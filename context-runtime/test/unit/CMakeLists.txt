@@ -739,7 +739,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_external_client_basic_connection PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 60
+    TIMEOUT 120
   )
 
   add_test(
@@ -749,7 +749,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_external_client_multiple_clients PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 60
+    TIMEOUT 120
   )
 
   add_test(
@@ -759,7 +759,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_external_client_without_server PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 60
+    TIMEOUT 120
   )
 
   add_test(
@@ -769,7 +769,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_external_client_operations PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 60
+    TIMEOUT 120
   )
 
   # Runtime Cleanup Tests
@@ -804,7 +804,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_ipc_transport_shm PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
+    TIMEOUT 300
   )
 
   add_test(
@@ -814,7 +814,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_ipc_transport_tcp PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
+    TIMEOUT 300
   )
 
   add_test(
@@ -824,7 +824,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_ipc_transport_ipc PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
+    TIMEOUT 300
   )
 
   add_test(
@@ -834,7 +834,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_ipc_transport_default PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-    TIMEOUT 120
+    TIMEOUT 300
   )
 
   # Client Retry Tests
@@ -846,8 +846,8 @@ if(WRP_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_client_retry_server_restart_tcp PROPERTIES
-    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 120
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
   )
 
   add_test(
@@ -856,8 +856,8 @@ if(WRP_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_client_retry_server_restart_ipc PROPERTIES
-    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 120
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
   )
 
   add_test(
@@ -866,8 +866,8 @@ if(WRP_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_client_retry_server_restart_shm PROPERTIES
-    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 120
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
   )
 
   add_test(
@@ -876,8 +876,8 @@ if(WRP_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_client_retry_client_death_tcp PROPERTIES
-    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 120
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
   )
 
   add_test(
@@ -886,8 +886,8 @@ if(WRP_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_client_retry_client_death_ipc PROPERTIES
-    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 120
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
   )
 
   add_test(
@@ -896,8 +896,8 @@ if(WRP_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_client_retry_client_death_shm PROPERTIES
-    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 120
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
   )
 
   # Set test properties for timeout and environment

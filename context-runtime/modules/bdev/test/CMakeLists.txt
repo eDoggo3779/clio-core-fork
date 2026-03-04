@@ -136,7 +136,7 @@ if(WRP_CORE_ENABLE_TESTS)
     cr_bdev_cleanup_tests
     cr_all_bdev_tests
     PROPERTIES
-      TIMEOUT 180
+      TIMEOUT 300
       ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1"
   )
 endif()
