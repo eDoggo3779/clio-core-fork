@@ -34,16 +34,20 @@
 /**
  * test_export_data.cc
  *
- * Unit tests for the CAE ExportData feature.
+ * Unit tests for the CAE ExportData feature and related task structs.
  *
- * Coverage targets (>95% of ExportData implementation):
- *   - ExportDataTask struct: default ctor, emplace ctor, Copy, Aggregate,
+ * Coverage targets (>95%):
+ *   - ExportDataTask: default ctor, emplace ctor, Copy, Aggregate,
  *     SerializeIn, SerializeOut
- *   - Runtime::ExportData: empty-tag path, binary success, binary bad path,
- *     HDF5 success (if enabled) or HDF5-not-compiled path, HDF5 bad path
+ *   - ParseOmniTask: default ctor, emplace ctor, Copy, Aggregate,
+ *     SerializeIn, SerializeOut
+ *   - ProcessHdf5DatasetTask: default ctor, emplace ctor, Copy, Aggregate,
+ *     SerializeIn, SerializeOut
+ *   - Runtime::ExportData: empty-tag, binary roundtrip, binary bad path,
+ *     unknown format (falls to binary), HDF5 or not-compiled path
  *   - autogen core_lib_exec.cc: kExportData cases in Run, SaveTask, LoadTask,
  *     LocalLoadTask, LocalSaveTask, NewCopyTask, NewTask, Aggregate, DelTask
- *     (exercised implicitly via AsyncExportData)
+ *     (exercised implicitly via AsyncExportData / AsyncParseOmni)
  */
 
 #include "simple_test.h"
@@ -51,6 +55,7 @@
 #include <wrp_cae/core/core_client.h>
 #include <wrp_cae/core/core_tasks.h>
 #include <wrp_cae/core/constants.h>
+#include <wrp_cae/core/factory/assimilation_ctx.h>
 #include <wrp_cte/core/core_client.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/admin/admin_client.h>
@@ -454,5 +459,403 @@ TEST_CASE("ExportData - HDF5 not compiled returns -3",
 }
 
 #endif  // WRP_CAE_ENABLE_HDF5
+
+// ---------------------------------------------------------------------------
+// ParseOmniTask struct tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ParseOmni - Task default constructor", "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<ParseOmniTask>();
+  REQUIRE(task->serialized_ctx_.str() == "");
+  REQUIRE(task->num_tasks_scheduled_ == 0);
+  REQUIRE(task->result_code_ == 0);
+  REQUIRE(task->error_message_.str() == "");
+  ipc->DelTask(task);
+
+  INFO("ParseOmniTask default constructor OK");
+}
+
+TEST_CASE("ParseOmni - Task emplace constructor", "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  std::vector<wrp_cae::core::AssimilationCtx> contexts;
+  contexts.emplace_back("file::/tmp/a.bin", "iowarp::tag_a", "binary");
+
+  auto task = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+                                          wrp_cae::core::kCaePoolId,
+                                          chi::PoolQuery::Local(),
+                                          contexts);
+  REQUIRE(!task->serialized_ctx_.str().empty());
+  REQUIRE(task->num_tasks_scheduled_ == 0);
+  REQUIRE(task->result_code_ == 0);
+  REQUIRE(task->method_ == Method::kParseOmni);
+
+  ipc->DelTask(task);
+  INFO("ParseOmniTask emplace constructor OK");
+}
+
+TEST_CASE("ParseOmni - Task Copy", "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  std::vector<wrp_cae::core::AssimilationCtx> contexts;
+  contexts.emplace_back("file::/tmp/b.bin", "iowarp::tag_b", "binary");
+
+  auto src = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+                                         wrp_cae::core::kCaePoolId,
+                                         chi::PoolQuery::Local(),
+                                         contexts);
+  src->num_tasks_scheduled_ = 3;
+  src->result_code_ = 2;
+  src->error_message_ = chi::priv::string("omni_err", HSHM_MALLOC);
+
+  auto dst = ipc->NewTask<ParseOmniTask>();
+  dst->Copy(src);
+
+  REQUIRE(dst->serialized_ctx_.str() == src->serialized_ctx_.str());
+  REQUIRE(dst->num_tasks_scheduled_ == 3);
+  REQUIRE(dst->result_code_ == 2);
+  REQUIRE(dst->error_message_.str() == "omni_err");
+
+  ipc->DelTask(src);
+  ipc->DelTask(dst);
+  INFO("ParseOmniTask Copy OK");
+}
+
+TEST_CASE("ParseOmni - Task Aggregate", "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  std::vector<wrp_cae::core::AssimilationCtx> ctxs;
+  ctxs.emplace_back("file::/tmp/c.bin", "iowarp::tag_c", "binary");
+
+  auto orig = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+                                          wrp_cae::core::kCaePoolId,
+                                          chi::PoolQuery::Local(), ctxs);
+  orig->num_tasks_scheduled_ = 1;
+  orig->result_code_ = 0;
+
+  auto rep = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+                                         wrp_cae::core::kCaePoolId,
+                                         chi::PoolQuery::Local(), ctxs);
+  rep->num_tasks_scheduled_ = 5;
+  rep->result_code_ = 9;
+
+  orig->Aggregate(rep.template Cast<chi::Task>());
+
+  REQUIRE(orig->num_tasks_scheduled_ == 5);
+  REQUIRE(orig->result_code_ == 9);
+
+  ipc->DelTask(orig);
+  ipc->DelTask(rep);
+  INFO("ParseOmniTask Aggregate OK");
+}
+
+TEST_CASE("ParseOmni - Task SerializeIn roundtrip", "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  std::vector<wrp_cae::core::AssimilationCtx> ctxs;
+  ctxs.emplace_back("file::/tmp/d.bin", "iowarp::ser_tag", "binary");
+
+  auto task = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+                                          wrp_cae::core::kCaePoolId,
+                                          chi::PoolQuery::Local(), ctxs);
+  const std::string ser_data = task->serialized_ctx_.str();
+
+  std::stringstream ss;
+  {
+    cereal::BinaryOutputArchive oa(ss);
+    task->SerializeIn(oa);
+  }
+
+  auto t2 = ipc->NewTask<ParseOmniTask>();
+  {
+    cereal::BinaryInputArchive ia(ss);
+    t2->SerializeIn(ia);
+  }
+
+  REQUIRE(t2->serialized_ctx_.str() == ser_data);
+
+  ipc->DelTask(task);
+  ipc->DelTask(t2);
+  INFO("ParseOmniTask SerializeIn roundtrip OK");
+}
+
+TEST_CASE("ParseOmni - Task SerializeOut roundtrip", "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<ParseOmniTask>();
+  task->num_tasks_scheduled_ = 7;
+  task->result_code_ = 4;
+  task->error_message_ = chi::priv::string("out_err", HSHM_MALLOC);
+
+  std::stringstream ss;
+  {
+    cereal::BinaryOutputArchive oa(ss);
+    task->SerializeOut(oa);
+  }
+
+  auto t2 = ipc->NewTask<ParseOmniTask>();
+  {
+    cereal::BinaryInputArchive ia(ss);
+    t2->SerializeOut(ia);
+  }
+
+  REQUIRE(t2->num_tasks_scheduled_ == 7);
+  REQUIRE(t2->result_code_ == 4);
+  REQUIRE(t2->error_message_.str() == "out_err");
+
+  ipc->DelTask(task);
+  ipc->DelTask(t2);
+  INFO("ParseOmniTask SerializeOut roundtrip OK");
+}
+
+// ---------------------------------------------------------------------------
+// ProcessHdf5DatasetTask struct tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ProcessHdf5Dataset - Task default constructor",
+          "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<ProcessHdf5DatasetTask>();
+  REQUIRE(task->file_path_.str() == "");
+  REQUIRE(task->dataset_path_.str() == "");
+  REQUIRE(task->tag_prefix_.str() == "");
+  REQUIRE(task->result_code_ == 0);
+  REQUIRE(task->error_message_.str() == "");
+  ipc->DelTask(task);
+
+  INFO("ProcessHdf5DatasetTask default constructor OK");
+}
+
+TEST_CASE("ProcessHdf5Dataset - Task emplace constructor",
+          "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+                                                    wrp_cae::core::kCaePoolId,
+                                                    chi::PoolQuery::Local(),
+                                                    "/tmp/test.h5",
+                                                    "/dataset/path",
+                                                    "my_prefix");
+  REQUIRE(task->file_path_.str() == "/tmp/test.h5");
+  REQUIRE(task->dataset_path_.str() == "/dataset/path");
+  REQUIRE(task->tag_prefix_.str() == "my_prefix");
+  REQUIRE(task->result_code_ == 0);
+  REQUIRE(task->method_ == Method::kProcessHdf5Dataset);
+
+  ipc->DelTask(task);
+  INFO("ProcessHdf5DatasetTask emplace constructor OK");
+}
+
+TEST_CASE("ProcessHdf5Dataset - Task Copy", "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto src = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+                                                   wrp_cae::core::kCaePoolId,
+                                                   chi::PoolQuery::Local(),
+                                                   "/h5/file.h5",
+                                                   "/ds",
+                                                   "prefix_x");
+  src->result_code_ = 5;
+  src->error_message_ = chi::priv::string("hdf5_err", HSHM_MALLOC);
+
+  auto dst = ipc->NewTask<ProcessHdf5DatasetTask>();
+  dst->Copy(src);
+
+  REQUIRE(dst->file_path_.str() == "/h5/file.h5");
+  REQUIRE(dst->dataset_path_.str() == "/ds");
+  REQUIRE(dst->tag_prefix_.str() == "prefix_x");
+  REQUIRE(dst->result_code_ == 5);
+  REQUIRE(dst->error_message_.str() == "hdf5_err");
+
+  ipc->DelTask(src);
+  ipc->DelTask(dst);
+  INFO("ProcessHdf5DatasetTask Copy OK");
+}
+
+TEST_CASE("ProcessHdf5Dataset - Task Aggregate keeps first error",
+          "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto orig = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+                                                    wrp_cae::core::kCaePoolId,
+                                                    chi::PoolQuery::Local(),
+                                                    "/f1.h5", "/d1", "p1");
+  orig->result_code_ = -1;
+  orig->error_message_ = chi::priv::string("first_err", HSHM_MALLOC);
+
+  auto rep = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+                                                   wrp_cae::core::kCaePoolId,
+                                                   chi::PoolQuery::Local(),
+                                                   "/f2.h5", "/d2", "p2");
+  rep->result_code_ = -2;
+  rep->error_message_ = chi::priv::string("second_err", HSHM_MALLOC);
+
+  // orig already has error → keeps its own error, does not overwrite
+  orig->Aggregate(rep.template Cast<chi::Task>());
+
+  REQUIRE(orig->result_code_ == -1);
+  REQUIRE(orig->error_message_.str() == "first_err");
+
+  ipc->DelTask(orig);
+  ipc->DelTask(rep);
+  INFO("ProcessHdf5DatasetTask Aggregate keeps first error OK");
+}
+
+TEST_CASE("ProcessHdf5Dataset - Task Aggregate adopts replica error",
+          "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto orig = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+                                                    wrp_cae::core::kCaePoolId,
+                                                    chi::PoolQuery::Local(),
+                                                    "/f3.h5", "/d3", "p3");
+  orig->result_code_ = 0;  // success so far
+
+  auto rep = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+                                                   wrp_cae::core::kCaePoolId,
+                                                   chi::PoolQuery::Local(),
+                                                   "/f4.h5", "/d4", "p4");
+  rep->result_code_ = -3;
+  rep->error_message_ = chi::priv::string("rep_err", HSHM_MALLOC);
+
+  // orig has no error → adopts replica's error
+  orig->Aggregate(rep.template Cast<chi::Task>());
+
+  REQUIRE(orig->result_code_ == -3);
+  REQUIRE(orig->error_message_.str() == "rep_err");
+
+  ipc->DelTask(orig);
+  ipc->DelTask(rep);
+  INFO("ProcessHdf5DatasetTask Aggregate adopts replica error OK");
+}
+
+TEST_CASE("ProcessHdf5Dataset - Task SerializeIn roundtrip",
+          "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+                                                    wrp_cae::core::kCaePoolId,
+                                                    chi::PoolQuery::Local(),
+                                                    "/ser/file.h5",
+                                                    "/ser/dataset",
+                                                    "ser_prefix");
+  std::stringstream ss;
+  {
+    cereal::BinaryOutputArchive oa(ss);
+    task->SerializeIn(oa);
+  }
+
+  auto t2 = ipc->NewTask<ProcessHdf5DatasetTask>();
+  {
+    cereal::BinaryInputArchive ia(ss);
+    t2->SerializeIn(ia);
+  }
+
+  REQUIRE(t2->file_path_.str() == "/ser/file.h5");
+  REQUIRE(t2->dataset_path_.str() == "/ser/dataset");
+  REQUIRE(t2->tag_prefix_.str() == "ser_prefix");
+
+  ipc->DelTask(task);
+  ipc->DelTask(t2);
+  INFO("ProcessHdf5DatasetTask SerializeIn roundtrip OK");
+}
+
+TEST_CASE("ProcessHdf5Dataset - Task SerializeOut roundtrip",
+          "[cae][export][task]") {
+  ExportDataFixture f;
+
+  auto *ipc = CHI_IPC;
+  auto task = ipc->NewTask<ProcessHdf5DatasetTask>();
+  task->result_code_ = 8;
+  task->error_message_ = chi::priv::string("ds_err", HSHM_MALLOC);
+
+  std::stringstream ss;
+  {
+    cereal::BinaryOutputArchive oa(ss);
+    task->SerializeOut(oa);
+  }
+
+  auto t2 = ipc->NewTask<ProcessHdf5DatasetTask>();
+  {
+    cereal::BinaryInputArchive ia(ss);
+    t2->SerializeOut(ia);
+  }
+
+  REQUIRE(t2->result_code_ == 8);
+  REQUIRE(t2->error_message_.str() == "ds_err");
+
+  ipc->DelTask(task);
+  ipc->DelTask(t2);
+  INFO("ProcessHdf5DatasetTask SerializeOut roundtrip OK");
+}
+
+// ---------------------------------------------------------------------------
+// ExportData - additional runtime paths
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ExportData - Unknown format falls through to binary",
+          "[cae][export][runtime]") {
+  ExportDataFixture f;
+
+  const std::string tag_name = "export_unknown_fmt_tag";
+  const std::string out_path = "/tmp/cae_export_unknown_fmt.bin";
+
+  std::vector<uint8_t> data = {0xAA, 0xBB, 0xCC};
+  f.PutBlob(tag_name, "blob_unk", data);
+
+  wrp_cae::core::Client cae(wrp_cae::core::kCaePoolId);
+  // "csv" is neither "hdf5" nor "binary" → falls to binary else-branch
+  auto fut = cae.AsyncExportData(tag_name, out_path, "csv");
+  fut.Wait();
+
+  // Binary branch should succeed and write the blob
+  REQUIRE(fut->result_code_ == 0);
+  REQUIRE(fut->bytes_exported_ == data.size());
+
+  std::remove(out_path.c_str());
+  INFO("ExportData unknown format (csv) → binary path OK, "
+       << fut->bytes_exported_ << " bytes");
+}
+
+TEST_CASE("ExportData - Binary export with multiple large blobs",
+          "[cae][export][runtime][binary]") {
+  ExportDataFixture f;
+
+  const std::string tag_name = "export_multi_blob_tag";
+  const std::string out_path = "/tmp/cae_export_multi_blob.bin";
+
+  // Three blobs with distinct sizes
+  std::vector<uint8_t> d1(64, 0x11);
+  std::vector<uint8_t> d2(128, 0x22);
+  std::vector<uint8_t> d3(32, 0x33);
+  f.PutBlob(tag_name, "mb1", d1);
+  f.PutBlob(tag_name, "mb2", d2);
+  f.PutBlob(tag_name, "mb3", d3);
+
+  wrp_cae::core::Client cae(wrp_cae::core::kCaePoolId);
+  auto fut = cae.AsyncExportData(tag_name, out_path, "binary");
+  fut.Wait();
+
+  REQUIRE(fut->result_code_ == 0);
+  REQUIRE(fut->bytes_exported_ == d1.size() + d2.size() + d3.size());
+
+  std::remove(out_path.c_str());
+  INFO("ExportData multi-blob binary: " << fut->bytes_exported_ << " bytes");
+}
 
 SIMPLE_TEST_MAIN()
