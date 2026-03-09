@@ -142,6 +142,18 @@ fi
 COVERAGE_EXCLUDE_LABELS="integration|restart|functional|query|stress|docker"
 COVERAGE_EXCLUDE_NAMES="cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
 
+# Detect lcov version for RC option compatibility.
+# lcov 1.x uses 'lcov_branch_coverage' and 'geninfo_unexecuted_blocks';
+# lcov 2.x renamed them and treats unknown keys as fatal errors.
+LCOV_MAJOR=$(lcov --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1)
+LCOV_MAJOR=${LCOV_MAJOR:-1}
+if [ "${LCOV_MAJOR}" -ge 2 ] 2>/dev/null; then
+    LCOV_RC_OPTS=(--rc branch_coverage=0)
+else
+    LCOV_RC_OPTS=(--rc lcov_branch_coverage=0 --rc geninfo_unexecuted_blocks=1)
+fi
+print_info "Detected lcov version: ${LCOV_MAJOR}.x (using ${LCOV_RC_OPTS[*]})"
+
 ################################################################################
 # Step 1: Clean build directory (if requested)
 ################################################################################
@@ -350,8 +362,7 @@ print_info "Capturing final coverage data with lcov..."
 lcov --capture \
      --directory . \
      --output-file coverage_combined.info \
-     --rc lcov_branch_coverage=0 \
-     --rc geninfo_unexecuted_blocks=1 \
+     "${LCOV_RC_OPTS[@]}" \
      --ignore-errors source,graph \
      2>&1 | grep -E "Found [0-9]+ data files|Finished" || true
 
