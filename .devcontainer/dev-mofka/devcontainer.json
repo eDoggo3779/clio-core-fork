@@ -1,0 +1,45 @@
+{
+  "name": "Mofka Development",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "args": {
+      "HOST_UID": "${localEnv:HOST_UID:1000}",
+      "HOST_GID": "${localEnv:HOST_GID:1000}"
+    },
+    "options": [
+      "--tag=mofka-devcontainer:latest"
+    ]
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "containerEnv": {
+    "SPACK_ROOT": "/opt/spack"
+  },
+  "mounts": [
+    "source=${localEnv:USERPROFILE}/.ssh,target=/tmp/host-ssh,type=bind,readonly"
+  ],
+  "runArgs": [
+    "--privileged"
+  ],
+  "updateRemoteUserUID": true,
+  "initializeCommand": "powershell -Command \"if (!(Test-Path $HOME/.ssh)) { New-Item -ItemType Directory -Force -Path $HOME/.ssh }\"",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy"
+      ],
+      "settings": {
+        "cmake.configureOnOpen": false,
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "postCreateCommand": "echo 'Mofka container ready. Spack env activated via ~/.bashrc.'",
+  "remoteUser": "mofka-dev"
+}

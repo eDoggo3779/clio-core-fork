@@ -18,16 +18,16 @@
     "LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib/x86_64-linux-gnu"
   },
   "mounts": [
-    "source=${localEnv:HOME}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
-    "source=${localEnv:HOME}/.claude,target=/tmp/host-claude,type=bind,readonly",
-    "source=${localEnv:HOME}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
+    "source=${localEnv:USERPROFILE}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
+    "source=${localEnv:USERPROFILE}/.claude,target=/tmp/host-claude,type=bind,readonly",
+    "source=${localEnv:USERPROFILE}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
     "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
   ],
   "runArgs": [
     "--privileged"
   ],
   "updateRemoteUserUID": true,
-  "initializeCommand": "bash -c 'mkdir -p ~/.ssh ~/.claude && chmod 700 ~/.ssh && touch ~/.claude.json'",
+  "initializeCommand": "powershell -Command \"mkdir -Force $HOME/.ssh; if (!(Test-Path $HOME/.claude)) { mkdir $HOME/.claude }; if (!(Test-Path $HOME/.claude.json)) { New-Item -Path $HOME/.claude.json -ItemType File }\"",
   "customizations": {
     "vscode": {
       "extensions": [
