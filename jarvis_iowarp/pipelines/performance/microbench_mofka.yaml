@@ -1,0 +1,38 @@
+# Mofka Benchmark — Producer/Consumer Performance
+# Purpose: Measure Mofka produce/consume throughput across data sizes and thread counts
+#
+# Usage:
+#   jarvis ppl run yaml jarvis_iowarp/pipelines/performance/microbench_mofka.yaml
+
+config:
+  name: mofka_bench_perf
+  pkgs:
+    - pkg_type: jarvis_iowarp.mofka_server
+      pkg_name: mofka_srv
+      protocol: "tcp"
+      workdir: "/tmp/mofka-bench"
+      topic: "benchmark_topic"
+      partition_type: "memory"
+
+    - pkg_type: jarvis_iowarp.mofka_bench
+      pkg_name: mofka_bench
+      mode: "both"
+      num_events: 1000
+      data_size: 1024
+      metadata_size: 64
+      batch_size: 16
+      num_threads: 1
+      data_selectivity: 1.0
+      use_progress_thread: true
+
+vars:
+  mofka_bench.data_size: [256, 1024, 4096, 16384, 65536]
+  mofka_bench.num_threads: [1, 2, 4]
+
+loop:
+  - [mofka_bench.data_size]
+  - [mofka_bench.num_threads]
+
+repeat: 3
+
+output: "${HOME}/mofka_bench_results"
