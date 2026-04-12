@@ -9,44 +9,118 @@
 config:
   name: cte_bench_perf
   pkgs:
+    # ==================================================================
     # IOWarp Runtime Service
+    # ==================================================================
     - pkg_type: jarvis_iowarp.wrp_runtime
       pkg_name: runtime
       do_dbg: false
       dbg_port: 4000
       log_level: "info"
+
+      # --- EXPERIMENT: IPC Transport Mode ---
+      # How the benchmark client communicates with the runtime server.
+      #   shm  — shared memory (lowest latency, single-node)
+      #   ipc  — Unix domain sockets
+      #   tcp  — TCP sockets (required for multi-node)
       ipc_mode: "shm"
 
-    # CTE Service — register storage devices
+    # ==================================================================
+    # CTE Service — Storage Configuration
+    # ==================================================================
     - pkg_type: jarvis_iowarp.wrp_cte
       pkg_name: cte_core
+
+      # --- EXPERIMENT: Storage Devices ---
+      # List of [path, capacity, score] tuples defining the storage tiers.
+      #   path     — "ram::<label>" for RAM, or a file path for disk-backed storage
+      #   capacity — device capacity (e.g., "500MB", "64g")
+      #   score    — performance hint 0.0–1.0 (higher = faster tier)
+      # Add/remove tiers to test tiered storage behavior, RAM-only, disk-only, etc.
       devices:
         - ["ram::cache", "500MB", 0.8]
         - ["/mnt/nvme/$USER/storage1.bin", "64g", 0.8]
+
+      # --- EXPERIMENT: Data Placement Engine ---
+      # Strategy CTE uses to distribute data across storage devices/nodes.
+      #   max_bw      — place data on the highest-bandwidth available target
+      #   round_robin — cycle through targets evenly
+      #   random      — random target selection
       dpe_type: "max_bw"
+
+      # --- EXPERIMENT: Target Neighborhood ---
+      # Number of remote nodes CTE can buffer data to.
+      # Larger neighborhoods spread data wider but add coordination overhead.
       neighborhood: 4
+
+      # Timeout (ms) before CTE gives up waiting on a target to respond.
       default_target_timeout_ms: 30000
+
+      # How often (ms) CTE re-scans targets for updated capacity/bandwidth stats.
       poll_period_ms: 5000
 
+      # --- EXPERIMENT: Compression ---
+      # Uncomment and set to enable compression. Major impact on effective bandwidth.
+      #   none/off                — no compression (default)
+      #   dynamic/auto            — adaptive compression (CTE picks the best codec)
+      #   zstd, lz4, snappy, etc. — force a specific compression library
+      # iowarp_compress: "none"
+
+    # ==================================================================
     # CTE Benchmark Application
+    # ==================================================================
     - pkg_type: jarvis_iowarp.wrp_cte_bench
       pkg_name: cte_bench
+
+      # --- EXPERIMENT: Test Case ---
+      # Which I/O operation to benchmark:
+      #   Put    — write-only
+      #   Get    — read-only
+      #   PutGet — write then read (measures both paths)
       test_case: "PutGet"
+
+      # --- EXPERIMENT: Thread Count ---
+      # Number of worker threads issuing I/O operations concurrently.
+      # Tests thread-level parallelism scaling. Swept via `vars` below.
       num_threads: 1
+
+      # --- EXPERIMENT: I/O Queue Depth ---
+      # Number of asynchronous I/O requests in-flight per thread.
+      # Higher depth increases overlap of I/O and compute but uses more memory.
       depth: 4
+
+      # --- EXPERIMENT: I/O Size ---
+      # Size of each Put/Get operation (e.g., "4k", "64k", "1m").
+      # Small sizes stress per-op latency; large sizes stress bandwidth.
+      # Swept via `vars` below.
       io_size: "4k"
+
+      # --- EXPERIMENT: I/O Count ---
+      # Number of I/O operations each thread performs.
+      # Higher values yield more stable averages but longer runs.
       io_count: 100
+
+      # --- EXPERIMENT: MPI Distribution ---
+      # nprocs — total MPI processes (use > 1 for distributed benchmarks)
+      # ppn    — processes per node
       nprocs: 1
       ppn: 1
 
+# -----------------------------------------------------------------------
+# Parameter Sweep Configuration
+# -----------------------------------------------------------------------
+# Each key maps to a package parameter; the list gives the values to sweep.
+# The `loop` section below defines which sweeps are crossed (cartesian product).
 vars:
   cte_bench.io_size: ["4k", "16k", "64k", "256k", "1m"]
   cte_bench.num_threads: [1, 2, 4]
 
+# Cartesian product: every io_size x every num_threads combination
 loop:
   - [cte_bench.io_size]
   - [cte_bench.num_threads]
 
+# Number of times to repeat each configuration (for statistical stability)
 repeat: 3
 
 output: "${HOME}/cte_bench_results"

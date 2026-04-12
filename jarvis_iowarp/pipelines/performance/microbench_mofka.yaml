@@ -1,6 +1,8 @@
 # Mofka Benchmark — Producer/Consumer Performance
 # Purpose: Measure Mofka produce/consume throughput across data sizes and thread counts
 #
+# Sweeps: 5 data sizes x 3 thread counts x 3 repeats = 45 benchmark runs
+#
 # Usage:
 #   jarvis ppl run yaml jarvis_iowarp/pipelines/performance/microbench_mofka.yaml
 
@@ -9,30 +11,82 @@ config:
   pkgs:
     - pkg_type: jarvis_iowarp.mofka_server
       pkg_name: mofka_srv
+
+      # --- EXPERIMENT: Network Transport ---
+      # Controls the Mercury RPC transport layer between producer/consumer and server.
+      #   tcp        — TCP sockets (portable, moderate latency)
+      #   na+sm      — shared-memory (single-node only, lowest latency)
+      #   ofi+tcp    — libfabric over TCP
+      #   ofi+verbs  — libfabric over InfiniBand RDMA (high bandwidth)
+      #   ofi+cxi    — libfabric over Slingshot (HPE Cray interconnect)
       protocol: "tcp"
+
       workdir: "/tmp/mofka-bench"
       topic: "benchmark_topic"
+
+      # Partition storage backend for events. Currently only "memory" is supported.
       partition_type: "memory"
 
     - pkg_type: jarvis_iowarp.mofka_bench
       pkg_name: mofka_bench
+
+      # --- EXPERIMENT: Benchmark Mode ---
+      # Which roles to run: "producer", "consumer", or "both".
+      # Use "both" for end-to-end throughput; split to isolate bottlenecks.
       mode: "both"
+
+      # --- EXPERIMENT: Workload Volume ---
+      # Total number of events to produce and/or consume per benchmark run.
+      # Higher values yield more stable averages but longer runs.
       num_events: 1000
+
+      # --- EXPERIMENT: Payload Size (bytes) ---
+      # Size of the data payload attached to each event.
+      # Small values stress per-event overhead; large values stress bandwidth.
+      # Swept via `vars` below.
       data_size: 1024
+
+      # --- EXPERIMENT: Metadata Size (bytes) ---
+      # Size of the metadata blob attached to each event.
+      # Metadata travels with every event — increasing this adds per-event overhead.
       metadata_size: 64
+
+      # --- EXPERIMENT: Batch Size ---
+      # Number of events grouped into a single produce/consume RPC call.
+      # Larger batches amortize RPC overhead but increase per-call latency.
       batch_size: 16
+
+      # --- EXPERIMENT: Thread Count ---
+      # Number of concurrent producer/consumer threads.
+      # Tests thread-level parallelism scaling. Swept via `vars` below.
       num_threads: 1
+
+      # --- EXPERIMENT: Consumer Data Selectivity (0.0 – 1.0) ---
+      # Fraction of the event's data payload the consumer actually reads.
+      # 1.0 = read all data, 0.5 = read half, 0.0 = metadata-only.
+      # Useful for testing selective/partial-read performance.
       data_selectivity: 1.0
+
+      # --- EXPERIMENT: Mercury Progress Thread ---
+      # When true, Mercury uses a dedicated background thread for async network I/O.
+      # Improves overlap of computation and communication at the cost of one CPU core.
       use_progress_thread: true
 
+# -----------------------------------------------------------------------
+# Parameter Sweep Configuration
+# -----------------------------------------------------------------------
+# Each key maps to a package parameter; the list gives the values to sweep.
+# The `loop` section below defines which sweeps are crossed (cartesian product).
 vars:
   mofka_bench.data_size: [256, 1024, 4096, 16384, 65536]
   mofka_bench.num_threads: [1, 2, 4]
 
+# Cartesian product: every data_size x every num_threads combination
 loop:
   - [mofka_bench.data_size]
   - [mofka_bench.num_threads]
 
+# Number of times to repeat each configuration (for statistical stability)
 repeat: 3
 
 output: "${HOME}/mofka_bench_results"
