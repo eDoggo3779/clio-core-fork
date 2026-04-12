@@ -42,7 +42,14 @@
       "Bash(jarvis repo:*)",
       "Bash(/home/iowarp/venv/bin/python3 -c ':*)",
       "Bash(/home/iowarp/venv/bin/pip install:*)",
-      "Bash(ls -la /tmp/mofka_plot_test/*.png)"
+      "Bash(ls -la /tmp/mofka_plot_test/*.png)",
+      "Read(//usr/local/**)",
+      "Read(//opt/**)",
+      "Bash(ssh localhost:*)",
+      "Bash(command -v chimaera)",
+      "Bash(g++ --version)",
+      "Bash(/workspace/build/bin/wrp_cte_bench)",
+      "Bash(ln -sf /workspace/build/bin/wrp_cte_bench /home/iowarp/.local/bin/wrp_cte_bench)"
     ],
     "deny": [],
     "ask": []

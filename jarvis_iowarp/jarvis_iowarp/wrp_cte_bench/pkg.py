@@ -1,38 +1,29 @@
 from jarvis_cd.core.pkg import Application
 from jarvis_cd.shell import Exec, PsshExecInfo
 import os
+import re
+import time as time_mod
+
 
 class WrpCteBench(Application):
     """
     CTE Core Benchmark Application
 
-    This application runs benchmarks for Put, Get, and GetTagSize operations
-    in the Content Transfer Engine (CTE) with MPI support for parallel I/O.
+    Runs Put, Get, and PutGet benchmarks against a running CTE instance
+    and collects throughput and latency statistics.
 
     The benchmark measures:
     - Put operations: Write data to CTE
     - Get operations: Read data from CTE
     - PutGet operations: Combined write and read operations
-
-    It supports async operation depth configuration for testing concurrent I/O.
     """
 
     def _init(self):
-        """
-        Initialize the WrpCteBench application.
-
-        This method is called during application initialization.
-        """
         self.benchmark_executable = 'wrp_cte_bench'
         self.output_file = None
+        self.start_time = None
 
     def _configure_menu(self):
-        """
-        Configure the application menu.
-
-        Returns:
-            List[Dict]: Configuration menu options for the benchmark.
-        """
         return [
             {
                 'name': 'test_case',
@@ -40,132 +31,66 @@ class WrpCteBench(Application):
                 'type': str,
                 'choices': ['Put', 'Get', 'PutGet'],
                 'default': 'Put',
-                'help': 'Put: Write benchmark, Get: Read benchmark, PutGet: Combined write+read benchmark'
             },
             {
                 'name': 'num_threads',
                 'msg': 'Number of worker threads',
                 'type': int,
                 'default': 4,
-                'help': 'Number of worker threads for parallel I/O (e.g., 4)'
             },
             {
                 'name': 'depth',
                 'msg': 'Number of async requests per thread',
                 'type': int,
                 'default': 4,
-                'help': 'Number of concurrent async I/O operations per thread (e.g., 4 means 4 operations in flight per thread)'
             },
             {
                 'name': 'io_size',
                 'msg': 'Size of I/O operations',
                 'type': str,
                 'default': '1m',
-                'help': 'I/O size with suffix: k/K (KB), m/M (MB), g/G (GB). Examples: 4k, 1m, 2g'
             },
             {
                 'name': 'io_count',
-                'msg': 'Number of I/O operations to generate per node',
+                'msg': 'Number of I/O operations per thread',
                 'type': int,
                 'default': 100,
-                'help': 'Total number of I/O operations each MPI rank will perform'
             },
             {
                 'name': 'nprocs',
                 'msg': 'Number of MPI processes',
                 'type': int,
                 'default': 1,
-                'help': 'Number of MPI processes to use for parallel I/O'
             },
             {
                 'name': 'ppn',
                 'msg': 'Processes per node',
                 'type': int,
                 'default': 1,
-                'help': 'Number of MPI processes per node'
-            },
-            {
-                'name': 'output_file',
-                'msg': 'Output file for benchmark results',
-                'type': str,
-                'default': '',
-                'help': 'Path to save benchmark results. If empty, results are printed to stdout'
             },
             {
                 'name': 'init_runtime',
-                'msg': 'Initialize Chimaera runtime (otherwise assumes runtime already running)',
+                'msg': 'Initialize Chimaera runtime',
                 'type': bool,
                 'default': False,
-                'help': 'Set to True to initialize runtime, False to only initialize client'
-            }
+            },
         ]
 
     def _configure(self, **kwargs):
-        """
-        Configure the CTE benchmark application with provided keyword arguments.
-
-        This method sets up the benchmark executable path and output file.
-
-        Args:
-            **kwargs: Configuration arguments from _configure_menu.
-        """
         self.log("Configuring CTE benchmark application...")
 
-        # Validate test_case
-        if self.config['test_case'] not in ['Put', 'Get', 'PutGet']:
-            raise ValueError(f"Invalid test_case: {self.config['test_case']}. Must be Put, Get, or PutGet")
-
-        # Validate num_threads
-        if self.config['num_threads'] <= 0:
-            raise ValueError(f"Invalid num_threads: {self.config['num_threads']}. Must be > 0")
-
-        # Validate depth
-        if self.config['depth'] <= 0:
-            raise ValueError(f"Invalid depth: {self.config['depth']}. Must be > 0")
-
-        # Validate io_count
-        if self.config['io_count'] <= 0:
-            raise ValueError(f"Invalid io_count: {self.config['io_count']}. Must be > 0")
-
-        # Validate io_size format (should have k/K, m/M, g/G suffix or be a number)
-        io_size_str = str(self.config['io_size']).lower()
-        if not (io_size_str[-1] in ['k', 'm', 'g'] or io_size_str.isdigit()):
-            self.log(f"Warning: io_size '{self.config['io_size']}' should end with k/K, m/M, or g/G suffix")
-
-        # Set output file if specified
-        if self.config['output_file']:
-            self.output_file = os.path.join(self.shared_dir, self.config['output_file'])
-            self.log(f"Benchmark results will be saved to: {self.output_file}")
-        else:
-            self.output_file = None
-            self.log("Benchmark results will be printed to stdout")
-
-        # Set environment variables for the benchmark
-        self.setenv('CTE_BENCH_TEST_CASE', self.config['test_case'])
-        self.setenv('CTE_BENCH_DEPTH', str(self.config['depth']))
-        self.setenv('CTE_BENCH_IO_SIZE', str(self.config['io_size']))
-        self.setenv('CTE_BENCH_IO_COUNT', str(self.config['io_count']))
-
-        # Set CHI_WITH_RUNTIME environment variable based on configuration
         if self.config['init_runtime']:
             self.setenv('CHI_WITH_RUNTIME', '1')
-            self.log("Runtime initialization enabled (CHI_WITH_RUNTIME=1)")
         else:
             self.setenv('CHI_WITH_RUNTIME', '0')
-            self.log("Runtime initialization disabled (CHI_WITH_RUNTIME=0)")
 
         self.log("CTE benchmark configuration completed successfully")
 
     def start(self):
-        """
-        Run the CTE benchmark application.
+        t0 = time_mod.time()
 
-        This method executes the benchmark with MPI support and configured parameters.
-        """
         self.log(f"Starting CTE benchmark: {self.config['test_case']}")
 
-        # Build command line arguments
-        # Usage: wrp_cte_bench <test_case> <num_threads> <depth> <io_size> <io_count>
         cmd = [
             self.benchmark_executable,
             self.config['test_case'],
@@ -175,10 +100,11 @@ class WrpCteBench(Application):
             str(self.config['io_count'])
         ]
 
-        # Execute with MPI if nprocs > 1
-        if self.config['nprocs'] > 1:
-            self.log(f"Running benchmark with MPI: {self.config['nprocs']} processes, {self.config['ppn']} per node")
+        cmd_str = ' '.join(cmd)
+        output_path = os.path.join(self.shared_dir, 'bench_output.txt')
+        self.log(f"Executing: {cmd_str}")
 
+        if self.config['nprocs'] > 1:
             exec_info = PsshExecInfo(
                 env=self.mod_env,
                 hostfile=self.hostfile,
@@ -186,47 +112,251 @@ class WrpCteBench(Application):
                 ppn=self.config['ppn']
             )
         else:
-            self.log("Running benchmark without MPI (single process)")
             from jarvis_cd.shell import LocalExecInfo
-            exec_info = LocalExecInfo(env=self.mod_env)
+            exec_info = LocalExecInfo(
+                env=self.mod_env,
+                pipe_stdout=output_path,
+            )
 
-        # Execute the benchmark
-        cmd_str = ' '.join(cmd)
+        Exec(cmd_str, exec_info).run()
 
-        if self.output_file:
-            # Redirect output to file
-            cmd_str += f' > {self.output_file} 2>&1'
-            self.log(f"Executing: {cmd_str}")
-            Exec(cmd_str, exec_info).run()
-            self.log(f"Benchmark completed. Results saved to: {self.output_file}")
-        else:
-            # Print to stdout
-            self.log(f"Executing: {cmd_str}")
-            Exec(cmd_str, exec_info).run()
-            self.log("Benchmark completed")
+        self.start_time = time_mod.time() - t0
+        self.log(f"Benchmark completed in {self.start_time:.2f}s")
 
     def stop(self):
-        """
-        Stop the benchmark application.
-
-        Since this is an application that runs to completion, this method
-        is typically not needed but is provided for consistency.
-        """
-        self.log("WrpCteBench is an application - it runs to completion")
-        return True
+        pass
 
     def clean(self):
-        """
-        Clean up benchmark output files.
-        """
-        self.log("Cleaning up CTE benchmark output files...")
+        path = os.path.join(self.shared_dir, 'bench_output.txt')
+        if os.path.exists(path):
+            os.remove(path)
 
-        # Clean output file if it exists
-        if self.output_file and os.path.exists(self.output_file):
+    # ------------------------------------------------------------------
+    # Statistics collection
+    # ------------------------------------------------------------------
+
+    def _get_stat(self, stat_dict):
+        """Parse benchmark output and populate stat_dict."""
+        output_path = os.path.join(self.shared_dir, 'bench_output.txt')
+        if not os.path.exists(output_path):
+            self.log(f'No output file found at {output_path}')
+            return
+
+        with open(output_path, 'r') as f:
+            output = f.read()
+
+        self._parse_output(output, stat_dict)
+
+    def _parse_output(self, output, stat_dict):
+        """Extract metrics from wrp_cte_bench stdout.
+
+        The C++ binary outputs via HLOG which prefixes each line with
+        ``<file>:<line> INFO <tid> <func> <message>``.
+        We match against the message portion.
+        """
+        # Detect which test case header appeared (Put, Get, or PutGet)
+        header_match = re.search(
+            r'=== (\w+) Benchmark Results ===', output)
+        operation = header_match.group(1).lower() if header_match else 'unknown'
+
+        patterns = {
+            'time_min_us': r'Time \(min\):\s+([\d.]+)\s+us',
+            'time_max_us': r'Time \(max\):\s+([\d.]+)\s+us',
+            'time_avg_us': r'Time \(avg\):\s+([\d.e+\-]+)\s+us',
+            'bw_per_thread_min_mbps': r'Bandwidth per thread \(min\):\s+([\d.e+\-]+)\s+MB/s',
+            'bw_per_thread_max_mbps': r'Bandwidth per thread \(max\):\s+([\d.e+\-]+)\s+MB/s',
+            'bw_per_thread_avg_mbps': r'Bandwidth per thread \(avg\):\s+([\d.e+\-]+)\s+MB/s',
+            'agg_bw_mbps': r'Aggregate bandwidth:\s+([\d.e+\-]+)\s+MB/s',
+        }
+
+        for metric, pattern in patterns.items():
+            match = re.search(pattern, output)
+            if match:
+                stat_dict[f'{self.pkg_id}.{operation}.{metric}'] = float(
+                    match.group(1))
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
+
+    def _plot(self, results_dir):
+        """Generate performance plots from pipeline results.csv.
+
+        Produces four PNG figures:
+          1. Aggregate Bandwidth (MB/s) vs I/O Size — grouped by test case
+          2. Average Latency (us) vs I/O Size — grouped by test case
+          3. Aggregate Bandwidth (MB/s) vs Num Threads
+          4. Average Latency (us) vs Num Threads
+        """
+        import csv
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except ImportError:
+            self.log('matplotlib not available — skipping plots')
+            return
+
+        csv_path = os.path.join(results_dir, 'results.csv')
+        if not os.path.exists(csv_path):
+            self.log(f'No results.csv found at {csv_path}')
+            return
+
+        rows = []
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
+
+        if not rows:
+            self.log('results.csv is empty')
+            return
+
+        # Detect the pkg_prefix used in stat column names.
+        # Columns look like: <prefix>.<operation>.<metric>
+        pkg_prefix = None
+        for op in ('put', 'get', 'putget'):
+            for key in rows[0]:
+                if key.endswith(f'.{op}.agg_bw_mbps'):
+                    pkg_prefix = key.rsplit(f'.{op}.agg_bw_mbps', 1)[0]
+                    break
+            if pkg_prefix:
+                break
+
+        if pkg_prefix is None:
+            self.log('Could not identify stat columns in results.csv')
+            return
+
+        def _col(op, metric):
+            return f'{pkg_prefix}.{op}.{metric}'
+
+        def _safe_float(row, col):
+            val = row.get(col, '')
+            if val == '':
+                return None
             try:
-                os.remove(self.output_file)
-                self.log(f"Removed benchmark output file: {self.output_file}")
-            except Exception as e:
-                self.log(f"Error removing output file: {e}")
+                return float(val)
+            except (ValueError, TypeError):
+                return None
 
-        self.log("CTE benchmark cleanup completed")
+        # Detect sweep-variable column names
+        io_size_col = None
+        threads_col = None
+        for key in rows[0]:
+            if key.endswith('.io_size'):
+                io_size_col = key
+            if key.endswith('.num_threads'):
+                threads_col = key
+
+        # Determine which operations actually have data
+        operations = []
+        op_labels = {'put': 'Put', 'get': 'Get', 'putget': 'PutGet'}
+        op_colours = {'put': '#2196F3', 'get': '#FF9800', 'putget': '#4CAF50'}
+        op_markers = {'put': 'o', 'get': 's', 'putget': '^'}
+        for op in ('put', 'get', 'putget'):
+            if any(_safe_float(r, _col(op, 'agg_bw_mbps')) is not None
+                   for r in rows):
+                operations.append(op)
+
+        if not operations:
+            self.log('No benchmark data found in results.csv')
+            return
+
+        # --- Helper: aggregate rows by a sweep variable ---
+        def _aggregate(rows, sweep_col, op, metric):
+            from collections import defaultdict
+            buckets = defaultdict(list)
+            for row in rows:
+                x = row.get(sweep_col, '')
+                y = _safe_float(row, _col(op, metric))
+                if x != '' and y is not None:
+                    buckets[x].append(y)
+            # Sort numerically if possible, otherwise lexicographically
+            def sort_key(k):
+                try:
+                    return float(k)
+                except ValueError:
+                    return k
+            xs = sorted(buckets.keys(), key=sort_key)
+            ys = [sum(buckets[x]) / len(buckets[x]) for x in xs]
+            return xs, ys
+
+        # --- Figure 1: Aggregate BW vs I/O Size ---
+        if io_size_col:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for op in operations:
+                xs, ys = _aggregate(rows, io_size_col, op, 'agg_bw_mbps')
+                if xs:
+                    ax.bar(xs, ys, alpha=0.7, color=op_colours[op],
+                           label=op_labels[op], width=0.25)
+            ax.set_xlabel('I/O Size')
+            ax.set_ylabel('Aggregate Bandwidth (MB/s)')
+            ax.set_title('CTE Bandwidth vs I/O Size')
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(results_dir, 'bw_vs_io_size.png'),
+                        dpi=150)
+            plt.close(fig)
+
+        # --- Figure 2: Avg Latency vs I/O Size ---
+        if io_size_col:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for op in operations:
+                xs, ys = _aggregate(rows, io_size_col, op, 'time_avg_us')
+                if xs:
+                    ax.bar(xs, ys, alpha=0.7, color=op_colours[op],
+                           label=op_labels[op], width=0.25)
+            ax.set_xlabel('I/O Size')
+            ax.set_ylabel('Average Latency (us)')
+            ax.set_title('CTE Latency vs I/O Size')
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(results_dir, 'latency_vs_io_size.png'),
+                        dpi=150)
+            plt.close(fig)
+
+        # --- Figure 3: Aggregate BW vs Num Threads ---
+        if threads_col:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for op in operations:
+                xs, ys = _aggregate(rows, threads_col, op, 'agg_bw_mbps')
+                if xs:
+                    try:
+                        x_nums = [float(x) for x in xs]
+                    except ValueError:
+                        x_nums = list(range(len(xs)))
+                    ax.plot(x_nums, ys, marker=op_markers[op],
+                            color=op_colours[op], label=op_labels[op],
+                            linewidth=2)
+            ax.set_xlabel('Number of Threads')
+            ax.set_ylabel('Aggregate Bandwidth (MB/s)')
+            ax.set_title('CTE Bandwidth vs Thread Count')
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(results_dir, 'bw_vs_threads.png'),
+                        dpi=150)
+            plt.close(fig)
+
+        # --- Figure 4: Avg Latency vs Num Threads ---
+        if threads_col:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for op in operations:
+                xs, ys = _aggregate(rows, threads_col, op, 'time_avg_us')
+                if xs:
+                    try:
+                        x_nums = [float(x) for x in xs]
+                    except ValueError:
+                        x_nums = list(range(len(xs)))
+                    ax.plot(x_nums, ys, marker=op_markers[op],
+                            color=op_colours[op], label=op_labels[op],
+                            linewidth=2)
+            ax.set_xlabel('Number of Threads')
+            ax.set_ylabel('Average Latency (us)')
+            ax.set_title('CTE Latency vs Thread Count')
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(results_dir, 'latency_vs_threads.png'),
+                        dpi=150)
+            plt.close(fig)
+
+        self.log(f'Plots saved to {results_dir}')
