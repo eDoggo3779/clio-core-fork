@@ -123,4 +123,4 @@ loop:
 # Number of times to repeat each configuration (for statistical stability)
 repeat: 3
 
-output: "${HOME}/cte_bench_results"
+output: "/workspace/results/cte_bench_results"

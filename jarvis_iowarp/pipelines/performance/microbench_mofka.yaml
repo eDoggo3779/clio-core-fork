@@ -89,4 +89,4 @@ loop:
 # Number of times to repeat each configuration (for statistical stability)
 repeat: 3
 
-output: "${HOME}/mofka_bench_results"
+output: "/workspace/results/mofka_bench_results"
