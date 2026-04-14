@@ -1,0 +1,468 @@
+loop:
+- - cte_bench.io_size
+- - cte_bench.num_threads
+repeat: 3
+results:
+- combination_idx: 0
+  end_time: '2026-04-13T02:00:26.360328'
+  repeat_idx: 0
+  runtime: 61.652485609054565
+  start_time: '2026-04-13T01:59:24.687600'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 1
+- combination_idx: 0
+  end_time: '2026-04-13T02:01:27.776336'
+  repeat_idx: 1
+  runtime: 61.40022158622742
+  start_time: '2026-04-13T02:00:26.367214'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 1
+- combination_idx: 0
+  end_time: '2026-04-13T02:02:29.284787'
+  repeat_idx: 2
+  runtime: 61.471883058547974
+  start_time: '2026-04-13T02:01:27.782860'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 1
+- combination_idx: 1
+  end_time: '2026-04-13T02:03:30.774598'
+  repeat_idx: 0
+  runtime: 61.46844434738159
+  start_time: '2026-04-13T02:02:29.294481'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 2
+- combination_idx: 1
+  end_time: '2026-04-13T02:04:32.232968'
+  repeat_idx: 1
+  runtime: 61.43394207954407
+  start_time: '2026-04-13T02:03:30.781778'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 2
+- combination_idx: 1
+  end_time: '2026-04-13T02:05:33.719082'
+  repeat_idx: 2
+  runtime: 61.462525606155396
+  start_time: '2026-04-13T02:04:32.239746'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 2
+- combination_idx: 2
+  end_time: '2026-04-13T02:06:35.167880'
+  repeat_idx: 0
+  runtime: 61.42012619972229
+  start_time: '2026-04-13T02:05:33.727240'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 4
+- combination_idx: 2
+  end_time: '2026-04-13T02:07:36.601938'
+  repeat_idx: 1
+  runtime: 61.41700530052185
+  start_time: '2026-04-13T02:06:35.175724'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 4
+- combination_idx: 2
+  end_time: '2026-04-13T02:08:38.024356'
+  repeat_idx: 2
+  runtime: 61.4049756526947
+  start_time: '2026-04-13T02:07:36.608306'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 4k
+    cte_bench.num_threads: 4
+- combination_idx: 3
+  end_time: '2026-04-13T02:09:39.495831'
+  repeat_idx: 0
+  runtime: 61.4524040222168
+  start_time: '2026-04-13T02:08:38.032335'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 1
+- combination_idx: 3
+  end_time: '2026-04-13T02:10:40.931018'
+  repeat_idx: 1
+  runtime: 61.42074918746948
+  start_time: '2026-04-13T02:09:39.502467'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 1
+- combination_idx: 3
+  end_time: '2026-04-13T02:11:42.436776'
+  repeat_idx: 2
+  runtime: 61.48869800567627
+  start_time: '2026-04-13T02:10:40.937057'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 1
+- combination_idx: 4
+  end_time: '2026-04-13T02:12:43.854019'
+  repeat_idx: 0
+  runtime: 61.380552530288696
+  start_time: '2026-04-13T02:11:42.444257'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 2
+- combination_idx: 4
+  end_time: '2026-04-13T02:13:45.299639'
+  repeat_idx: 1
+  runtime: 61.42004656791687
+  start_time: '2026-04-13T02:12:43.864850'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 2
+- combination_idx: 4
+  end_time: '2026-04-13T02:14:46.789045'
+  repeat_idx: 2
+  runtime: 61.471747398376465
+  start_time: '2026-04-13T02:13:45.306152'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 2
+- combination_idx: 5
+  end_time: '2026-04-13T02:15:48.269276'
+  repeat_idx: 0
+  runtime: 61.45862603187561
+  start_time: '2026-04-13T02:14:46.798641'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 4
+- combination_idx: 5
+  end_time: '2026-04-13T02:16:49.716523'
+  repeat_idx: 1
+  runtime: 61.427443981170654
+  start_time: '2026-04-13T02:15:48.276814'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 4
+- combination_idx: 5
+  end_time: '2026-04-13T02:17:51.178319'
+  repeat_idx: 2
+  runtime: 61.44054126739502
+  start_time: '2026-04-13T02:16:49.728306'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 16k
+    cte_bench.num_threads: 4
+- combination_idx: 6
+  end_time: '2026-04-13T02:18:52.655509'
+  repeat_idx: 0
+  runtime: 61.45917105674744
+  start_time: '2026-04-13T02:17:51.185175'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 1
+- combination_idx: 6
+  end_time: '2026-04-13T02:19:54.142870'
+  repeat_idx: 1
+  runtime: 61.46794080734253
+  start_time: '2026-04-13T02:18:52.662855'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 1
+- combination_idx: 6
+  end_time: '2026-04-13T02:20:55.609278'
+  repeat_idx: 2
+  runtime: 61.44855570793152
+  start_time: '2026-04-13T02:19:54.149056'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 1
+- combination_idx: 7
+  end_time: '2026-04-13T02:21:57.060794'
+  repeat_idx: 0
+  runtime: 61.42809247970581
+  start_time: '2026-04-13T02:20:55.615583'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 2
+- combination_idx: 7
+  end_time: '2026-04-13T02:22:58.509969'
+  repeat_idx: 1
+  runtime: 61.43195986747742
+  start_time: '2026-04-13T02:21:57.068468'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 2
+- combination_idx: 7
+  end_time: '2026-04-13T02:23:59.977872'
+  repeat_idx: 2
+  runtime: 61.45061373710632
+  start_time: '2026-04-13T02:22:58.516352'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 2
+- combination_idx: 8
+  end_time: '2026-04-13T02:25:01.426353'
+  repeat_idx: 0
+  runtime: 61.410059452056885
+  start_time: '2026-04-13T02:23:59.986125'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 4
+- combination_idx: 8
+  end_time: '2026-04-13T02:26:02.916057'
+  repeat_idx: 1
+  runtime: 61.46419811248779
+  start_time: '2026-04-13T02:25:01.435175'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 4
+- combination_idx: 8
+  end_time: '2026-04-13T02:27:04.297706'
+  repeat_idx: 2
+  runtime: 61.362401247024536
+  start_time: '2026-04-13T02:26:02.923641'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 64k
+    cte_bench.num_threads: 4
+- combination_idx: 9
+  end_time: '2026-04-13T02:28:05.692091'
+  repeat_idx: 0
+  runtime: 61.373631954193115
+  start_time: '2026-04-13T02:27:04.304285'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 1
+- combination_idx: 9
+  end_time: '2026-04-13T02:29:07.056200'
+  repeat_idx: 1
+  runtime: 61.341312646865845
+  start_time: '2026-04-13T02:28:05.699307'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 1
+- combination_idx: 9
+  end_time: '2026-04-13T02:30:08.482171'
+  repeat_idx: 2
+  runtime: 61.40581655502319
+  start_time: '2026-04-13T02:29:07.064686'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 1
+- combination_idx: 10
+  end_time: '2026-04-13T02:31:09.883515'
+  repeat_idx: 0
+  runtime: 61.36998724937439
+  start_time: '2026-04-13T02:30:08.489417'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 2
+- combination_idx: 10
+  end_time: '2026-04-13T02:32:11.210480'
+  repeat_idx: 1
+  runtime: 61.30873513221741
+  start_time: '2026-04-13T02:31:09.892638'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 2
+- combination_idx: 10
+  end_time: '2026-04-13T02:33:12.659493'
+  repeat_idx: 2
+  runtime: 61.43231534957886
+  start_time: '2026-04-13T02:32:11.217763'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 2
+- combination_idx: 11
+  end_time: '2026-04-13T02:34:14.084237'
+  repeat_idx: 0
+  runtime: 61.393473625183105
+  start_time: '2026-04-13T02:33:12.666852'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 4
+- combination_idx: 11
+  end_time: '2026-04-13T02:35:15.560832'
+  repeat_idx: 1
+  runtime: 61.44110608100891
+  start_time: '2026-04-13T02:34:14.093223'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 4
+- combination_idx: 11
+  end_time: '2026-04-13T02:36:16.961451'
+  repeat_idx: 2
+  runtime: 61.38141322135925
+  start_time: '2026-04-13T02:35:15.569739'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 256k
+    cte_bench.num_threads: 4
+- combination_idx: 12
+  end_time: '2026-04-13T02:37:18.317442'
+  repeat_idx: 0
+  runtime: 61.33869385719299
+  start_time: '2026-04-13T02:36:16.967667'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 1
+- combination_idx: 12
+  end_time: '2026-04-13T02:38:19.732323'
+  repeat_idx: 1
+  runtime: 61.395225048065186
+  start_time: '2026-04-13T02:37:18.324401'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 1
+- combination_idx: 12
+  end_time: '2026-04-13T02:39:21.181006'
+  repeat_idx: 2
+  runtime: 61.4178204536438
+  start_time: '2026-04-13T02:38:19.744254'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 1
+- combination_idx: 13
+  end_time: '2026-04-13T02:40:22.639502'
+  repeat_idx: 0
+  runtime: 61.43938994407654
+  start_time: '2026-04-13T02:39:21.189327'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 2
+- combination_idx: 13
+  end_time: '2026-04-13T02:41:24.026619'
+  repeat_idx: 1
+  runtime: 61.369715213775635
+  start_time: '2026-04-13T02:40:22.646005'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 2
+- combination_idx: 13
+  end_time: '2026-04-13T02:42:25.452214'
+  repeat_idx: 2
+  runtime: 61.41136884689331
+  start_time: '2026-04-13T02:41:24.033091'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 2
+- combination_idx: 14
+  end_time: '2026-04-13T02:43:26.819072'
+  repeat_idx: 0
+  runtime: 61.34486246109009
+  start_time: '2026-04-13T02:42:25.459204'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 4
+- combination_idx: 14
+  end_time: '2026-04-13T02:44:28.260991'
+  repeat_idx: 1
+  runtime: 61.42402958869934
+  start_time: '2026-04-13T02:43:26.826422'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 4
+- combination_idx: 14
+  end_time: '2026-04-13T02:45:29.670254'
+  repeat_idx: 2
+  runtime: 61.39068055152893
+  start_time: '2026-04-13T02:44:28.269489'
+  stats: {}
+  status: success
+  variables:
+    cte_bench.io_size: 1m
+    cte_bench.num_threads: 4
+test_name: cte_bench_perf
+total_runs: 45
+variables:
+  cte_bench.io_size:
+  - 4k
+  - 16k
+  - 64k
+  - 256k
+  - 1m
+  cte_bench.num_threads:
+  - 1
+  - 2
+  - 4

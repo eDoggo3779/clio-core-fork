@@ -4,10 +4,8 @@ loop:
 repeat: 3
 results:
 - combination_idx: 0
-  end_time: '2026-04-13T01:32:45.500354'
   repeat_idx: 0
   runtime: 5.169602870941162
-  start_time: '2026-04-13T01:32:40.304669'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.87
     mofka_bench.consumer.events_count: 1000
@@ -24,10 +22,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 1
 - combination_idx: 0
-  end_time: '2026-04-13T01:32:50.160729'
   repeat_idx: 1
   runtime: 4.63938307762146
-  start_time: '2026-04-13T01:32:45.512235'
   stats:
     mofka_bench.consumer.elapsed_ms: 137.61
     mofka_bench.consumer.events_count: 1000
@@ -44,10 +40,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 1
 - combination_idx: 0
-  end_time: '2026-04-13T01:32:54.912396'
   repeat_idx: 2
   runtime: 4.727166652679443
-  start_time: '2026-04-13T01:32:50.168405'
   stats:
     mofka_bench.consumer.elapsed_ms: 94.66
     mofka_bench.consumer.events_count: 1000
@@ -64,10 +58,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 1
 - combination_idx: 1
-  end_time: '2026-04-13T01:32:59.585360'
   repeat_idx: 0
   runtime: 4.655557632446289
-  start_time: '2026-04-13T01:32:54.921334'
   stats:
     mofka_bench.consumer.elapsed_ms: 94.36
     mofka_bench.consumer.events_count: 1000
@@ -84,10 +76,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 2
 - combination_idx: 1
-  end_time: '2026-04-13T01:33:04.222781'
   repeat_idx: 1
   runtime: 4.619643688201904
-  start_time: '2026-04-13T01:32:59.593334'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.74
     mofka_bench.consumer.events_count: 1000
@@ -104,10 +94,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 2
 - combination_idx: 1
-  end_time: '2026-04-13T01:33:08.913842'
   repeat_idx: 2
   runtime: 4.658288955688477
-  start_time: '2026-04-13T01:33:04.234332'
   stats:
     mofka_bench.consumer.elapsed_ms: 139.64
     mofka_bench.consumer.events_count: 1000
@@ -124,10 +112,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 2
 - combination_idx: 2
-  end_time: '2026-04-13T01:33:13.621957'
   repeat_idx: 0
   runtime: 4.691296339035034
-  start_time: '2026-04-13T01:33:08.923862'
   stats:
     mofka_bench.consumer.elapsed_ms: 94.52
     mofka_bench.consumer.events_count: 1000
@@ -144,10 +130,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 4
 - combination_idx: 2
-  end_time: '2026-04-13T01:33:18.377523'
   repeat_idx: 1
   runtime: 4.7317821979522705
-  start_time: '2026-04-13T01:33:13.629624'
   stats:
     mofka_bench.consumer.elapsed_ms: 94.22
     mofka_bench.consumer.events_count: 1000
@@ -164,10 +148,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 4
 - combination_idx: 2
-  end_time: '2026-04-13T01:33:23.041073'
   repeat_idx: 2
   runtime: 4.641631841659546
-  start_time: '2026-04-13T01:33:18.387220'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.45
     mofka_bench.consumer.events_count: 1000
@@ -184,10 +166,8 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 4
 - combination_idx: 3
-  end_time: '2026-04-13T01:33:27.685490'
   repeat_idx: 0
   runtime: 4.626955986022949
-  start_time: '2026-04-13T01:33:23.051940'
   stats:
     mofka_bench.consumer.elapsed_ms: 98.93
     mofka_bench.consumer.events_count: 1000
@@ -204,10 +184,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 1
 - combination_idx: 3
-  end_time: '2026-04-13T01:33:32.406596'
   repeat_idx: 1
   runtime: 4.697763681411743
-  start_time: '2026-04-13T01:33:27.692887'
   stats:
     mofka_bench.consumer.elapsed_ms: 104.45
     mofka_bench.consumer.events_count: 1000
@@ -224,10 +202,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 1
 - combination_idx: 3
-  end_time: '2026-04-13T01:33:37.085986'
   repeat_idx: 2
   runtime: 4.653372049331665
-  start_time: '2026-04-13T01:33:32.416547'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.66
     mofka_bench.consumer.events_count: 1000
@@ -244,10 +220,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 1
 - combination_idx: 4
-  end_time: '2026-04-13T01:33:41.737903'
   repeat_idx: 0
   runtime: 4.622150897979736
-  start_time: '2026-04-13T01:33:37.102144'
   stats:
     mofka_bench.consumer.elapsed_ms: 94.62
     mofka_bench.consumer.events_count: 1000
@@ -264,10 +238,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 2
 - combination_idx: 4
-  end_time: '2026-04-13T01:33:46.388018'
   repeat_idx: 1
   runtime: 4.633271217346191
-  start_time: '2026-04-13T01:33:41.748180'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.36
     mofka_bench.consumer.events_count: 1000
@@ -284,10 +256,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 2
 - combination_idx: 4
-  end_time: '2026-04-13T01:33:51.339991'
   repeat_idx: 2
   runtime: 4.9135048389434814
-  start_time: '2026-04-13T01:33:46.395174'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.59
     mofka_bench.consumer.events_count: 1000
@@ -304,10 +274,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 2
 - combination_idx: 5
-  end_time: '2026-04-13T01:33:56.044777'
   repeat_idx: 0
   runtime: 4.672236204147339
-  start_time: '2026-04-13T01:33:51.355782'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.51
     mofka_bench.consumer.events_count: 1000
@@ -324,10 +292,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 4
 - combination_idx: 5
-  end_time: '2026-04-13T01:34:00.728110'
   repeat_idx: 1
   runtime: 4.658315420150757
-  start_time: '2026-04-13T01:33:56.053857'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.65
     mofka_bench.consumer.events_count: 1000
@@ -344,10 +310,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 4
 - combination_idx: 5
-  end_time: '2026-04-13T01:34:05.482114'
   repeat_idx: 2
   runtime: 4.71895956993103
-  start_time: '2026-04-13T01:34:00.739617'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.27
     mofka_bench.consumer.events_count: 1000
@@ -364,10 +328,8 @@ results:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 4
 - combination_idx: 6
-  end_time: '2026-04-13T01:34:10.122970'
   repeat_idx: 0
   runtime: 4.615405321121216
-  start_time: '2026-04-13T01:34:05.493317'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.88
     mofka_bench.consumer.events_count: 1000
@@ -384,10 +346,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 1
 - combination_idx: 6
-  end_time: '2026-04-13T01:34:14.817340'
   repeat_idx: 1
   runtime: 4.677445888519287
-  start_time: '2026-04-13T01:34:10.132668'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.76
     mofka_bench.consumer.events_count: 1000
@@ -404,10 +364,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 1
 - combination_idx: 6
-  end_time: '2026-04-13T01:34:19.572654'
   repeat_idx: 2
   runtime: 4.734816074371338
-  start_time: '2026-04-13T01:34:14.825093'
   stats:
     mofka_bench.consumer.elapsed_ms: 94.21
     mofka_bench.consumer.events_count: 1000
@@ -424,10 +382,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 1
 - combination_idx: 7
-  end_time: '2026-04-13T01:34:24.247367'
   repeat_idx: 0
   runtime: 4.648213148117065
-  start_time: '2026-04-13T01:34:19.586182'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.99
     mofka_bench.consumer.events_count: 1000
@@ -444,10 +400,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 2
 - combination_idx: 7
-  end_time: '2026-04-13T01:34:28.967012'
   repeat_idx: 1
   runtime: 4.69987154006958
-  start_time: '2026-04-13T01:34:24.256539'
   stats:
     mofka_bench.consumer.elapsed_ms: 99.42
     mofka_bench.consumer.events_count: 1000
@@ -464,10 +418,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 2
 - combination_idx: 7
-  end_time: '2026-04-13T01:34:33.679722'
   repeat_idx: 2
   runtime: 4.677113056182861
-  start_time: '2026-04-13T01:34:28.975348'
   stats:
     mofka_bench.consumer.elapsed_ms: 98.67
     mofka_bench.consumer.events_count: 1000
@@ -484,10 +436,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 2
 - combination_idx: 8
-  end_time: '2026-04-13T01:34:38.375190'
   repeat_idx: 0
   runtime: 4.675663709640503
-  start_time: '2026-04-13T01:34:33.692796'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.44
     mofka_bench.consumer.events_count: 1000
@@ -504,10 +454,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 4
 - combination_idx: 8
-  end_time: '2026-04-13T01:34:43.022279'
   repeat_idx: 1
   runtime: 4.623631477355957
-  start_time: '2026-04-13T01:34:38.382643'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.17
     mofka_bench.consumer.events_count: 1000
@@ -524,10 +472,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 4
 - combination_idx: 8
-  end_time: '2026-04-13T01:34:47.715037'
   repeat_idx: 2
   runtime: 4.662086725234985
-  start_time: '2026-04-13T01:34:43.032813'
   stats:
     mofka_bench.consumer.elapsed_ms: 97.79
     mofka_bench.consumer.events_count: 1000
@@ -544,10 +490,8 @@ results:
     mofka_bench.data_size: 4096
     mofka_bench.num_threads: 4
 - combination_idx: 9
-  end_time: '2026-04-13T01:34:52.394044'
   repeat_idx: 0
   runtime: 4.647902488708496
-  start_time: '2026-04-13T01:34:47.724760'
   stats:
     mofka_bench.consumer.elapsed_ms: 98.45
     mofka_bench.consumer.events_count: 1000
@@ -564,10 +508,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 1
 - combination_idx: 9
-  end_time: '2026-04-13T01:34:57.127824'
   repeat_idx: 1
   runtime: 4.714512586593628
-  start_time: '2026-04-13T01:34:52.404301'
   stats:
     mofka_bench.consumer.elapsed_ms: 95.69
     mofka_bench.consumer.events_count: 1000
@@ -584,10 +526,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 1
 - combination_idx: 9
-  end_time: '2026-04-13T01:35:01.860632'
   repeat_idx: 2
   runtime: 4.700851202011108
-  start_time: '2026-04-13T01:34:57.143527'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.03
     mofka_bench.consumer.events_count: 1000
@@ -604,10 +544,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 1
 - combination_idx: 10
-  end_time: '2026-04-13T01:35:06.626876'
   repeat_idx: 0
   runtime: 4.747936725616455
-  start_time: '2026-04-13T01:35:01.872284'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.99
     mofka_bench.consumer.events_count: 1000
@@ -624,10 +562,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 2
 - combination_idx: 10
-  end_time: '2026-04-13T01:35:11.274247'
   repeat_idx: 1
   runtime: 4.622679233551025
-  start_time: '2026-04-13T01:35:06.634102'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.16
     mofka_bench.consumer.events_count: 1000
@@ -644,10 +580,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 2
 - combination_idx: 10
-  end_time: '2026-04-13T01:35:16.212524'
   repeat_idx: 2
   runtime: 4.921533584594727
-  start_time: '2026-04-13T01:35:11.283021'
   stats:
     mofka_bench.consumer.elapsed_ms: 145.45
     mofka_bench.consumer.events_count: 1000
@@ -664,10 +598,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 2
 - combination_idx: 11
-  end_time: '2026-04-13T01:35:20.957394'
   repeat_idx: 0
   runtime: 4.718125820159912
-  start_time: '2026-04-13T01:35:16.221667'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.33
     mofka_bench.consumer.events_count: 1000
@@ -684,10 +616,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 4
 - combination_idx: 11
-  end_time: '2026-04-13T01:35:25.705100'
   repeat_idx: 1
   runtime: 4.708808183670044
-  start_time: '2026-04-13T01:35:20.968209'
   stats:
     mofka_bench.consumer.elapsed_ms: 144.22
     mofka_bench.consumer.events_count: 1000
@@ -704,10 +634,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 4
 - combination_idx: 11
-  end_time: '2026-04-13T01:35:30.489643'
   repeat_idx: 2
   runtime: 4.743898153305054
-  start_time: '2026-04-13T01:35:25.716568'
   stats:
     mofka_bench.consumer.elapsed_ms: 94.6
     mofka_bench.consumer.events_count: 1000
@@ -724,10 +652,8 @@ results:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 4
 - combination_idx: 12
-  end_time: '2026-04-13T01:35:35.380746'
   repeat_idx: 0
   runtime: 4.849617004394531
-  start_time: '2026-04-13T01:35:30.504165'
   stats:
     mofka_bench.consumer.elapsed_ms: 103.85
     mofka_bench.consumer.events_count: 1000
@@ -744,10 +670,8 @@ results:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 1
 - combination_idx: 12
-  end_time: '2026-04-13T01:35:40.257077'
   repeat_idx: 1
   runtime: 4.857316732406616
-  start_time: '2026-04-13T01:35:35.393389'
   stats:
     mofka_bench.consumer.elapsed_ms: 117.41
     mofka_bench.consumer.events_count: 1000
@@ -764,10 +688,8 @@ results:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 1
 - combination_idx: 12
-  end_time: '2026-04-13T01:35:45.400297'
   repeat_idx: 2
   runtime: 5.128911733627319
-  start_time: '2026-04-13T01:35:40.263694'
   stats:
     mofka_bench.consumer.elapsed_ms: 105.94
     mofka_bench.consumer.events_count: 1000
@@ -784,10 +706,8 @@ results:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 1
 - combination_idx: 13
-  end_time: '2026-04-13T01:35:50.398084'
   repeat_idx: 0
   runtime: 4.977750539779663
-  start_time: '2026-04-13T01:35:45.412250'
   stats:
     mofka_bench.consumer.elapsed_ms: 110.16
     mofka_bench.consumer.events_count: 1000
@@ -804,10 +724,8 @@ results:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 2
 - combination_idx: 13
-  end_time: '2026-04-13T01:35:55.311014'
   repeat_idx: 1
   runtime: 4.885401248931885
-  start_time: '2026-04-13T01:35:50.405958'
   stats:
     mofka_bench.consumer.elapsed_ms: 114.86
     mofka_bench.consumer.events_count: 1000
@@ -824,10 +742,8 @@ results:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 2
 - combination_idx: 13
-  end_time: '2026-04-13T01:36:00.216726'
   repeat_idx: 2
   runtime: 4.875971078872681
-  start_time: '2026-04-13T01:35:55.322219'
   stats:
     mofka_bench.consumer.elapsed_ms: 107.63
     mofka_bench.consumer.events_count: 1000
@@ -844,10 +760,8 @@ results:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 2
 - combination_idx: 14
-  end_time: '2026-04-13T01:36:05.070771'
   repeat_idx: 0
   runtime: 4.816908597946167
-  start_time: '2026-04-13T01:36:00.227095'
   stats:
     mofka_bench.consumer.elapsed_ms: 117.37
     mofka_bench.consumer.events_count: 1000
@@ -864,10 +778,8 @@ results:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 4
 - combination_idx: 14
-  end_time: '2026-04-13T01:36:09.937936'
   repeat_idx: 1
   runtime: 4.830846548080444
-  start_time: '2026-04-13T01:36:05.082126'
   stats:
     mofka_bench.consumer.elapsed_ms: 157.4
     mofka_bench.consumer.events_count: 1000
@@ -884,10 +796,8 @@ results:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 4
 - combination_idx: 14
-  end_time: '2026-04-13T01:36:14.821854'
   repeat_idx: 2
   runtime: 4.851568698883057
-  start_time: '2026-04-13T01:36:09.950396'
   stats:
     mofka_bench.consumer.elapsed_ms: 100.48
     mofka_bench.consumer.events_count: 1000

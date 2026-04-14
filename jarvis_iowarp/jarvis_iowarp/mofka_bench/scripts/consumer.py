@@ -47,10 +47,27 @@ def main():
     # Open topic
     topic = driver.open_topic(args.topic)
 
-    # Create consumer (overload 2: no data_selector/data_broker — gets all data by default)
+    # Build data_selector and data_broker callbacks so the consumer
+    # actually fetches event payloads.  Without these (overload 2),
+    # Mofka returns events with no data attached.
+    selectivity = args.data_selectivity
+
+    def data_selector(metadata, descriptor):
+        if selectivity <= 0:
+            return None
+        if selectivity >= 1.0:
+            return descriptor
+        size = int(descriptor.size * selectivity)
+        return descriptor.make_sub_view(0, size) if size > 0 else None
+
+    def data_broker(metadata, descriptor):
+        return [bytearray(descriptor.size)]
+
     consumer = topic.consumer(
         name="bench-consumer",
         batch_size=args.batch_size,
+        data_selector=data_selector,
+        data_broker=data_broker,
     )
 
     # Run benchmark
@@ -65,7 +82,10 @@ def main():
         event = future.wait()
         event_data = event.data
         if event_data is not None:
-            total_data_bytes += len(event_data)
+            if isinstance(event_data, (list, tuple)):
+                total_data_bytes += sum(len(buf) for buf in event_data)
+            else:
+                total_data_bytes += len(event_data)
         event.acknowledge()
         events_consumed += 1
 

@@ -49,7 +49,12 @@
       "Bash(command -v chimaera)",
       "Bash(g++ --version)",
       "Bash(/workspace/build/bin/wrp_cte_bench)",
-      "Bash(ln -sf /workspace/build/bin/wrp_cte_bench /home/iowarp/.local/bin/wrp_cte_bench)"
+      "Bash(ln -sf /workspace/build/bin/wrp_cte_bench /home/iowarp/.local/bin/wrp_cte_bench)",
+      "Bash(wrp_cte_bench --help)",
+      "Bash(wrp_cte_bench)",
+      "Bash(env)",
+      "Bash(chimaera --help)",
+      "Bash(ldd /home/iowarp/.local/bin/chimaera)"
     ],
     "deny": [],
     "ask": []
