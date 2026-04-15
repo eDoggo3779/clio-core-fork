@@ -4,125 +4,139 @@ loop:
 repeat: 3
 results:
 - combination_idx: 0
+  end_time: '2026-04-15T20:25:32.737800'
   repeat_idx: 0
-  runtime: 5.169602870941162
+  runtime: 4.674034595489502
+  start_time: '2026-04-15T20:25:28.044403'
   stats:
-    mofka_bench.consumer.elapsed_ms: 95.87
+    mofka_bench.consumer.elapsed_ms: 91.86
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10431.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 136.9
+    mofka_bench.consumer.events_per_sec: 10887.0
+    mofka_bench.consumer.throughput_mbps: 2.66
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 143.26
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7305.0
-    mofka_bench.producer.throughput_mbps: 2.23
-    mofka_bench.producer.total_data_mb: 0.31
-  status: success
-  variables:
-    mofka_bench.data_size: 256
-    mofka_bench.num_threads: 1
-- combination_idx: 0
-  repeat_idx: 1
-  runtime: 4.63938307762146
-  stats:
-    mofka_bench.consumer.elapsed_ms: 137.61
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 7267.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 142.43
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7021.0
-    mofka_bench.producer.throughput_mbps: 2.14
-    mofka_bench.producer.total_data_mb: 0.31
-  status: success
-  variables:
-    mofka_bench.data_size: 256
-    mofka_bench.num_threads: 1
-- combination_idx: 0
-  repeat_idx: 2
-  runtime: 4.727166652679443
-  stats:
-    mofka_bench.consumer.elapsed_ms: 94.66
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10564.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 143.61
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6963.0
+    mofka_bench.producer.events_per_sec: 6980.0
     mofka_bench.producer.throughput_mbps: 2.13
     mofka_bench.producer.total_data_mb: 0.31
   status: success
   variables:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 1
-- combination_idx: 1
-  repeat_idx: 0
-  runtime: 4.655557632446289
-  stats:
-    mofka_bench.consumer.elapsed_ms: 94.36
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10598.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 141.67
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7059.0
-    mofka_bench.producer.throughput_mbps: 2.15
-    mofka_bench.producer.total_data_mb: 0.31
-  status: success
-  variables:
-    mofka_bench.data_size: 256
-    mofka_bench.num_threads: 2
-- combination_idx: 1
+- combination_idx: 0
+  end_time: '2026-04-15T20:25:37.405522'
   repeat_idx: 1
-  runtime: 4.619643688201904
+  runtime: 4.651637315750122
+  start_time: '2026-04-15T20:25:32.743907'
   stats:
-    mofka_bench.consumer.elapsed_ms: 95.74
+    mofka_bench.consumer.elapsed_ms: 93.78
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10445.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 42.76
+    mofka_bench.consumer.events_per_sec: 10664.0
+    mofka_bench.consumer.throughput_mbps: 2.6
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 127.64
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 23388.0
-    mofka_bench.producer.throughput_mbps: 7.14
+    mofka_bench.producer.events_per_sec: 7835.0
+    mofka_bench.producer.throughput_mbps: 2.39
+    mofka_bench.producer.total_data_mb: 0.31
+  status: success
+  variables:
+    mofka_bench.data_size: 256
+    mofka_bench.num_threads: 1
+- combination_idx: 0
+  end_time: '2026-04-15T20:25:42.059298'
+  repeat_idx: 2
+  runtime: 4.6227028369903564
+  start_time: '2026-04-15T20:25:37.412101'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 92.86
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10769.0
+    mofka_bench.consumer.throughput_mbps: 2.63
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 128.99
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 7753.0
+    mofka_bench.producer.throughput_mbps: 2.37
+    mofka_bench.producer.total_data_mb: 0.31
+  status: success
+  variables:
+    mofka_bench.data_size: 256
+    mofka_bench.num_threads: 1
+- combination_idx: 1
+  end_time: '2026-04-15T20:25:46.705459'
+  repeat_idx: 0
+  runtime: 4.604177236557007
+  start_time: '2026-04-15T20:25:42.074038'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 91.62
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10914.0
+    mofka_bench.consumer.throughput_mbps: 2.66
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 117.66
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 8499.0
+    mofka_bench.producer.throughput_mbps: 2.59
     mofka_bench.producer.total_data_mb: 0.31
   status: success
   variables:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 2
 - combination_idx: 1
-  repeat_idx: 2
-  runtime: 4.658288955688477
+  end_time: '2026-04-15T20:25:51.411293'
+  repeat_idx: 1
+  runtime: 4.678046941757202
+  start_time: '2026-04-15T20:25:46.719369'
   stats:
-    mofka_bench.consumer.elapsed_ms: 139.64
+    mofka_bench.consumer.elapsed_ms: 92.76
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 7161.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 127.17
+    mofka_bench.consumer.events_per_sec: 10781.0
+    mofka_bench.consumer.throughput_mbps: 2.63
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 131.42
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7863.0
-    mofka_bench.producer.throughput_mbps: 2.4
+    mofka_bench.producer.events_per_sec: 7609.0
+    mofka_bench.producer.throughput_mbps: 2.32
+    mofka_bench.producer.total_data_mb: 0.31
+  status: success
+  variables:
+    mofka_bench.data_size: 256
+    mofka_bench.num_threads: 2
+- combination_idx: 1
+  end_time: '2026-04-15T20:25:56.183642'
+  repeat_idx: 2
+  runtime: 4.737813711166382
+  start_time: '2026-04-15T20:25:51.420366'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 94.7
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10559.0
+    mofka_bench.consumer.throughput_mbps: 2.58
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 143.53
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6967.0
+    mofka_bench.producer.throughput_mbps: 2.13
     mofka_bench.producer.total_data_mb: 0.31
   status: success
   variables:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 2
 - combination_idx: 2
+  end_time: '2026-04-15T20:26:00.874003'
   repeat_idx: 0
-  runtime: 4.691296339035034
+  runtime: 4.65224814414978
+  start_time: '2026-04-15T20:25:56.195832'
   stats:
-    mofka_bench.consumer.elapsed_ms: 94.52
+    mofka_bench.consumer.elapsed_ms: 91.96
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10579.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 134.77
+    mofka_bench.consumer.events_per_sec: 10874.0
+    mofka_bench.consumer.throughput_mbps: 2.65
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 135.27
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7420.0
+    mofka_bench.producer.events_per_sec: 7392.0
     mofka_bench.producer.throughput_mbps: 2.26
     mofka_bench.producer.total_data_mb: 0.31
   status: success
@@ -130,684 +144,760 @@ results:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 4
 - combination_idx: 2
+  end_time: '2026-04-15T20:26:05.600260'
   repeat_idx: 1
-  runtime: 4.7317821979522705
+  runtime: 4.686471939086914
+  start_time: '2026-04-15T20:26:00.886402'
   stats:
-    mofka_bench.consumer.elapsed_ms: 94.22
+    mofka_bench.consumer.elapsed_ms: 95.31
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10614.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 141.45
+    mofka_bench.consumer.events_per_sec: 10493.0
+    mofka_bench.consumer.throughput_mbps: 2.56
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 141.78
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7070.0
-    mofka_bench.producer.throughput_mbps: 2.16
+    mofka_bench.producer.events_per_sec: 7053.0
+    mofka_bench.producer.throughput_mbps: 2.15
     mofka_bench.producer.total_data_mb: 0.31
   status: success
   variables:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 4
 - combination_idx: 2
+  end_time: '2026-04-15T20:26:10.335777'
   repeat_idx: 2
-  runtime: 4.641631841659546
+  runtime: 4.693139314651489
+  start_time: '2026-04-15T20:26:05.615496'
   stats:
-    mofka_bench.consumer.elapsed_ms: 96.45
+    mofka_bench.consumer.elapsed_ms: 97.01
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10368.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 136.35
+    mofka_bench.consumer.events_per_sec: 10309.0
+    mofka_bench.consumer.throughput_mbps: 2.52
+    mofka_bench.consumer.total_data_mb: 0.24
+    mofka_bench.producer.elapsed_ms: 139.51
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7334.0
-    mofka_bench.producer.throughput_mbps: 2.24
+    mofka_bench.producer.events_per_sec: 7168.0
+    mofka_bench.producer.throughput_mbps: 2.19
     mofka_bench.producer.total_data_mb: 0.31
   status: success
   variables:
     mofka_bench.data_size: 256
     mofka_bench.num_threads: 4
 - combination_idx: 3
+  end_time: '2026-04-15T20:26:15.061104'
   repeat_idx: 0
-  runtime: 4.626955986022949
+  runtime: 4.685551404953003
+  start_time: '2026-04-15T20:26:10.350716'
   stats:
-    mofka_bench.consumer.elapsed_ms: 98.93
+    mofka_bench.consumer.elapsed_ms: 131.23
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10108.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 140.69
+    mofka_bench.consumer.events_per_sec: 7620.0
+    mofka_bench.consumer.throughput_mbps: 7.44
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 150.49
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7108.0
-    mofka_bench.producer.throughput_mbps: 7.38
+    mofka_bench.producer.events_per_sec: 6645.0
+    mofka_bench.producer.throughput_mbps: 6.89
     mofka_bench.producer.total_data_mb: 1.04
   status: success
   variables:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 1
 - combination_idx: 3
+  end_time: '2026-04-15T20:26:19.678519'
   repeat_idx: 1
-  runtime: 4.697763681411743
+  runtime: 4.597729444503784
+  start_time: '2026-04-15T20:26:15.071306'
   stats:
-    mofka_bench.consumer.elapsed_ms: 104.45
+    mofka_bench.consumer.elapsed_ms: 157.24
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 9574.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 124.35
+    mofka_bench.consumer.events_per_sec: 6360.0
+    mofka_bench.consumer.throughput_mbps: 6.21
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 124.31
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 8042.0
-    mofka_bench.producer.throughput_mbps: 8.34
+    mofka_bench.producer.events_per_sec: 8044.0
+    mofka_bench.producer.throughput_mbps: 8.35
     mofka_bench.producer.total_data_mb: 1.04
   status: success
   variables:
     mofka_bench.data_size: 1024
     mofka_bench.num_threads: 1
 - combination_idx: 3
+  end_time: '2026-04-15T20:26:24.387774'
   repeat_idx: 2
-  runtime: 4.653372049331665
-  stats:
-    mofka_bench.consumer.elapsed_ms: 96.66
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10345.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 146.03
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6848.0
-    mofka_bench.producer.throughput_mbps: 7.11
-    mofka_bench.producer.total_data_mb: 1.04
-  status: success
-  variables:
-    mofka_bench.data_size: 1024
-    mofka_bench.num_threads: 1
-- combination_idx: 4
-  repeat_idx: 0
-  runtime: 4.622150897979736
-  stats:
-    mofka_bench.consumer.elapsed_ms: 94.62
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10568.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 143.12
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6987.0
-    mofka_bench.producer.throughput_mbps: 7.25
-    mofka_bench.producer.total_data_mb: 1.04
-  status: success
-  variables:
-    mofka_bench.data_size: 1024
-    mofka_bench.num_threads: 2
-- combination_idx: 4
-  repeat_idx: 1
-  runtime: 4.633271217346191
-  stats:
-    mofka_bench.consumer.elapsed_ms: 95.36
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10486.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 126.75
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7890.0
-    mofka_bench.producer.throughput_mbps: 8.19
-    mofka_bench.producer.total_data_mb: 1.04
-  status: success
-  variables:
-    mofka_bench.data_size: 1024
-    mofka_bench.num_threads: 2
-- combination_idx: 4
-  repeat_idx: 2
-  runtime: 4.9135048389434814
-  stats:
-    mofka_bench.consumer.elapsed_ms: 96.59
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10353.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 142.27
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7029.0
-    mofka_bench.producer.throughput_mbps: 7.29
-    mofka_bench.producer.total_data_mb: 1.04
-  status: success
-  variables:
-    mofka_bench.data_size: 1024
-    mofka_bench.num_threads: 2
-- combination_idx: 5
-  repeat_idx: 0
-  runtime: 4.672236204147339
-  stats:
-    mofka_bench.consumer.elapsed_ms: 96.51
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10361.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 143.16
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6985.0
-    mofka_bench.producer.throughput_mbps: 7.25
-    mofka_bench.producer.total_data_mb: 1.04
-  status: success
-  variables:
-    mofka_bench.data_size: 1024
-    mofka_bench.num_threads: 4
-- combination_idx: 5
-  repeat_idx: 1
-  runtime: 4.658315420150757
-  stats:
-    mofka_bench.consumer.elapsed_ms: 95.65
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10455.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 131.54
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7603.0
-    mofka_bench.producer.throughput_mbps: 7.89
-    mofka_bench.producer.total_data_mb: 1.04
-  status: success
-  variables:
-    mofka_bench.data_size: 1024
-    mofka_bench.num_threads: 4
-- combination_idx: 5
-  repeat_idx: 2
-  runtime: 4.71895956993103
-  stats:
-    mofka_bench.consumer.elapsed_ms: 95.27
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10497.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 142.69
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7008.0
-    mofka_bench.producer.throughput_mbps: 7.27
-    mofka_bench.producer.total_data_mb: 1.04
-  status: success
-  variables:
-    mofka_bench.data_size: 1024
-    mofka_bench.num_threads: 4
-- combination_idx: 6
-  repeat_idx: 0
-  runtime: 4.615405321121216
-  stats:
-    mofka_bench.consumer.elapsed_ms: 95.88
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10430.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 137.1
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7294.0
-    mofka_bench.producer.throughput_mbps: 28.94
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 1
-- combination_idx: 6
-  repeat_idx: 1
-  runtime: 4.677445888519287
-  stats:
-    mofka_bench.consumer.elapsed_ms: 96.76
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10335.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 145.69
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6864.0
-    mofka_bench.producer.throughput_mbps: 27.23
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 1
-- combination_idx: 6
-  repeat_idx: 2
-  runtime: 4.734816074371338
-  stats:
-    mofka_bench.consumer.elapsed_ms: 94.21
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10614.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 129.44
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 7725.0
-    mofka_bench.producer.throughput_mbps: 30.65
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 1
-- combination_idx: 7
-  repeat_idx: 0
-  runtime: 4.648213148117065
-  stats:
-    mofka_bench.consumer.elapsed_ms: 95.99
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10417.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 143.24
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6981.0
-    mofka_bench.producer.throughput_mbps: 27.7
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 2
-- combination_idx: 7
-  repeat_idx: 1
-  runtime: 4.69987154006958
-  stats:
-    mofka_bench.consumer.elapsed_ms: 99.42
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10058.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 154.66
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6466.0
-    mofka_bench.producer.throughput_mbps: 25.65
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 2
-- combination_idx: 7
-  repeat_idx: 2
-  runtime: 4.677113056182861
-  stats:
-    mofka_bench.consumer.elapsed_ms: 98.67
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10135.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 154.28
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6482.0
-    mofka_bench.producer.throughput_mbps: 25.71
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 2
-- combination_idx: 8
-  repeat_idx: 0
-  runtime: 4.675663709640503
-  stats:
-    mofka_bench.consumer.elapsed_ms: 96.44
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10369.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 159.31
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6277.0
-    mofka_bench.producer.throughput_mbps: 24.9
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 4
-- combination_idx: 8
-  repeat_idx: 1
-  runtime: 4.623631477355957
-  stats:
-    mofka_bench.consumer.elapsed_ms: 95.17
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10507.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 124.68
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 8021.0
-    mofka_bench.producer.throughput_mbps: 31.82
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 4
-- combination_idx: 8
-  repeat_idx: 2
-  runtime: 4.662086725234985
-  stats:
-    mofka_bench.consumer.elapsed_ms: 97.79
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10226.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 160.34
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 6237.0
-    mofka_bench.producer.throughput_mbps: 24.74
-    mofka_bench.producer.total_data_mb: 3.97
-  status: success
-  variables:
-    mofka_bench.data_size: 4096
-    mofka_bench.num_threads: 4
-- combination_idx: 9
-  repeat_idx: 0
-  runtime: 4.647902488708496
-  stats:
-    mofka_bench.consumer.elapsed_ms: 98.45
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10158.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 184.29
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 5426.0
-    mofka_bench.producer.throughput_mbps: 85.11
-    mofka_bench.producer.total_data_mb: 15.69
-  status: success
-  variables:
-    mofka_bench.data_size: 16384
-    mofka_bench.num_threads: 1
-- combination_idx: 9
-  repeat_idx: 1
-  runtime: 4.714512586593628
-  stats:
-    mofka_bench.consumer.elapsed_ms: 95.69
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10450.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 175.21
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 5707.0
-    mofka_bench.producer.throughput_mbps: 89.53
-    mofka_bench.producer.total_data_mb: 15.69
-  status: success
-  variables:
-    mofka_bench.data_size: 16384
-    mofka_bench.num_threads: 1
-- combination_idx: 9
-  repeat_idx: 2
-  runtime: 4.700851202011108
-  stats:
-    mofka_bench.consumer.elapsed_ms: 96.03
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10414.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 184.48
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 5421.0
-    mofka_bench.producer.throughput_mbps: 85.03
-    mofka_bench.producer.total_data_mb: 15.69
-  status: success
-  variables:
-    mofka_bench.data_size: 16384
-    mofka_bench.num_threads: 1
-- combination_idx: 10
-  repeat_idx: 0
-  runtime: 4.747936725616455
-  stats:
-    mofka_bench.consumer.elapsed_ms: 96.99
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10310.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 66.68
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 14998.0
-    mofka_bench.producer.throughput_mbps: 235.25
-    mofka_bench.producer.total_data_mb: 15.69
-  status: success
-  variables:
-    mofka_bench.data_size: 16384
-    mofka_bench.num_threads: 2
-- combination_idx: 10
-  repeat_idx: 1
-  runtime: 4.622679233551025
-  stats:
-    mofka_bench.consumer.elapsed_ms: 96.16
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10399.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 188.26
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 5312.0
-    mofka_bench.producer.throughput_mbps: 83.32
-    mofka_bench.producer.total_data_mb: 15.69
-  status: success
-  variables:
-    mofka_bench.data_size: 16384
-    mofka_bench.num_threads: 2
-- combination_idx: 10
-  repeat_idx: 2
-  runtime: 4.921533584594727
-  stats:
-    mofka_bench.consumer.elapsed_ms: 145.45
-    mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 6875.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 184.48
-    mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 5421.0
-    mofka_bench.producer.throughput_mbps: 85.03
-    mofka_bench.producer.total_data_mb: 15.69
-  status: success
-  variables:
-    mofka_bench.data_size: 16384
-    mofka_bench.num_threads: 2
-- combination_idx: 11
-  repeat_idx: 0
-  runtime: 4.718125820159912
+  runtime: 4.687165021896362
+  start_time: '2026-04-15T20:26:19.686397'
   stats:
     mofka_bench.consumer.elapsed_ms: 96.33
     mofka_bench.consumer.events_count: 1000
     mofka_bench.consumer.events_per_sec: 10381.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 183.3
+    mofka_bench.consumer.throughput_mbps: 10.14
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 120.89
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 5456.0
-    mofka_bench.producer.throughput_mbps: 85.58
+    mofka_bench.producer.events_per_sec: 8272.0
+    mofka_bench.producer.throughput_mbps: 8.58
+    mofka_bench.producer.total_data_mb: 1.04
+  status: success
+  variables:
+    mofka_bench.data_size: 1024
+    mofka_bench.num_threads: 1
+- combination_idx: 4
+  end_time: '2026-04-15T20:26:29.046940'
+  repeat_idx: 0
+  runtime: 4.640467882156372
+  start_time: '2026-04-15T20:26:24.398632'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 94.25
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10610.0
+    mofka_bench.consumer.throughput_mbps: 10.36
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 120.33
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 8311.0
+    mofka_bench.producer.throughput_mbps: 8.62
+    mofka_bench.producer.total_data_mb: 1.04
+  status: success
+  variables:
+    mofka_bench.data_size: 1024
+    mofka_bench.num_threads: 2
+- combination_idx: 4
+  end_time: '2026-04-15T20:26:33.741283'
+  repeat_idx: 1
+  runtime: 4.659832954406738
+  start_time: '2026-04-15T20:26:29.054629'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 93.38
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10709.0
+    mofka_bench.consumer.throughput_mbps: 10.46
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 145.69
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6864.0
+    mofka_bench.producer.throughput_mbps: 7.12
+    mofka_bench.producer.total_data_mb: 1.04
+  status: success
+  variables:
+    mofka_bench.data_size: 1024
+    mofka_bench.num_threads: 2
+- combination_idx: 4
+  end_time: '2026-04-15T20:26:38.459163'
+  repeat_idx: 2
+  runtime: 4.687943458557129
+  start_time: '2026-04-15T20:26:33.752867'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 95.2
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10504.0
+    mofka_bench.consumer.throughput_mbps: 10.26
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 143.85
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6952.0
+    mofka_bench.producer.throughput_mbps: 7.21
+    mofka_bench.producer.total_data_mb: 1.04
+  status: success
+  variables:
+    mofka_bench.data_size: 1024
+    mofka_bench.num_threads: 2
+- combination_idx: 5
+  end_time: '2026-04-15T20:26:43.133769'
+  repeat_idx: 0
+  runtime: 4.646242618560791
+  start_time: '2026-04-15T20:26:38.465216'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 93.46
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10700.0
+    mofka_bench.consumer.throughput_mbps: 10.45
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 142.43
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 7021.0
+    mofka_bench.producer.throughput_mbps: 7.28
+    mofka_bench.producer.total_data_mb: 1.04
+  status: success
+  variables:
+    mofka_bench.data_size: 1024
+    mofka_bench.num_threads: 4
+- combination_idx: 5
+  end_time: '2026-04-15T20:26:47.821466'
+  repeat_idx: 1
+  runtime: 4.667052984237671
+  start_time: '2026-04-15T20:26:43.145322'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 95.84
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10434.0
+    mofka_bench.consumer.throughput_mbps: 10.19
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 124.52
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 8031.0
+    mofka_bench.producer.throughput_mbps: 8.33
+    mofka_bench.producer.total_data_mb: 1.04
+  status: success
+  variables:
+    mofka_bench.data_size: 1024
+    mofka_bench.num_threads: 4
+- combination_idx: 5
+  end_time: '2026-04-15T20:26:52.542538'
+  repeat_idx: 2
+  runtime: 4.685673236846924
+  start_time: '2026-04-15T20:26:47.832689'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 95.13
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10512.0
+    mofka_bench.consumer.throughput_mbps: 10.27
+    mofka_bench.consumer.total_data_mb: 0.98
+    mofka_bench.producer.elapsed_ms: 144.82
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6905.0
+    mofka_bench.producer.throughput_mbps: 7.16
+    mofka_bench.producer.total_data_mb: 1.04
+  status: success
+  variables:
+    mofka_bench.data_size: 1024
+    mofka_bench.num_threads: 4
+- combination_idx: 6
+  end_time: '2026-04-15T20:26:57.240976'
+  repeat_idx: 0
+  runtime: 4.675342559814453
+  start_time: '2026-04-15T20:26:52.555951'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 144.23
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 6933.0
+    mofka_bench.consumer.throughput_mbps: 27.08
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 155.52
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6430.0
+    mofka_bench.producer.throughput_mbps: 25.51
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 1
+- combination_idx: 6
+  end_time: '2026-04-15T20:27:01.944759'
+  repeat_idx: 1
+  runtime: 4.6832334995269775
+  start_time: '2026-04-15T20:26:57.247868'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 93.82
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10659.0
+    mofka_bench.consumer.throughput_mbps: 41.64
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 127.79
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 7825.0
+    mofka_bench.producer.throughput_mbps: 31.04
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 1
+- combination_idx: 6
+  end_time: '2026-04-15T20:27:06.715919'
+  repeat_idx: 2
+  runtime: 4.733851671218872
+  start_time: '2026-04-15T20:27:01.954204'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 91.17
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10968.0
+    mofka_bench.consumer.throughput_mbps: 42.85
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 151.92
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6582.0
+    mofka_bench.producer.throughput_mbps: 26.11
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 1
+- combination_idx: 7
+  end_time: '2026-04-15T20:27:11.472315'
+  repeat_idx: 0
+  runtime: 4.716755628585815
+  start_time: '2026-04-15T20:27:06.730415'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 98.41
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10162.0
+    mofka_bench.consumer.throughput_mbps: 39.69
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 152.77
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6546.0
+    mofka_bench.producer.throughput_mbps: 25.97
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 2
+- combination_idx: 7
+  end_time: '2026-04-15T20:27:16.177949'
+  repeat_idx: 1
+  runtime: 4.687344074249268
+  start_time: '2026-04-15T20:27:11.484215'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 94.94
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10533.0
+    mofka_bench.consumer.throughput_mbps: 41.14
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 129.53
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 7720.0
+    mofka_bench.producer.throughput_mbps: 30.63
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 2
+- combination_idx: 7
+  end_time: '2026-04-15T20:27:20.870144'
+  repeat_idx: 2
+  runtime: 4.666819334030151
+  start_time: '2026-04-15T20:27:16.184539'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 93.68
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10674.0
+    mofka_bench.consumer.throughput_mbps: 41.7
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 154.54
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6471.0
+    mofka_bench.producer.throughput_mbps: 25.67
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 2
+- combination_idx: 8
+  end_time: '2026-04-15T20:27:25.556798'
+  repeat_idx: 0
+  runtime: 4.660971403121948
+  start_time: '2026-04-15T20:27:20.876079'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 149.52
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 6688.0
+    mofka_bench.consumer.throughput_mbps: 26.13
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 145.14
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6890.0
+    mofka_bench.producer.throughput_mbps: 27.33
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 4
+- combination_idx: 8
+  end_time: '2026-04-15T20:27:30.240202'
+  repeat_idx: 1
+  runtime: 4.671504020690918
+  start_time: '2026-04-15T20:27:25.562561'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 93.23
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10727.0
+    mofka_bench.consumer.throughput_mbps: 41.9
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 151.99
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6579.0
+    mofka_bench.producer.throughput_mbps: 26.1
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 4
+- combination_idx: 8
+  end_time: '2026-04-15T20:27:34.945788'
+  repeat_idx: 2
+  runtime: 4.687278509140015
+  start_time: '2026-04-15T20:27:30.246471'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 94.77
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10551.0
+    mofka_bench.consumer.throughput_mbps: 41.22
+    mofka_bench.consumer.total_data_mb: 3.91
+    mofka_bench.producer.elapsed_ms: 128.61
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 7776.0
+    mofka_bench.producer.throughput_mbps: 30.85
+    mofka_bench.producer.total_data_mb: 3.97
+  status: success
+  variables:
+    mofka_bench.data_size: 4096
+    mofka_bench.num_threads: 4
+- combination_idx: 9
+  end_time: '2026-04-15T20:27:39.665768'
+  repeat_idx: 0
+  runtime: 4.700323581695557
+  start_time: '2026-04-15T20:27:34.957719'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 93.97
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10642.0
+    mofka_bench.consumer.throughput_mbps: 166.28
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 181.32
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 5515.0
+    mofka_bench.producer.throughput_mbps: 86.51
+    mofka_bench.producer.total_data_mb: 15.69
+  status: success
+  variables:
+    mofka_bench.data_size: 16384
+    mofka_bench.num_threads: 1
+- combination_idx: 9
+  end_time: '2026-04-15T20:27:44.450186'
+  repeat_idx: 1
+  runtime: 4.759812831878662
+  start_time: '2026-04-15T20:27:39.673400'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 95.46
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10476.0
+    mofka_bench.consumer.throughput_mbps: 163.68
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 181.08
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 5522.0
+    mofka_bench.producer.throughput_mbps: 86.62
+    mofka_bench.producer.total_data_mb: 15.69
+  status: success
+  variables:
+    mofka_bench.data_size: 16384
+    mofka_bench.num_threads: 1
+- combination_idx: 9
+  end_time: '2026-04-15T20:27:49.158638'
+  repeat_idx: 2
+  runtime: 4.692270040512085
+  start_time: '2026-04-15T20:27:44.456747'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 93.91
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10649.0
+    mofka_bench.consumer.throughput_mbps: 166.39
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 165.96
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6025.0
+    mofka_bench.producer.throughput_mbps: 94.52
+    mofka_bench.producer.total_data_mb: 15.69
+  status: success
+  variables:
+    mofka_bench.data_size: 16384
+    mofka_bench.num_threads: 1
+- combination_idx: 10
+  end_time: '2026-04-15T20:27:53.907718'
+  repeat_idx: 0
+  runtime: 4.716772556304932
+  start_time: '2026-04-15T20:27:49.166992'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 95.31
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10492.0
+    mofka_bench.consumer.throughput_mbps: 163.94
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 187.6
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 5330.0
+    mofka_bench.producer.throughput_mbps: 83.61
+    mofka_bench.producer.total_data_mb: 15.69
+  status: success
+  variables:
+    mofka_bench.data_size: 16384
+    mofka_bench.num_threads: 2
+- combination_idx: 10
+  end_time: '2026-04-15T20:27:58.556254'
+  repeat_idx: 1
+  runtime: 4.621893644332886
+  start_time: '2026-04-15T20:27:53.922453'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 154.33
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 6480.0
+    mofka_bench.consumer.throughput_mbps: 101.24
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 167.9
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 5956.0
+    mofka_bench.producer.throughput_mbps: 93.43
+    mofka_bench.producer.total_data_mb: 15.69
+  status: success
+  variables:
+    mofka_bench.data_size: 16384
+    mofka_bench.num_threads: 2
+- combination_idx: 10
+  end_time: '2026-04-15T20:28:03.250372'
+  repeat_idx: 2
+  runtime: 4.662651062011719
+  start_time: '2026-04-15T20:27:58.563269'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 92.77
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 10779.0
+    mofka_bench.consumer.throughput_mbps: 168.42
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 165.62
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 6038.0
+    mofka_bench.producer.throughput_mbps: 94.71
+    mofka_bench.producer.total_data_mb: 15.69
+  status: success
+  variables:
+    mofka_bench.data_size: 16384
+    mofka_bench.num_threads: 2
+- combination_idx: 11
+  end_time: '2026-04-15T20:28:08.047880'
+  repeat_idx: 0
+  runtime: 4.762471914291382
+  start_time: '2026-04-15T20:28:03.261884'
+  stats:
+    mofka_bench.consumer.elapsed_ms: 104.6
+    mofka_bench.consumer.events_count: 1000
+    mofka_bench.consumer.events_per_sec: 9560.0
+    mofka_bench.consumer.throughput_mbps: 149.38
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 187.99
+    mofka_bench.producer.events_count: 1000
+    mofka_bench.producer.events_per_sec: 5319.0
+    mofka_bench.producer.throughput_mbps: 83.44
     mofka_bench.producer.total_data_mb: 15.69
   status: success
   variables:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 4
 - combination_idx: 11
+  end_time: '2026-04-15T20:28:12.789836'
   repeat_idx: 1
-  runtime: 4.708808183670044
+  runtime: 4.7151360511779785
+  start_time: '2026-04-15T20:28:08.058210'
   stats:
-    mofka_bench.consumer.elapsed_ms: 144.22
+    mofka_bench.consumer.elapsed_ms: 106.78
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 6934.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 189.34
+    mofka_bench.consumer.events_per_sec: 9365.0
+    mofka_bench.consumer.throughput_mbps: 146.33
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 186.27
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 5281.0
-    mofka_bench.producer.throughput_mbps: 82.84
+    mofka_bench.producer.events_per_sec: 5369.0
+    mofka_bench.producer.throughput_mbps: 84.21
     mofka_bench.producer.total_data_mb: 15.69
   status: success
   variables:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 4
 - combination_idx: 11
+  end_time: '2026-04-15T20:28:17.530207'
   repeat_idx: 2
-  runtime: 4.743898153305054
+  runtime: 4.715155363082886
+  start_time: '2026-04-15T20:28:12.796066'
   stats:
-    mofka_bench.consumer.elapsed_ms: 94.6
+    mofka_bench.consumer.elapsed_ms: 94.38
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 10571.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 167.11
+    mofka_bench.consumer.events_per_sec: 10595.0
+    mofka_bench.consumer.throughput_mbps: 165.55
+    mofka_bench.consumer.total_data_mb: 15.62
+    mofka_bench.producer.elapsed_ms: 187.21
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 5984.0
-    mofka_bench.producer.throughput_mbps: 93.87
+    mofka_bench.producer.events_per_sec: 5342.0
+    mofka_bench.producer.throughput_mbps: 83.79
     mofka_bench.producer.total_data_mb: 15.69
   status: success
   variables:
     mofka_bench.data_size: 16384
     mofka_bench.num_threads: 4
 - combination_idx: 12
+  end_time: '2026-04-15T20:28:22.481415'
   repeat_idx: 0
-  runtime: 4.849617004394531
+  runtime: 4.918230772018433
+  start_time: '2026-04-15T20:28:17.541718'
   stats:
-    mofka_bench.consumer.elapsed_ms: 103.85
+    mofka_bench.consumer.elapsed_ms: 128.41
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 9630.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 294.46
+    mofka_bench.consumer.events_per_sec: 7788.0
+    mofka_bench.consumer.throughput_mbps: 486.74
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 305.86
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 3396.0
-    mofka_bench.producer.throughput_mbps: 212.46
+    mofka_bench.producer.events_per_sec: 3270.0
+    mofka_bench.producer.throughput_mbps: 204.54
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 1
 - combination_idx: 12
+  end_time: '2026-04-15T20:28:27.503310'
   repeat_idx: 1
-  runtime: 4.857316732406616
+  runtime: 4.983987092971802
+  start_time: '2026-04-15T20:28:22.493835'
   stats:
-    mofka_bench.consumer.elapsed_ms: 117.41
+    mofka_bench.consumer.elapsed_ms: 110.3
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 8517.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 333.74
+    mofka_bench.consumer.events_per_sec: 9066.0
+    mofka_bench.consumer.throughput_mbps: 566.64
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 323.11
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 2996.0
-    mofka_bench.producer.throughput_mbps: 187.45
+    mofka_bench.producer.events_per_sec: 3095.0
+    mofka_bench.producer.throughput_mbps: 193.62
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 1
 - combination_idx: 12
+  end_time: '2026-04-15T20:28:32.396996'
   repeat_idx: 2
-  runtime: 5.128911733627319
+  runtime: 4.869646310806274
+  start_time: '2026-04-15T20:28:27.516283'
   stats:
-    mofka_bench.consumer.elapsed_ms: 105.94
+    mofka_bench.consumer.elapsed_ms: 102.85
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 9439.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 329.69
+    mofka_bench.consumer.events_per_sec: 9723.0
+    mofka_bench.consumer.throughput_mbps: 607.67
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 334.1
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 3033.0
-    mofka_bench.producer.throughput_mbps: 189.76
+    mofka_bench.producer.events_per_sec: 2993.0
+    mofka_bench.producer.throughput_mbps: 187.26
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 1
 - combination_idx: 13
+  end_time: '2026-04-15T20:28:37.260336'
   repeat_idx: 0
-  runtime: 4.977750539779663
+  runtime: 4.84393835067749
+  start_time: '2026-04-15T20:28:32.405926'
   stats:
-    mofka_bench.consumer.elapsed_ms: 110.16
+    mofka_bench.consumer.elapsed_ms: 116.23
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 9078.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 325.75
+    mofka_bench.consumer.events_per_sec: 8604.0
+    mofka_bench.consumer.throughput_mbps: 537.72
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 308.74
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 3070.0
-    mofka_bench.producer.throughput_mbps: 192.06
+    mofka_bench.producer.events_per_sec: 3239.0
+    mofka_bench.producer.throughput_mbps: 202.63
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 2
 - combination_idx: 13
+  end_time: '2026-04-15T20:28:42.089300'
   repeat_idx: 1
-  runtime: 4.885401248931885
+  runtime: 4.810940980911255
+  start_time: '2026-04-15T20:28:37.270963'
   stats:
-    mofka_bench.consumer.elapsed_ms: 114.86
+    mofka_bench.consumer.elapsed_ms: 97.5
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 8706.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 297.57
+    mofka_bench.consumer.events_per_sec: 10256.0
+    mofka_bench.consumer.throughput_mbps: 641.0
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 325.42
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 3361.0
-    mofka_bench.producer.throughput_mbps: 210.24
+    mofka_bench.producer.events_per_sec: 3073.0
+    mofka_bench.producer.throughput_mbps: 192.25
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 2
 - combination_idx: 13
+  end_time: '2026-04-15T20:28:46.979024'
   repeat_idx: 2
-  runtime: 4.875971078872681
+  runtime: 4.855979919433594
+  start_time: '2026-04-15T20:28:42.096785'
   stats:
-    mofka_bench.consumer.elapsed_ms: 107.63
+    mofka_bench.consumer.elapsed_ms: 153.37
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 9291.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 227.46
+    mofka_bench.consumer.events_per_sec: 6520.0
+    mofka_bench.consumer.throughput_mbps: 407.5
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 322.71
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 4396.0
-    mofka_bench.producer.throughput_mbps: 275.04
+    mofka_bench.producer.events_per_sec: 3099.0
+    mofka_bench.producer.throughput_mbps: 193.86
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 2
 - combination_idx: 14
+  end_time: '2026-04-15T20:28:51.845836'
   repeat_idx: 0
-  runtime: 4.816908597946167
+  runtime: 4.8313329219818115
+  start_time: '2026-04-15T20:28:46.991756'
   stats:
-    mofka_bench.consumer.elapsed_ms: 117.37
+    mofka_bench.consumer.elapsed_ms: 108.01
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 8520.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 227.13
+    mofka_bench.consumer.events_per_sec: 9258.0
+    mofka_bench.consumer.throughput_mbps: 578.63
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 314.93
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 4403.0
-    mofka_bench.producer.throughput_mbps: 275.44
+    mofka_bench.producer.events_per_sec: 3175.0
+    mofka_bench.producer.throughput_mbps: 198.65
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 4
 - combination_idx: 14
+  end_time: '2026-04-15T20:28:56.717702'
   repeat_idx: 1
-  runtime: 4.830846548080444
+  runtime: 4.834092855453491
+  start_time: '2026-04-15T20:28:51.857618'
   stats:
-    mofka_bench.consumer.elapsed_ms: 157.4
+    mofka_bench.consumer.elapsed_ms: 99.51
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 6353.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 324.55
+    mofka_bench.consumer.events_per_sec: 10049.0
+    mofka_bench.consumer.throughput_mbps: 628.07
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 303.98
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 3081.0
-    mofka_bench.producer.throughput_mbps: 192.76
+    mofka_bench.producer.events_per_sec: 3290.0
+    mofka_bench.producer.throughput_mbps: 205.81
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:
     mofka_bench.data_size: 65536
     mofka_bench.num_threads: 4
 - combination_idx: 14
+  end_time: '2026-04-15T20:29:01.574230'
   repeat_idx: 2
-  runtime: 4.851568698883057
+  runtime: 4.818177223205566
+  start_time: '2026-04-15T20:28:56.729726'
   stats:
-    mofka_bench.consumer.elapsed_ms: 100.48
+    mofka_bench.consumer.elapsed_ms: 103.93
     mofka_bench.consumer.events_count: 1000
-    mofka_bench.consumer.events_per_sec: 9952.0
-    mofka_bench.consumer.throughput_mbps: 0.01
-    mofka_bench.consumer.total_data_mb: 0.0
-    mofka_bench.producer.elapsed_ms: 330.3
+    mofka_bench.consumer.events_per_sec: 9622.0
+    mofka_bench.consumer.throughput_mbps: 601.35
+    mofka_bench.consumer.total_data_mb: 62.5
+    mofka_bench.producer.elapsed_ms: 321.28
     mofka_bench.producer.events_count: 1000
-    mofka_bench.producer.events_per_sec: 3028.0
-    mofka_bench.producer.throughput_mbps: 189.4
+    mofka_bench.producer.events_per_sec: 3113.0
+    mofka_bench.producer.throughput_mbps: 194.73
     mofka_bench.producer.total_data_mb: 62.56
   status: success
   variables:

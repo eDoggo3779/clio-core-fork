@@ -99,6 +99,13 @@ class MofkaBench(Application):
         topic = self.env.get('MOFKA_TOPIC', 'benchmark_topic')
         scripts_dir = os.path.join(self.pkg_dir, 'scripts')
 
+        # Clear previous output files to prevent stale data
+        # from being matched by _parse_output (pipe_stdout appends).
+        for fname in ('producer_output.txt', 'consumer_output.txt'):
+            path = os.path.join(self.shared_dir, fname)
+            if os.path.exists(path):
+                os.remove(path)
+
         progress_flag = ('--use-progress-thread'
                          if self.config['use_progress_thread'] else '')
 
@@ -129,6 +136,7 @@ class MofkaBench(Application):
                 f' --group-file {group_file}'
                 f' --topic {topic}'
                 f' --num-events {self.config["num_events"]}'
+                f' --data-size {self.config["data_size"]}'
                 f' --data-selectivity {self.config["data_selectivity"]}'
                 f' --batch-size {self.config["batch_size"]}'
                 f' --num-threads {self.config["num_threads"]}'
@@ -171,7 +179,11 @@ class MofkaBench(Application):
                 self._parse_output(output, role, stat_dict)
 
     def _parse_output(self, output, role, stat_dict):
-        """Extract metrics from producer or consumer stdout."""
+        """Extract metrics from producer or consumer stdout.
+
+        Uses findall and takes the last match to be resilient against
+        output files that contain data from multiple appended runs.
+        """
         patterns = {
             'throughput_mbps': r'Throughput:\s+([\d.]+)\s+MB/s',
             'events_per_sec': r'Events/sec:\s+([\d.]+)',
@@ -180,9 +192,9 @@ class MofkaBench(Application):
             'events_count': r'Events (?:produced|consumed):\s+(\d+)',
         }
         for metric, pattern in patterns.items():
-            match = re.search(pattern, output)
-            if match:
-                value = float(match.group(1))
+            matches = re.findall(pattern, output)
+            if matches:
+                value = float(matches[-1])
                 if metric == 'events_count':
                     value = int(value)
                 stat_dict[f'{self.pkg_id}.{role}.{metric}'] = value

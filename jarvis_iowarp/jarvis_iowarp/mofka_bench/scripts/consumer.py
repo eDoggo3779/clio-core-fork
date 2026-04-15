@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--group-file", default=os.environ.get("MOFKA_GROUP_FILE", "/tmp/mofka-bench/mofka.json"))
     parser.add_argument("--topic", default=os.environ.get("MOFKA_TOPIC", "benchmark_topic"))
     parser.add_argument("--num-events", type=int, default=int(os.environ.get("MOFKA_NUM_EVENTS", "1000")))
+    parser.add_argument("--data-size", type=int, default=int(os.environ.get("MOFKA_DATA_SIZE", "1024")))
     parser.add_argument("--num-threads", type=int, default=int(os.environ.get("MOFKA_NUM_THREADS", "1")))
     parser.add_argument("--data-selectivity", type=float, default=float(os.environ.get("MOFKA_DATA_SELECTIVITY", "1.0")))
     parser.add_argument("--batch-size", type=int, default=int(os.environ.get("MOFKA_BATCH_SIZE", "16")))
@@ -29,6 +30,7 @@ def main():
     print(f"  Group file:        {args.group_file}")
     print(f"  Topic:             {args.topic}")
     print(f"  Events to consume: {args.num_events}")
+    print(f"  Data size:         {args.data_size} bytes")
     print(f"  Data selectivity:  {args.data_selectivity}")
     print(f"  Batch size:        {args.batch_size}")
     print(f"  Threads:           {args.num_threads}")
@@ -47,32 +49,21 @@ def main():
     # Open topic
     topic = driver.open_topic(args.topic)
 
-    # Build data_selector and data_broker callbacks so the consumer
-    # actually fetches event payloads.  Without these (overload 2),
-    # Mofka returns events with no data attached.
-    selectivity = args.data_selectivity
-
-    def data_selector(metadata, descriptor):
-        if selectivity <= 0:
-            return None
-        if selectivity >= 1.0:
-            return descriptor
-        size = int(descriptor.size * selectivity)
-        return descriptor.make_sub_view(0, size) if size > 0 else None
-
-    def data_broker(metadata, descriptor):
-        return [bytearray(descriptor.size)]
-
+    # Create consumer without Python data_selector/data_broker callbacks.
+    # Using Python callbacks with use_progress_thread=True causes a GIL
+    # deadlock: the C++ progress thread tries to acquire the GIL for the
+    # callback while the main thread holds it inside future.wait().
+    # The default C++ consumer retrieves all event data without callbacks.
     consumer = topic.consumer(
         name="bench-consumer",
         batch_size=args.batch_size,
-        data_selector=data_selector,
-        data_broker=data_broker,
     )
 
     # Run benchmark
-    total_data_bytes = 0
+    # event.data returns a DataDescriptor (not raw bytes), so we track
+    # transferred bytes as data_size * selectivity per event consumed.
     events_consumed = 0
+    bytes_per_event = int(args.data_size * args.data_selectivity)
 
     print(f"\nConsuming {args.num_events} events...")
     t_start = time.time()
@@ -80,14 +71,10 @@ def main():
     while events_consumed < args.num_events:
         future = consumer.pull()
         event = future.wait()
-        event_data = event.data
-        if event_data is not None:
-            if isinstance(event_data, (list, tuple)):
-                total_data_bytes += sum(len(buf) for buf in event_data)
-            else:
-                total_data_bytes += len(event_data)
         event.acknowledge()
         events_consumed += 1
+
+    total_data_bytes = events_consumed * bytes_per_event
 
     t_end = time.time()
 

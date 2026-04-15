@@ -116,6 +116,7 @@ class WrpCteBench(Application):
             exec_info = LocalExecInfo(
                 env=self.mod_env,
                 pipe_stdout=output_path,
+                pipe_stderr=output_path,
             )
 
         Exec(cmd_str, exec_info).run()
@@ -145,7 +146,17 @@ class WrpCteBench(Application):
         with open(output_path, 'r') as f:
             output = f.read()
 
+        if not output.strip():
+            self.log(f'Output file is empty: {output_path}')
+            return
+
+        before_count = len(stat_dict)
         self._parse_output(output, stat_dict)
+        after_count = len(stat_dict)
+        if after_count == before_count:
+            self.log(f'Warning: No metrics extracted from {output_path} '
+                     f'({len(output)} bytes). '
+                     f'Check if benchmark results are present in output.')
 
     def _parse_output(self, output, stat_dict):
         """Extract metrics from wrp_cte_bench stdout.
@@ -154,6 +165,9 @@ class WrpCteBench(Application):
         ``<file>:<line> INFO <tid> <func> <message>``.
         We match against the message portion.
         """
+        # Strip ANSI escape codes from HLOG output
+        output = re.sub(r'\033\[[0-9;]*m', '', output)
+
         # Detect which test case header appeared (Put, Get, or PutGet)
         header_match = re.search(
             r'=== (\w+) Benchmark Results ===', output)
@@ -167,6 +181,12 @@ class WrpCteBench(Application):
             'bw_per_thread_max_mbps': r'Bandwidth per thread \(max\):\s+([\d.e+\-]+)\s+MB/s',
             'bw_per_thread_avg_mbps': r'Bandwidth per thread \(avg\):\s+([\d.e+\-]+)\s+MB/s',
             'agg_bw_mbps': r'Aggregate bandwidth:\s+([\d.e+\-]+)\s+MB/s',
+            'agg_ops_per_sec': r'Aggregate IOPS:\s+([\d.e+\-]+)',
+            'ops_per_thread_avg_per_sec': r'IOPS per thread \(avg\):\s+([\d.e+\-]+)',
+            'avg_latency_per_op_us': r'Avg latency per op:\s+([\d.e+\-]+)\s+us',
+            'latency_stddev_us': r'Latency stddev:\s+([\d.e+\-]+)\s+us',
+            'total_data_mb': r'Total data:\s+([\d.e+\-]+)\s+MB',
+            'total_ops': r'Total ops:\s+(\d+)',
         }
 
         for metric, pattern in patterns.items():
@@ -182,11 +202,13 @@ class WrpCteBench(Application):
     def _plot(self, results_dir):
         """Generate performance plots from pipeline results.csv.
 
-        Produces four PNG figures:
+        Produces six PNG figures:
           1. Aggregate Bandwidth (MB/s) vs I/O Size — grouped by test case
           2. Average Latency (us) vs I/O Size — grouped by test case
           3. Aggregate Bandwidth (MB/s) vs Num Threads
           4. Average Latency (us) vs Num Threads
+          5. Aggregate IOPS (ops/s) vs I/O Size
+          6. Aggregate IOPS (ops/s) vs Num Threads
         """
         import csv
         try:
@@ -356,6 +378,47 @@ class WrpCteBench(Application):
             ax.legend()
             fig.tight_layout()
             fig.savefig(os.path.join(results_dir, 'latency_vs_threads.png'),
+                        dpi=150)
+            plt.close(fig)
+
+        # --- Figure 5: Aggregate IOPS vs I/O Size ---
+        if io_size_col:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for op in operations:
+                xs, ys = _aggregate(rows, io_size_col, op,
+                                    'agg_ops_per_sec')
+                if xs:
+                    ax.bar(xs, ys, alpha=0.7, color=op_colours[op],
+                           label=op_labels[op], width=0.25)
+            ax.set_xlabel('I/O Size')
+            ax.set_ylabel('Aggregate IOPS (ops/s)')
+            ax.set_title('CTE IOPS vs I/O Size')
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(results_dir, 'iops_vs_io_size.png'),
+                        dpi=150)
+            plt.close(fig)
+
+        # --- Figure 6: Aggregate IOPS vs Num Threads ---
+        if threads_col:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for op in operations:
+                xs, ys = _aggregate(rows, threads_col, op,
+                                    'agg_ops_per_sec')
+                if xs:
+                    try:
+                        x_nums = [float(x) for x in xs]
+                    except ValueError:
+                        x_nums = list(range(len(xs)))
+                    ax.plot(x_nums, ys, marker=op_markers[op],
+                            color=op_colours[op], label=op_labels[op],
+                            linewidth=2)
+            ax.set_xlabel('Number of Threads')
+            ax.set_ylabel('Aggregate IOPS (ops/s)')
+            ax.set_title('CTE IOPS vs Thread Count')
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(os.path.join(results_dir, 'iops_vs_threads.png'),
                         dpi=150)
             plt.close(fig)
 

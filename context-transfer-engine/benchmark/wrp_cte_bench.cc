@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -472,6 +473,40 @@ class CTEBenchmark {
          avg_bw_bytes);
     HLOG(kInfo, "Aggregate bandwidth: {} MB/s ({} bytes/s)", agg_bw,
          agg_bw_bytes);
+    HLOG(kInfo, "");
+
+    // --- IOPS and derived statistics ---
+    double avg_time_sec = avg_time / 1000000.0;
+    double agg_ops_per_sec =
+        (avg_time_sec > 0.0)
+            ? (static_cast<double>(io_count_) * num_threads_) / avg_time_sec
+            : 0.0;
+    double ops_per_thread_avg_per_sec =
+        (avg_time_sec > 0.0)
+            ? static_cast<double>(io_count_) / avg_time_sec
+            : 0.0;
+    double avg_latency_per_op =
+        (io_count_ > 0) ? avg_time / io_count_ : 0.0;
+    double total_data_mb =
+        static_cast<double>(io_size_) * io_count_ * num_threads_
+        / (1024.0 * 1024.0);
+    long long total_ops =
+        static_cast<long long>(io_count_) * num_threads_;
+
+    // Latency standard deviation across threads
+    double sum_sq_diff = 0.0;
+    for (auto t : thread_times) {
+      double diff = static_cast<double>(t) - avg_time;
+      sum_sq_diff += diff * diff;
+    }
+    double latency_stddev = std::sqrt(sum_sq_diff / num_threads_);
+
+    HLOG(kInfo, "Aggregate IOPS: {}", agg_ops_per_sec);
+    HLOG(kInfo, "IOPS per thread (avg): {}", ops_per_thread_avg_per_sec);
+    HLOG(kInfo, "Avg latency per op: {} us", avg_latency_per_op);
+    HLOG(kInfo, "Latency stddev: {} us", latency_stddev);
+    HLOG(kInfo, "Total data: {} MB", total_data_mb);
+    HLOG(kInfo, "Total ops: {}", total_ops);
     HLOG(kInfo, "===========================");
   }
 

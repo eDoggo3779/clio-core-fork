@@ -121,6 +121,6 @@ loop:
   - [cte_bench.num_threads]
 
 # Number of times to repeat each configuration (for statistical stability)
-repeat: 3
+repeat: 4
 
 output: "/workspace/results/cte_bench_results"
