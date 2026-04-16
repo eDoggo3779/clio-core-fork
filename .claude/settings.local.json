@@ -54,7 +54,12 @@
       "Bash(wrp_cte_bench)",
       "Bash(env)",
       "Bash(chimaera --help)",
-      "Bash(ldd /home/iowarp/.local/bin/chimaera)"
+      "Bash(ldd /home/iowarp/.local/bin/chimaera)",
+      "Bash(ls -la /workspace/build/bin/*.so)",
+      "Bash(ls /workspace/build/bin/lib*_runtime.so)",
+      "Bash(pkill -9 chimaera)",
+      "Bash(rm -f /dev/shm/chi_*)",
+      "Bash(awk -F, 'NR>1 {print $4}' /workspace/results/cte_bench_results/results.csv)"
     ],
     "deny": [],
     "ask": []

@@ -23,6 +23,12 @@ class WrpCte(Service):
         self.compose_config_path = os.path.join(self.shared_dir, 'cte_compose.yaml')
         self.devices_from_resource_graph = []
 
+    def _exec_info(self, **kwargs):
+        """Return LocalExecInfo or PsshExecInfo based on hostfile."""
+        if self.jarvis.hostfile.is_local():
+            return LocalExecInfo(**kwargs)
+        return PsshExecInfo(hostfile=self.jarvis.hostfile, **kwargs)
+
     def _configure_menu(self):
         """
         Configure the service menu.
@@ -171,7 +177,7 @@ class WrpCte(Service):
             if parent_dir:
                 self.log(f"Creating directory: {parent_dir}")
                 try:
-                    Mkdir(parent_dir, PsshExecInfo(hostfile=self.hostfile)).run()
+                    Mkdir(parent_dir, self._exec_info()).run()
                     self.log(f"Created directory: {parent_dir}")
                 except Exception as e:
                     self.log(f"Error creating directory {parent_dir}: {e}")
@@ -500,9 +506,8 @@ class WrpCte(Service):
 
         try:
             # Execute chimaera compose on all nodes using PsshExecInfo
-            Exec(cmd, PsshExecInfo(
-                env=env,
-                hostfile=self.jarvis.hostfile
+            Exec(cmd, self._exec_info(
+                env=env
             )).run()
 
             self.log("Content Transfer Engine started successfully on all nodes")
@@ -590,14 +595,14 @@ class WrpCte(Service):
 
                     try:
                         # Execute removal using Rm with PsshExecInfo across all nodes
-                        Rm(path, PsshExecInfo(hostfile=self.hostfile)).run()
+                        Rm(path, self._exec_info()).run()
                         self.log(f"Successfully cleaned storage device: {path}")
 
                         # Remove parent directory
                         parent_dir = os.path.dirname(path)
                         if parent_dir:
                             self.log(f"Removing directory: {parent_dir}")
-                            Rm(parent_dir, PsshExecInfo(hostfile=self.hostfile)).run()
+                            Rm(parent_dir, self._exec_info()).run()
                             self.log(f"Successfully removed parent directory: {parent_dir}")
 
                     except Exception as e:

@@ -29,6 +29,12 @@ class WrpRuntime(Service):
         """Initialize package-specific variables"""
         self.config_file = None
 
+    def _exec_info(self, **kwargs):
+        """Return LocalExecInfo or PsshExecInfo based on hostfile."""
+        if self.jarvis.hostfile.is_local():
+            return LocalExecInfo(**kwargs)
+        return PsshExecInfo(hostfile=self.jarvis.hostfile, **kwargs)
+
     def _configure_menu(self):
         """Define configuration options for IOWarp runtime"""
         return [
@@ -192,15 +198,13 @@ class WrpRuntime(Service):
         # Execute with or without debugging
         if self.config.get('do_dbg', False):
             self.log(f"Starting with GDB server on port {self.config['dbg_port']}")
-            GdbServer(cmd, self.config['dbg_port'], PsshExecInfo(
+            GdbServer(cmd, self.config['dbg_port'], self._exec_info(
                 env=self.env,
-                hostfile=self.jarvis.hostfile,
                 exec_async=True
             )).run()
         else:
-            Exec(cmd, PsshExecInfo(
-                env=self.env,  # Use env, not mod_env
-                hostfile=self.jarvis.hostfile,
+            Exec(cmd, self._exec_info(
+                env=self.env,
                 exec_async=True
             )).run()
 
@@ -231,15 +235,13 @@ class WrpRuntime(Service):
 
         # chimaera runtime stop now waits for the runtime to actually exit
         cmd = 'chimaera runtime stop'
-        Exec(cmd, PsshExecInfo(
-            env=self.env,
-            hostfile=self.jarvis.hostfile
+        Exec(cmd, self._exec_info(
+            env=self.env
         )).run()
 
         # Fallback: force kill any remaining chimaera processes
         Kill('chimaera',
-             PsshExecInfo(env=self.env,
-                          hostfile=self.jarvis.hostfile),
+             self._exec_info(env=self.env),
              partial=False).run()
 
         # Wait for the port to be free before returning
@@ -263,9 +265,7 @@ class WrpRuntime(Service):
         """Forcibly terminate the IOWarp runtime on all nodes"""
         self.log("Forcibly killing IOWarp runtime on all nodes")
 
-        Kill('chimaera', PsshExecInfo(
-            hostfile=self.jarvis.hostfile
-        )).run()
+        Kill('chimaera', self._exec_info()).run()
 
         self.log("IOWarp runtime killed on all nodes")
 
@@ -291,8 +291,6 @@ class WrpRuntime(Service):
         # Clean shared memory segments on all nodes
         self.log("Cleaning shared memory segments on all nodes")
         cmd = 'rm -f /dev/shm/chi_*'
-        Exec(cmd, PsshExecInfo(
-            hostfile=self.jarvis.hostfile
-        )).run()
+        Exec(cmd, self._exec_info()).run()
 
         self.log("Cleanup completed")
