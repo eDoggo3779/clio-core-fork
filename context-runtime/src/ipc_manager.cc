@@ -1304,17 +1304,17 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
   // Get lane 0 (single lane) with the specified priority
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
-  bool was_empty = lane.Empty();
   lane.Push(future);
 
-  // Signal the net worker if the lane was empty (same pattern as
-  // admin_runtime.cc:1086-1089)
-  if (was_empty && net_lane_) {
+  // Why: always signal — the `if (was_empty)` gate had a lost-wakeup TOCTOU
+  // (producer could observe non-empty and skip the signal while the net worker
+  // was about to SetActive(false) and block in epoll_wait(-1)).
+  if (net_lane_) {
     AwakenWorker(net_lane_);
   }
 
-  HLOG(kDebug, "EnqueueNetTask: priority={}, was_empty={}, net_lane={}",
-       priority_idx, was_empty, net_lane_ != nullptr);
+  HLOG(kDebug, "EnqueueNetTask: priority={}, net_lane={}",
+       priority_idx, net_lane_ != nullptr);
 }
 
 bool IpcManager::TryPopNetTask(NetQueuePriority priority,
@@ -2282,13 +2282,11 @@ bool IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
     return true;
   }
 
-  // Enqueue to the destination worker's lane
+  // Enqueue to the destination worker's lane.
+  // Why: always signal — see ipc_manager.h SendShm for the lost-wakeup TOCTOU.
   auto &dest_lane = worker_queues_->GetLane(dest_worker_id, 0);
-  bool was_empty = dest_lane.Empty();
   dest_lane.Push(future);
-  if (was_empty) {
-    AwakenWorker(&dest_lane);
-  }
+  AwakenWorker(&dest_lane);
   return false;
 }
 
@@ -2559,12 +2557,10 @@ Future<Task> IpcManager::SendRuntimeClient(
   if (scheduler_ != nullptr) {
     u32 lane_id = scheduler_->ClientMapTask(this, future);
     if (!worker_queues_.IsNull()) {
+      // Why: always signal — see ipc_manager.h SendShm for the lost-wakeup TOCTOU.
       auto &dest_lane = worker_queues_->GetLane(lane_id, 0);
-      bool was_empty = dest_lane.Empty();
       dest_lane.Push(future);
-      if (was_empty) {
-        AwakenWorker(&dest_lane);
-      }
+      AwakenWorker(&dest_lane);
     }
   }
 

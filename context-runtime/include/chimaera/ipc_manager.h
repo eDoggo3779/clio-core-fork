@@ -637,11 +637,12 @@ class IpcManager {
     LaneId lane_id =
         scheduler_->ClientMapTask(this, future.template Cast<Task>());
     auto &lane = worker_queues_->GetLane(lane_id, 0);
-    bool was_empty = lane.Empty();
     lane.Push(future.template Cast<Task>());
-    if (was_empty) {
-      AwakenWorker(&lane);
-    }
+    // Why: `if (was_empty) AwakenWorker` had a lost-wakeup TOCTOU — producer
+    // could observe non-empty and skip the signal while the consumer was about
+    // to SetActive(false) and block in epoll_wait(-1). AwakenWorker is a no-op
+    // when the worker is active, so always signaling is correct and cheap.
+    AwakenWorker(&lane);
 
     SaveTaskArchive archive(MsgType::kSerializeIn, shm_send_transport_.get());
     archive << (*task_ptr.ptr_);

@@ -1119,13 +1119,11 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
       // Map task to lane using scheduler
       chi::LaneId lane_id =
           ipc_manager->GetScheduler()->ClientMapTask(ipc_manager, future);
+      // Why: always signal — see ipc_manager.h SendShm for the lost-wakeup TOCTOU.
       auto *worker_queues = ipc_manager->GetTaskQueue();
       auto &lane_ref = worker_queues->GetLane(lane_id, 0);
-      bool was_empty = lane_ref.Empty();
       lane_ref.Push(future);
-      if (was_empty) {
-        ipc_manager->AwakenWorker(&lane_ref);
-      }
+      ipc_manager->AwakenWorker(&lane_ref);
 
       did_work = true;
       task->tasks_received_++;

@@ -865,9 +865,11 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
         reinterpret_cast<hipc::mpsc_ring_buffer<Future<Task, CHI_MAIN_ALLOC_T>,
                                                 hshm::ipc::MallocAllocator> *>(
             parent_task->event_queue_);
-    bool was_empty = parent_event_queue->Empty();
     parent_event_queue->Emplace(run_ctx->future_);
-    if (was_empty && parent_task->lane_) {
+    // Why: always signal — the `if (was_empty)` gate had a lost-wakeup TOCTOU
+    // (parent could observe non-empty and skip the signal while the parent's
+    // worker was about to SetActive(false) and block in epoll_wait(-1)).
+    if (parent_task->lane_) {
       CHI_IPC->AwakenWorker(parent_task->lane_);
     }
   } else {
