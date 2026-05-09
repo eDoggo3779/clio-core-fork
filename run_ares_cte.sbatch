@@ -18,4 +18,6 @@ conda activate iowarp
 
 cd ~/clio-core-fork
 
-jarvis ppl run yaml jarvis_iowarp/pipelines/performance/microbench_cte_timed_ares.yaml
+./run_bench.sh \
+    jarvis_iowarp/pipelines/performance/microbench_cte_timed_ares.yaml \
+    /home/anaik18/clio-core-fork/results/cte_bench_timed_ares_results
