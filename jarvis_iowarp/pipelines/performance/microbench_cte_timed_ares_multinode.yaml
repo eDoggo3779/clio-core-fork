@@ -1,0 +1,93 @@
+# CTE Put/Get Timed Benchmark — Ares Multi-Node Variant
+# Purpose: Measure CTE Put/Get throughput and latency across I/O sizes and thread counts
+#          using a fixed-duration run (30s per iteration), distributed across multiple
+#          Ares compute nodes via TCP IPC and parallel-SSH fan-out.
+#
+# Sweeps: 5 I/O sizes x 3 thread counts x 3 repeats = 45 benchmark runs
+#
+# Multi-node prerequisites (handled by run_ares_cte_multinode.sbatch):
+#   1. A Slurm allocation of N compute nodes.
+#   2. A Jarvis hostfile listing every allocated host (one hostname per line),
+#      registered via `jarvis hostfile set <path>`.
+#   3. `nprocs` below MUST equal `nodes * ppn` for the benchmark fan-out to match
+#      the runtime/CTE fan-out across the hostfile.
+#
+# What differs from microbench_cte_timed_ares.yaml (single-node):
+#   - runtime.ipc_mode: "tcp"  (shm only works within one OS image)
+#   - cte_bench_timed.nprocs: 4, ppn: 1  (drives PsshExecInfo path in the wrapper)
+#   - output: separate dir so single-node baselines don't get clobbered
+#
+# Usage (inside an active salloc with `conda activate iowarp` and a hostfile set):
+#   jarvis ppl run yaml jarvis_iowarp/pipelines/performance/microbench_cte_timed_ares_multinode.yaml
+
+config:
+  name: cte_bench_timed_perf_ares_multinode
+  pkgs:
+    # ==================================================================
+    # IOWarp Runtime Service — fans out to every host in the hostfile
+    # ==================================================================
+    - pkg_type: jarvis_iowarp.wrp_runtime
+      pkg_name: runtime
+      do_dbg: false
+      dbg_port: 4000
+      log_level: "info"
+
+      # --- EXPERIMENT: IPC Transport Mode ---
+      #   shm  — shared memory (single-node only; will NOT work multi-node)
+      #   ipc  — Unix domain sockets (single-node only)
+      #   tcp  — TCP sockets (required for multi-node)
+      ipc_mode: "tcp"
+
+    # ==================================================================
+    # CTE Service — Storage Configuration (per-node /mnt/nvme)
+    # ==================================================================
+    - pkg_type: jarvis_iowarp.wrp_cte
+      pkg_name: cte_core
+
+      # Each Ares compute node provisions its own /mnt/nvme/$USER (250 GB).
+      # The same path is used on every node; jarvis Mkdirs it via PSSH.
+      devices:
+        - ["ram::cache", "500MB", 0.8]
+        - ["/mnt/nvme/$USER/storage1.bin", "64g", 0.8]
+
+      dpe_type: "max_bw"
+      neighborhood: 4
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+      # iowarp_compress: "none"
+
+    # ==================================================================
+    # CTE Timed Benchmark Application
+    # ==================================================================
+    - pkg_type: jarvis_iowarp.wrp_cte_bench_timed
+      pkg_name: cte_bench_timed
+
+      test_case: "Get"
+      num_threads: 1
+      depth: 4
+      io_size: "4k"
+      duration_sec: 30
+
+      # --- Multi-node fan-out ---
+      # nprocs must equal (nodes in hostfile) * ppn. The default sbatch script
+      # allocates 4 nodes with ppn=1, hence nprocs=4. If you change --nodes in
+      # the sbatch, update both numbers here.
+      nprocs: 4
+      ppn: 1
+
+# -----------------------------------------------------------------------
+# Parameter Sweep Configuration
+# Same shape as the single-node sweep so results can be compared directly.
+# -----------------------------------------------------------------------
+vars:
+  cte_bench_timed.io_size: ["4k", "16k", "64k", "256k", "1m"]
+  cte_bench_timed.num_threads: [1, 2, 4]
+
+loop:
+  - [cte_bench_timed.io_size]
+  - [cte_bench_timed.num_threads]
+
+repeat: 3
+
+output: "/home/anaik18/clio-core-fork/results/cte_bench_timed_ares_multinode_results"
