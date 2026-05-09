@@ -1,0 +1,79 @@
+# CTE Put/Get Timed Benchmark — Ares Variant
+# Purpose: Measure CTE Put/Get throughput and latency across I/O sizes and thread counts
+#          using a fixed-duration run (30s per iteration) instead of a fixed operation count
+#
+# Sweeps: 5 I/O sizes x 3 thread counts x 3 repeats = 45 benchmark runs
+#
+# Ares notes:
+#   - Storage device path /mnt/nvme/$USER/storage1.bin is provisioned per compute node.
+#   - output: points at NFS home so results are visible from the login node after the run.
+#
+# Usage (inside an active salloc, with `conda activate iowarp`):
+#   jarvis ppl run yaml jarvis_iowarp/pipelines/performance/microbench_cte_timed_ares.yaml
+
+config:
+  name: cte_bench_timed_perf_ares
+  pkgs:
+    # ==================================================================
+    # IOWarp Runtime Service
+    # ==================================================================
+    - pkg_type: jarvis_iowarp.wrp_runtime
+      pkg_name: runtime
+      do_dbg: false
+      dbg_port: 4000
+      log_level: "info"
+
+      # --- EXPERIMENT: IPC Transport Mode ---
+      #   shm  — shared memory (lowest latency, single-node)
+      #   ipc  — Unix domain sockets
+      #   tcp  — TCP sockets (required for multi-node)
+      ipc_mode: "shm"
+
+    # ==================================================================
+    # CTE Service — Storage Configuration
+    # ==================================================================
+    - pkg_type: jarvis_iowarp.wrp_cte
+      pkg_name: cte_core
+
+      # --- EXPERIMENT: Storage Devices ---
+      # Ares per-node NVMe is auto-provisioned at /mnt/nvme/$USER (250 GB).
+      devices:
+        - ["ram::cache", "500MB", 0.8]
+        - ["/mnt/nvme/$USER/storage1.bin", "64g", 0.8]
+
+      dpe_type: "max_bw"
+      neighborhood: 4
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+      # iowarp_compress: "none"
+
+    # ==================================================================
+    # CTE Timed Benchmark Application
+    # ==================================================================
+    - pkg_type: jarvis_iowarp.wrp_cte_bench_timed
+      pkg_name: cte_bench_timed
+
+      test_case: "Get"
+      num_threads: 1
+      depth: 4
+      io_size: "4k"
+      duration_sec: 30
+
+      nprocs: 1
+      ppn: 1
+
+# -----------------------------------------------------------------------
+# Parameter Sweep Configuration
+# -----------------------------------------------------------------------
+vars:
+  cte_bench_timed.io_size: ["4k", "16k", "64k", "256k", "1m"]
+  cte_bench_timed.num_threads: [1, 2, 4]
+
+loop:
+  - [cte_bench_timed.io_size]
+  - [cte_bench_timed.num_threads]
+
+repeat: 3
+
+output: "/home/anaik18/clio-core-fork/results/cte_bench_timed_ares_results"
