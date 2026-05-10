@@ -121,8 +121,16 @@ class WrpCteBenchTimed(Application):
             # the redirect in the command itself. Each node writes to its own
             # bench_output.txt.<hostname> in NFS to avoid the contention you'd
             # get from N nodes truncating/appending the same file in parallel.
+            #
+            # Quoting: SshExec wraps the whole remote command in single quotes
+            # (jarvis_cd/shell/ssh_exec.py:84), so we MUST NOT use single
+            # quotes here — POSIX shells can't nest them, and the inner quote
+            # would close the outer one early, causing args to leak out and
+            # the binary to run with argc=1. Use double quotes with an
+            # escaped \$ so $(hostname) is evaluated on the remote node, not
+            # locally on the sbatch controller.
             cmd_str = (
-                f"bash -c '{cmd_str} > {output_path}.$(hostname) 2>&1'"
+                f'bash -c "{cmd_str} > {output_path}.\\$(hostname) 2>&1"'
             )
             exec_info = PsshExecInfo(
                 env=self.mod_env,
