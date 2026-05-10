@@ -1,5 +1,6 @@
 from jarvis_cd.core.pkg import Application
 from jarvis_cd.shell import Exec, PsshExecInfo
+import glob
 import os
 import re
 import time as time_mod
@@ -94,8 +95,12 @@ class WrpCteBenchTimed(Application):
 
         # Truncate any stale output from a prior iteration before running,
         # so a crashing/non-producing child cannot be masked by cached data.
+        # Multi-node writes per-host files (bench_output.txt.<hostname>); clear
+        # those too so we don't pick up stale data from a previous run.
         if os.path.exists(output_path):
             os.remove(output_path)
+        for stale in glob.glob(output_path + '.*'):
+            os.remove(stale)
 
         self.log(f"Starting CTE timed benchmark: {self.config['test_case']}")
 
@@ -112,6 +117,13 @@ class WrpCteBenchTimed(Application):
         self.log(f"Executing: {cmd_str}")
 
         if self.config['nprocs'] > 1:
+            # PsshExecInfo doesn't accept pipe_stdout/pipe_stderr, so embed
+            # the redirect in the command itself. Each node writes to its own
+            # bench_output.txt.<hostname> in NFS to avoid the contention you'd
+            # get from N nodes truncating/appending the same file in parallel.
+            cmd_str = (
+                f"bash -c '{cmd_str} > {output_path}.$(hostname) 2>&1'"
+            )
             exec_info = PsshExecInfo(
                 env=self.mod_env,
                 hostfile=self.hostfile,
@@ -153,42 +165,58 @@ class WrpCteBenchTimed(Application):
         path = os.path.join(self.shared_dir, 'bench_output.txt')
         if os.path.exists(path):
             os.remove(path)
+        for per_host in glob.glob(path + '.*'):
+            os.remove(per_host)
+
+    def _resolve_output_path(self, path):
+        """Return the canonical bench_output.txt if it exists (single-node),
+        else any one of the per-host files written in multi-node mode.
+        Returns None if neither shape is on disk."""
+        if os.path.exists(path):
+            return path
+        per_host = sorted(glob.glob(path + '.*'))
+        return per_host[0] if per_host else None
 
     def _log_output_tail(self, path, n_lines=100):
-        """Emit the tail of bench_output.txt into the Jarvis log."""
-        if not os.path.exists(path):
-            self.log(f'(no output file at {path})')
+        """Emit the tail of bench_output.txt into the Jarvis log. Falls back
+        to a per-host file (multi-node) if the canonical path is absent."""
+        resolved = self._resolve_output_path(path)
+        if resolved is None:
+            self.log(f'(no output file at {path} or {path}.*)')
             return
         try:
-            with open(path, 'r') as f:
+            with open(resolved, 'r') as f:
                 lines = f.readlines()
         except Exception as e:
-            self.log(f'failed to read {path}: {e}')
+            self.log(f'failed to read {resolved}: {e}')
             return
         tail = lines[-n_lines:] if len(lines) > n_lines else lines
-        self.log(f'--- bench_output.txt tail ({len(tail)} lines) ---')
+        self.log(f'--- {os.path.basename(resolved)} tail ({len(tail)} lines) ---')
         for line in tail:
             self.log(line.rstrip())
-        self.log('--- end bench_output.txt tail ---')
+        self.log(f'--- end {os.path.basename(resolved)} tail ---')
 
     def _check_output_freshness(self, path):
         """Raise if output is missing, empty, missing the results header,
-        or reports an operation that does not match self.config['test_case']."""
-        if not os.path.exists(path):
+        or reports an operation that does not match self.config['test_case'].
+        In multi-node mode all per-host outputs are symmetric copies of the
+        same benchmark, so checking any one of them is sufficient."""
+        resolved = self._resolve_output_path(path)
+        if resolved is None:
             raise RuntimeError(
-                f'Benchmark produced no output file at {path}')
-        with open(path, 'r') as f:
+                f'Benchmark produced no output file at {path} (or {path}.*)')
+        with open(resolved, 'r') as f:
             content = f.read()
         if not content.strip():
             raise RuntimeError(
-                f'Benchmark output file is empty: {path}')
+                f'Benchmark output file is empty: {resolved}')
         content_stripped = re.sub(r'\033\[[0-9;]*m', '', content)
         header_match = re.search(
             r'=== (\w+) Benchmark Results ===', content_stripped)
         if header_match is None:
             self._log_output_tail(path)
             raise RuntimeError(
-                f'Benchmark output lacks results header: {path}')
+                f'Benchmark output lacks results header: {resolved}')
         parsed_op = header_match.group(1).lower()
         want = str(self.config['test_case']).lower()
         if parsed_op != want:
