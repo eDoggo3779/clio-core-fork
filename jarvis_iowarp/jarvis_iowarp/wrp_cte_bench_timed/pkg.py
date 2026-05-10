@@ -238,26 +238,100 @@ class WrpCteBenchTimed(Application):
     # ------------------------------------------------------------------
 
     def _get_stat(self, stat_dict):
-        """Parse benchmark output and populate stat_dict."""
+        """Parse benchmark output and populate stat_dict.
+
+        Single-node: one canonical bench_output.txt is parsed directly.
+        Multi-node: every per-host bench_output.txt.<hostname> is parsed and
+        the results folded together so the CSV columns mean "cluster
+        aggregate" — identical semantics to single-node. Without this fold,
+        multi-node rows would silently report per-node numbers and every
+        cross-config plot would be off by a factor of nprocs.
+        """
         output_path = os.path.join(self.shared_dir, 'bench_output.txt')
-        if not os.path.exists(output_path):
-            self.log(f'No output file found at {output_path}')
+
+        if os.path.exists(output_path):
+            files = [output_path]
+        else:
+            files = sorted(glob.glob(output_path + '.*'))
+
+        if not files:
+            self.log(f'No output file found at {output_path} or {output_path}.*')
             return
 
-        with open(output_path, 'r') as f:
-            output = f.read()
+        per_host_stats = []
+        for path in files:
+            with open(path, 'r') as f:
+                output = f.read()
+            if not output.strip():
+                self.log(f'Output file is empty: {path}')
+                continue
+            host_stat = {}
+            self._parse_output(output, host_stat)
+            if host_stat:
+                per_host_stats.append(host_stat)
 
-        if not output.strip():
-            self.log(f'Output file is empty: {output_path}')
+        if not per_host_stats:
+            self.log(f'Warning: No metrics extracted from {len(files)} '
+                     f'output file(s) under {output_path}*.')
             return
 
         before_count = len(stat_dict)
-        self._parse_output(output, stat_dict)
+        self._fold_host_stats(per_host_stats, stat_dict)
         after_count = len(stat_dict)
         if after_count == before_count:
-            self.log(f'Warning: No metrics extracted from {output_path} '
-                     f'({len(output)} bytes). '
-                     f'Check if benchmark results are present in output.')
+            self.log(f'Warning: fold produced no metrics from '
+                     f'{len(per_host_stats)} host stat dict(s).')
+
+    # Aggregation rules across per-host stat dicts. Mirrors how the C++
+    # binary aggregates across threads within a single host: sums for
+    # throughput/totals, averages for latencies and per-thread means,
+    # min-of-mins / max-of-maxes for the extremes.
+    _FOLD_SUM = {
+        'agg_bw_mbps',
+        'agg_ops_per_sec',
+        'total_data_mb',
+        'total_ops',
+    }
+    _FOLD_AVG = {
+        'time_avg_us',
+        'bw_per_thread_avg_mbps',
+        'ops_per_thread_avg_per_sec',
+        'avg_latency_per_op_us',
+        'latency_stddev_us',
+    }
+    _FOLD_MIN = {
+        'time_min_us',
+        'bw_per_thread_min_mbps',
+    }
+    _FOLD_MAX = {
+        'time_max_us',
+        'bw_per_thread_max_mbps',
+    }
+
+    def _fold_host_stats(self, per_host_stats, stat_dict):
+        """Combine per-host stat dicts into stat_dict using the fold rules.
+
+        Stat keys are namespaced as '<pkg_id>.<operation>.<metric>'. The
+        metric is the last dotted segment; we look it up in the FOLD_* sets
+        to pick an aggregation. Unknown metrics fall back to averaging,
+        which is the most conservative default.
+        """
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for host_stat in per_host_stats:
+            for key, value in host_stat.items():
+                buckets[key].append(value)
+
+        for key, values in buckets.items():
+            metric = key.rsplit('.', 1)[-1]
+            if metric in self._FOLD_SUM:
+                stat_dict[key] = sum(values)
+            elif metric in self._FOLD_MIN:
+                stat_dict[key] = min(values)
+            elif metric in self._FOLD_MAX:
+                stat_dict[key] = max(values)
+            else:
+                stat_dict[key] = sum(values) / len(values)
 
     def _parse_output(self, output, stat_dict):
         """Extract metrics from wrp_cte_bench stdout.
