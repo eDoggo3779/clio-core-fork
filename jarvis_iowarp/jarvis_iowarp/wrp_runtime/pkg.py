@@ -239,10 +239,22 @@ class WrpRuntime(Service):
             env=self.env
         )).run()
 
-        # Fallback: force kill any remaining chimaera processes
+        # Fallback: force kill any remaining chimaera_* processes on every node.
+        # partial=True passes -f to pkill so it matches the full cmdline — the
+        # actual binary is named 'chimaera_run' (process name != 'chimaera'),
+        # so partial=False would silently match nothing. This catches
+        # chimaera_run, chimaera_start_runtime, and any 'chimaera compose'
+        # leftovers, preventing accumulation across sweep iterations.
         Kill('chimaera',
              self._exec_info(env=self.env),
-             partial=False).run()
+             partial=True).run()
+
+        # Clean stale shared-memory segments on every node so the next
+        # iteration starts from a clean slate. Without this, lingering
+        # /dev/shm/chi_* segments from a partially-killed runtime can cause
+        # the next 'chimaera compose' bdev open to hang indefinitely.
+        Exec('rm -f /dev/shm/chi_* 2>/dev/null || true',
+             self._exec_info(env=self.env)).run()
 
         # Wait for the port to be free before returning
         port = self.config['port']

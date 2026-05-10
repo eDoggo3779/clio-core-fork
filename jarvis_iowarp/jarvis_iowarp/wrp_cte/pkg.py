@@ -355,16 +355,26 @@ class WrpCte(Service):
                     # Validate path
                     if not isinstance(path, str) or not path.strip():
                         raise ValueError(f"Invalid path in device {i}: {path}")
-                    
+
+                    # Expand env vars and ~ so paths like /mnt/nvme/$USER/storage1.bin
+                    # become /mnt/nvme/<user>/storage1.bin before going to Mkdir,
+                    # the chimaera compose YAML, and clean()'s Rm. Without this,
+                    # the literal '$USER' is passed verbatim and bdev file open
+                    # silently fails on each compute node. RAM pseudo-paths
+                    # (ram::...) are passed through unchanged.
+                    path = path.strip()
+                    if not path.startswith('ram::'):
+                        path = os.path.expandvars(os.path.expanduser(path))
+
                     # Validate capacity using SizeType
                     capacity_str = self._normalize_capacity_with_sizetype(capacity)
-                    
+
                     # Validate score
                     score_float = float(score)
                     if not 0.0 <= score_float <= 1.0:
                         raise ValueError(f"Score must be between 0.0 and 1.0, got: {score_float}")
-                    
-                    validated_devices.append((path.strip(), capacity_str, score_float))
+
+                    validated_devices.append((path, capacity_str, score_float))
                 else:
                     raise ValueError(f"Device {i} must be a tuple/list with at least 3 elements")
                     
@@ -576,12 +586,14 @@ class WrpCte(Service):
 
         # Clean up storage devices using Rm with PsshExecInfo
         try:
-            # Get all configured storage devices
-            devices = self.config.get('devices', [])
-
-            # If no devices were manually configured, get from resource graph
-            if not devices:
-                devices.extend(self._get_devices_from_resource_graph())
+            # Get all configured storage devices (run through validation so
+            # $USER and ~ get expanded — clean() must see the same concrete
+            # paths that were passed to Mkdir / chimaera compose).
+            raw_devices = self.config.get('devices', [])
+            if raw_devices:
+                devices = self._validate_and_convert_devices(raw_devices)
+            else:
+                devices = self._get_devices_from_resource_graph()
 
             # Clean up each device and parent directory using Rm with PsshExecInfo
             if devices:
