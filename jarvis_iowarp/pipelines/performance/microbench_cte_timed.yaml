@@ -78,7 +78,7 @@ config:
       #   Put    — write-only
       #   Get    — read-only
       #   PutGet — write then read (measures both paths)
-      test_case: "PutGet"
+      test_case: "Get"
 
       # --- EXPERIMENT: Thread Count ---
       # Number of worker threads issuing I/O operations concurrently.

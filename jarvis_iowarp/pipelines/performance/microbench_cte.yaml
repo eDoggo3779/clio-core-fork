@@ -98,7 +98,7 @@ config:
       # --- EXPERIMENT: I/O Count ---
       # Number of I/O operations each thread performs.
       # Higher values yield more stable averages but longer runs.
-      io_count: 100
+      io_count: 10000
 
       # --- EXPERIMENT: MPI Distribution ---
       # nprocs — total MPI processes (use > 1 for distributed benchmarks)

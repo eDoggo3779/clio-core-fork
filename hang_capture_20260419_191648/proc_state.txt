@@ -1,0 +1,158 @@
+--- PID 53469 ---
+Name:	sh
+Umask:	0022
+State:	S (sleeping)
+Tgid:	53469
+Ngid:	0
+Pid:	53469
+PPid:	51881
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	256
+Groups:	27 995 1000 
+NStgid:	53469
+NSpid:	53469
+NSpgid:	51881
+NSsid:	565
+Kthread:	0
+VmPeak:	    2804 kB
+VmSize:	    2804 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	    1664 kB
+VmRSS:	    1664 kB
+RssAnon:	       0 kB
+RssFile:	    1664 kB
+RssShmem:	       0 kB
+VmData:	     232 kB
+VmStk:	     136 kB
+VmExe:	      84 kB
+VmLib:	    1748 kB
+VmPTE:	      44 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	1/31349
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	0000000000010002
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	1
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	8
+nonvoluntary_ctxt_switches:	0
+--- /proc/53469/stack ---
+cat: /proc/53469/stack: Permission denied
+--- /proc/53469/wchan ---
+do_wait
+--- /proc/53469/syscall ---
+cat: /proc/53469/syscall: Operation not permitted
+--- per-thread stacks (PID 53469) ---
+  TID 53469 state=State:	S (sleeping)
+  stack:
+
+--- PID 53472 ---
+Name:	wrp_cte_bench
+Umask:	0022
+State:	S (sleeping)
+Tgid:	53472
+Ngid:	0
+Pid:	53472
+PPid:	53469
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Groups:	27 995 1000 
+NStgid:	53472
+NSpid:	53472
+NSpgid:	51881
+NSsid:	565
+Kthread:	0
+VmPeak:	 1299340 kB
+VmSize:	 1069964 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	   11392 kB
+VmRSS:	   11392 kB
+RssAnon:	     512 kB
+RssFile:	    6016 kB
+RssShmem:	    4864 kB
+VmData:	   75008 kB
+VmStk:	     136 kB
+VmExe:	     168 kB
+VmLib:	    5376 kB
+VmPTE:	     160 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	10
+SigQ:	1/31349
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	0000000100000000
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	1
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	43
+nonvoluntary_ctxt_switches:	0
+--- /proc/53472/stack ---
+cat: /proc/53472/stack: Permission denied
+--- /proc/53472/wchan ---
+futex_wait_queue
+--- /proc/53472/syscall ---
+cat: /proc/53472/syscall: Operation not permitted
+--- per-thread stacks (PID 53472) ---
+  TID 53472 state=State:	S (sleeping)
+  stack:
+  TID 53473 state=State:	S (sleeping)
+  stack:
+  TID 53474 state=State:	S (sleeping)
+  stack:
+  TID 53475 state=State:	S (sleeping)
+  stack:
+  TID 53476 state=State:	S (sleeping)
+  stack:
+  TID 53477 state=State:	S (sleeping)
+  stack:
+  TID 53479 state=State:	R (running)
+  stack:
+  TID 53480 state=State:	R (running)
+  stack:
+  TID 53481 state=State:	R (running)
+  stack:
+  TID 53482 state=State:	R (running)
+  stack:
+

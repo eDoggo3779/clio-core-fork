@@ -1,0 +1,158 @@
+--- PID 55739 ---
+Name:	sh
+Umask:	0022
+State:	S (sleeping)
+Tgid:	55739
+Ngid:	0
+Pid:	55739
+PPid:	55350
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	256
+Groups:	27 995 1000 
+NStgid:	55739
+NSpid:	55739
+NSpgid:	55350
+NSsid:	54674
+Kthread:	0
+VmPeak:	    2804 kB
+VmSize:	    2804 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	    1664 kB
+VmRSS:	    1664 kB
+RssAnon:	       0 kB
+RssFile:	    1664 kB
+RssShmem:	       0 kB
+VmData:	     232 kB
+VmStk:	     136 kB
+VmExe:	      84 kB
+VmLib:	    1748 kB
+VmPTE:	      48 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	1/31349
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	0000000000010002
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	1
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	8
+nonvoluntary_ctxt_switches:	0
+--- /proc/55739/stack ---
+cat: /proc/55739/stack: Permission denied
+--- /proc/55739/wchan ---
+do_wait
+--- /proc/55739/syscall ---
+61 0xffffffff 0x7ffcaeb613ec 0x0 0x0 0x7a91c42f0b20 0xb0 0x7ffcaeb613c8 0x7a91c41fd7d7
+--- per-thread stacks (PID 55739) ---
+  TID 55739 state=State:	S (sleeping)
+  stack:
+
+--- PID 55742 ---
+Name:	wrp_cte_bench
+Umask:	0022
+State:	S (sleeping)
+Tgid:	55742
+Ngid:	0
+Pid:	55742
+PPid:	55739
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Groups:	27 995 1000 
+NStgid:	55742
+NSpid:	55742
+NSpgid:	55350
+NSsid:	54674
+Kthread:	0
+VmPeak:	 1102732 kB
+VmSize:	 1069964 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	   11520 kB
+VmRSS:	   11520 kB
+RssAnon:	     512 kB
+RssFile:	    6144 kB
+RssShmem:	    4864 kB
+VmData:	   75008 kB
+VmStk:	     136 kB
+VmExe:	     168 kB
+VmLib:	    5376 kB
+VmPTE:	     168 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	10
+SigQ:	1/31349
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	0000000100000000
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	1
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	43
+nonvoluntary_ctxt_switches:	0
+--- /proc/55742/stack ---
+cat: /proc/55742/stack: Permission denied
+--- /proc/55742/wchan ---
+futex_wait_queue
+--- /proc/55742/syscall ---
+202 0x7208577fe990 0x109 0xd9c7 0x0 0x0 0xffffffff 0x7ffe1b1c76e0 0x7208609f7d71
+--- per-thread stacks (PID 55742) ---
+  TID 55742 state=State:	S (sleeping)
+  stack:
+  TID 55743 state=State:	S (sleeping)
+  stack:
+  TID 55744 state=State:	S (sleeping)
+  stack:
+  TID 55745 state=State:	S (sleeping)
+  stack:
+  TID 55746 state=State:	S (sleeping)
+  stack:
+  TID 55747 state=State:	S (sleeping)
+  stack:
+  TID 55751 state=State:	R (running)
+  stack:
+  TID 55752 state=State:	R (running)
+  stack:
+  TID 55753 state=State:	R (running)
+  stack:
+  TID 55754 state=State:	R (running)
+  stack:
+

@@ -1,0 +1,13 @@
+=== uptime / loadavg ===
+ 19:21:42 up  5:31,  0 user,  load average: 7.85, 5.94, 3.75
+7.85 5.94 3.75 8/535 56174
+
+=== memory ===
+               total        used        free      shared  buff/cache   available
+Mem:           7.7Gi       2.0Gi       4.9Gi       9.5Mi       897Mi       5.6Gi
+Swap:          2.0Gi          0B       2.0Gi
+
+=== disk usage /workspace & /tmp ===
+Filesystem      Size  Used Avail Use% Mounted on
+C:\             238G  167G   71G  71% /workspace
+overlay        1007G   30G  926G   4% /

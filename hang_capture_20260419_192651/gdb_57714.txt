@@ -1,0 +1,25 @@
+=== gdb backtrace for PID 57714 ===
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x00007c7b544367d7 in __GI___wait4 (pid=-1, stat_loc=0x7ffd5b49a00c, options=0, usage=0x0) at ../sysdeps/unix/sysv/linux/wait4.c:30
+
+warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+
+Thread 1 (Thread 0x7c7b54323740 (LWP 57714) "sh"):
+#0  0x00007c7b544367d7 in __GI___wait4 (pid=-1, stat_loc=0x7ffd5b49a00c, options=0, usage=0x0) at ../sysdeps/unix/sysv/linux/wait4.c:30
+#1  0x00006165b48c221d in ?? ()
+#2  0x00006165b48c24a9 in ?? ()
+#3  0x00006165b48ce5e9 in ?? ()
+#4  0x00006165b48c51b0 in ?? ()
+#5  0x00006165b48cba49 in ?? ()
+#6  0x00006165b48c0d62 in ?? ()
+#7  0x00007c7b543501ca in __libc_start_call_main (main=main@entry=0x6165b48c0b20, argc=argc@entry=3, argv=argv@entry=0x7ffd5b49a4f8) at ../sysdeps/nptl/libc_start_call_main.h:58
+#8  0x00007c7b5435028b in __libc_start_main_impl (main=0x6165b48c0b20, argc=3, argv=0x7ffd5b49a4f8, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7ffd5b49a4e8) at ../csu/libc-start.c:360
+#9  0x00006165b48c0f35 in ?? ()
+[Inferior 1 (process 57714) detached]

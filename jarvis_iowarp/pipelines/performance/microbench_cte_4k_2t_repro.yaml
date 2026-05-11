@@ -1,0 +1,49 @@
+# CTE 4k × 2 threads Hang Reproducer
+# Purpose: Isolate the iteration-6 hang (4k io_size, 2 threads, repeat 1) from the full sweep.
+#          If this pipeline hangs in isolation on repeat 1 or 2, we have a deterministic repro.
+#          If it runs all 10 repeats clean, then cross-config residual state is the trigger.
+#
+# Derived from: microbench_cte_timed.yaml
+# Single config: io_size=4k, num_threads=2, repeated 10 times.
+
+config:
+  name: cte_bench_4k_2t_repro
+  pkgs:
+    - pkg_type: jarvis_iowarp.wrp_runtime
+      pkg_name: runtime
+      do_dbg: false
+      dbg_port: 4000
+      log_level: "info"
+      ipc_mode: "shm"
+
+    - pkg_type: jarvis_iowarp.wrp_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cache", "500MB", 0.8]
+        - ["/mnt/nvme/$USER/storage1.bin", "64g", 0.8]
+      dpe_type: "max_bw"
+      neighborhood: 4
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    - pkg_type: jarvis_iowarp.wrp_cte_bench_timed
+      pkg_name: cte_bench_timed
+      test_case: "PutGet"
+      num_threads: 2
+      depth: 4
+      io_size: "4k"
+      duration_sec: 30
+      nprocs: 1
+      ppn: 1
+
+vars:
+  cte_bench_timed.io_size: ["4k"]
+  cte_bench_timed.num_threads: [2]
+
+loop:
+  - [cte_bench_timed.io_size]
+  - [cte_bench_timed.num_threads]
+
+repeat: 10
+
+output: "/workspace/results/cte_bench_4k_2t_repro_results"

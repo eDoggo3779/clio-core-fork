@@ -1,0 +1,324 @@
+--- PID 57657 ---
+Name:	sh
+Umask:	0022
+State:	S (sleeping)
+Tgid:	57657
+Ngid:	0
+Pid:	57657
+PPid:	57652
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	256
+Groups:	27 995 1000 
+NStgid:	57657
+NSpid:	57657
+NSpgid:	57652
+NSsid:	57027
+Kthread:	0
+VmPeak:	    2804 kB
+VmSize:	    2804 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	    1536 kB
+VmRSS:	    1536 kB
+RssAnon:	       0 kB
+RssFile:	    1536 kB
+RssShmem:	       0 kB
+VmData:	     232 kB
+VmStk:	     136 kB
+VmExe:	      84 kB
+VmLib:	    1748 kB
+VmPTE:	      48 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	1/31349
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	0000000000010002
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	1
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	4
+nonvoluntary_ctxt_switches:	0
+--- /proc/57657/stack ---
+cat: /proc/57657/stack: Permission denied
+--- /proc/57657/wchan ---
+do_wait
+--- /proc/57657/syscall ---
+61 0xffffffff 0x7fff21d13b9c 0x0 0x0 0x754482f75b20 0xb0 0x7fff21d13b78 0x754482e827d7
+--- per-thread stacks (PID 57657) ---
+  TID 57657 state=State:	S (sleeping)
+  stack:
+
+--- PID 57661 ---
+Name:	chimaera
+Umask:	0022
+State:	S (sleeping)
+Tgid:	57661
+Ngid:	0
+Pid:	57661
+PPid:	57657
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Groups:	27 995 1000 
+NStgid:	57661
+NSpid:	57661
+NSpgid:	57652
+NSsid:	57027
+Kthread:	0
+VmPeak:	 2403408 kB
+VmSize:	 2403408 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	  562156 kB
+VmRSS:	  562156 kB
+RssAnon:	  548844 kB
+RssFile:	    7936 kB
+RssShmem:	    5376 kB
+VmData:	  656468 kB
+VmStk:	     136 kB
+VmExe:	     340 kB
+VmLib:	    6396 kB
+VmPTE:	    1288 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	14
+SigQ:	1/31349
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	0000000100004002
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	1
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	503
+nonvoluntary_ctxt_switches:	1
+--- /proc/57661/stack ---
+cat: /proc/57661/stack: Permission denied
+--- /proc/57661/wchan ---
+hrtimer_nanosleep
+--- /proc/57661/syscall ---
+230 0x0 0x0 0x7fff2ee3aac0 0x7fff2ee3aac0 0x0 0x1 0x7fff2ee3aa30 0x7a3791f6aadf
+--- per-thread stacks (PID 57661) ---
+  TID 57661 state=State:	S (sleeping)
+  stack:
+  TID 57662 state=State:	S (sleeping)
+  stack:
+  TID 57663 state=State:	S (sleeping)
+  stack:
+  TID 57664 state=State:	S (sleeping)
+  stack:
+  TID 57665 state=State:	S (sleeping)
+  stack:
+  TID 57666 state=State:	S (sleeping)
+  stack:
+  TID 57667 state=State:	S (sleeping)
+  stack:
+  TID 57668 state=State:	S (sleeping)
+  stack:
+  TID 57669 state=State:	S (sleeping)
+  stack:
+  TID 57670 state=State:	S (sleeping)
+  stack:
+  TID 57671 state=State:	S (sleeping)
+  stack:
+  TID 57672 state=State:	S (sleeping)
+  stack:
+  TID 57673 state=State:	S (sleeping)
+  stack:
+  TID 57674 state=State:	S (sleeping)
+  stack:
+
+--- PID 57714 ---
+Name:	sh
+Umask:	0022
+State:	S (sleeping)
+Tgid:	57714
+Ngid:	0
+Pid:	57714
+PPid:	57652
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	256
+Groups:	27 995 1000 
+NStgid:	57714
+NSpid:	57714
+NSpgid:	57652
+NSsid:	57027
+Kthread:	0
+VmPeak:	    2804 kB
+VmSize:	    2804 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	    1664 kB
+VmRSS:	    1664 kB
+RssAnon:	       0 kB
+RssFile:	    1664 kB
+RssShmem:	       0 kB
+VmData:	     232 kB
+VmStk:	     136 kB
+VmExe:	      84 kB
+VmLib:	    1748 kB
+VmPTE:	      48 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	1
+SigQ:	1/31349
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	0000000000010002
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	1
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	8
+nonvoluntary_ctxt_switches:	0
+--- /proc/57714/stack ---
+cat: /proc/57714/stack: Permission denied
+--- /proc/57714/wchan ---
+do_wait
+--- /proc/57714/syscall ---
+61 0xffffffff 0x7ffd5b49a00c 0x0 0x0 0x7c7b54529b20 0xb0 0x7ffd5b499fe8 0x7c7b544367d7
+--- per-thread stacks (PID 57714) ---
+  TID 57714 state=State:	S (sleeping)
+  stack:
+
+--- PID 57717 ---
+Name:	wrp_cte_bench
+Umask:	0022
+State:	S (sleeping)
+Tgid:	57717
+Ngid:	0
+Pid:	57717
+PPid:	57714
+TracerPid:	0
+Uid:	1000	1000	1000	1000
+Gid:	1000	1000	1000	1000
+FDSize:	64
+Groups:	27 995 1000 
+NStgid:	57717
+NSpid:	57717
+NSpgid:	57652
+NSsid:	57027
+Kthread:	0
+VmPeak:	 1135500 kB
+VmSize:	 1069964 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	   11136 kB
+VmRSS:	   11136 kB
+RssAnon:	     512 kB
+RssFile:	    5888 kB
+RssShmem:	    4736 kB
+VmData:	   75008 kB
+VmStk:	     136 kB
+VmExe:	     168 kB
+VmLib:	    5376 kB
+VmPTE:	     164 kB
+VmSwap:	       0 kB
+HugetlbPages:	       0 kB
+CoreDumping:	0
+THP_enabled:	1
+untag_mask:	0xffffffffffffffff
+Threads:	10
+SigQ:	1/31349
+SigPnd:	0000000000000000
+ShdPnd:	0000000000000000
+SigBlk:	0000000000000000
+SigIgn:	0000000000000000
+SigCgt:	0000000100000000
+CapInh:	0000000000000000
+CapPrm:	0000000000000000
+CapEff:	0000000000000000
+CapBnd:	000001ffffffffff
+CapAmb:	0000000000000000
+NoNewPrivs:	0
+Seccomp:	2
+Seccomp_filters:	1
+Speculation_Store_Bypass:	thread vulnerable
+SpeculationIndirectBranch:	conditional enabled
+Cpus_allowed:	fff
+Cpus_allowed_list:	0-11
+Mems_allowed:	00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000000,00000001
+Mems_allowed_list:	0
+voluntary_ctxt_switches:	42
+nonvoluntary_ctxt_switches:	0
+--- /proc/57717/stack ---
+cat: /proc/57717/stack: Permission denied
+--- /proc/57717/wchan ---
+futex_wait_queue
+--- /proc/57717/syscall ---
+202 0x76d2bcf49990 0x109 0xe17c 0x0 0x0 0xffffffff 0x7ffd4c5694b0 0x76d2bf7f1d71
+--- per-thread stacks (PID 57717) ---
+  TID 57717 state=State:	S (sleeping)
+  stack:
+  TID 57718 state=State:	S (sleeping)
+  stack:
+  TID 57719 state=State:	S (sleeping)
+  stack:
+  TID 57720 state=State:	S (sleeping)
+  stack:
+  TID 57721 state=State:	S (sleeping)
+  stack:
+  TID 57722 state=State:	S (sleeping)
+  stack:
+  TID 57724 state=State:	R (running)
+  stack:
+  TID 57725 state=State:	R (running)
+  stack:
+  TID 57726 state=State:	R (running)
+  stack:
+  TID 57727 state=State:	R (running)
+  stack:
+

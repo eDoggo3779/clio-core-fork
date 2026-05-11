@@ -1,0 +1,45 @@
+# Phase 3 probe: 4k x 1 thread x 1 repeat
+# Expected: success, runtime ~37s, non-empty putget.* columns, exit 0,
+#           bench_output.txt contains "=== PutGet Benchmark Results ==="
+
+config:
+  name: probe_cte_4k_1t
+  pkgs:
+    - pkg_type: jarvis_iowarp.wrp_runtime
+      pkg_name: runtime
+      do_dbg: false
+      dbg_port: 4000
+      log_level: "info"
+      ipc_mode: "shm"
+
+    - pkg_type: jarvis_iowarp.wrp_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cache", "500MB", 0.8]
+        - ["/mnt/nvme/$USER/storage1.bin", "64g", 0.8]
+      dpe_type: "max_bw"
+      neighborhood: 4
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    - pkg_type: jarvis_iowarp.wrp_cte_bench_timed
+      pkg_name: cte_bench_timed
+      test_case: "PutGet"
+      num_threads: 1
+      depth: 4
+      io_size: "4k"
+      duration_sec: 30
+      nprocs: 1
+      ppn: 1
+
+vars:
+  cte_bench_timed.io_size: ["4k"]
+  cte_bench_timed.num_threads: [1]
+
+loop:
+  - [cte_bench_timed.io_size]
+  - [cte_bench_timed.num_threads]
+
+repeat: 1
+
+output: "/workspace/results/probe_cte_4k_1t_results"

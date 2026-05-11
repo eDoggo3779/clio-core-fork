@@ -1,0 +1,242 @@
+loop:
+- - cte_bench_timed.io_size
+- - cte_bench_timed.num_threads
+repeat: 10
+results:
+- combination_idx: 0
+  end_time: '2026-04-19T19:01:47.122532'
+  repeat_idx: 0
+  runtime: 37.4860417842865
+  start_time: '2026-04-19T19:01:09.602556'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 14.3997
+    cte_bench_timed.putget.agg_ops_per_sec: 3686.33
+    cte_bench_timed.putget.avg_latency_per_op_us: 542.545
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 7.19986
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 7.19985
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 7.19987
+    cte_bench_timed.putget.latency_stddev_us: 47.0
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1843.16
+    cte_bench_timed.putget.time_avg_us: 30000600.0
+    cte_bench_timed.putget.time_max_us: 30000624.0
+    cte_bench_timed.putget.time_min_us: 30000530.0
+    cte_bench_timed.putget.total_data_mb: 432.0
+    cte_bench_timed.putget.total_ops: 110592.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:02:23.363925'
+  repeat_idx: 1
+  runtime: 36.19295287132263
+  start_time: '2026-04-19T19:01:47.130811'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 14.2564
+    cte_bench_timed.putget.agg_ops_per_sec: 3649.65
+    cte_bench_timed.putget.avg_latency_per_op_us: 547.998
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 7.12822
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 7.12822
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 7.12823
+    cte_bench_timed.putget.latency_stddev_us: 36.5
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1824.83
+    cte_bench_timed.putget.time_avg_us: 30000700.0
+    cte_bench_timed.putget.time_max_us: 30000713.0
+    cte_bench_timed.putget.time_min_us: 30000640.0
+    cte_bench_timed.putget.total_data_mb: 427.703
+    cte_bench_timed.putget.total_ops: 109492.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:03:00.569834'
+  repeat_idx: 2
+  runtime: 37.16541838645935
+  start_time: '2026-04-19T19:02:23.376731'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 14.0841
+    cte_bench_timed.putget.agg_ops_per_sec: 3605.53
+    cte_bench_timed.putget.avg_latency_per_op_us: 554.704
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 7.04204
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 7.042
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 7.04209
+    cte_bench_timed.putget.latency_stddev_us: 188.0
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1802.76
+    cte_bench_timed.putget.time_avg_us: 30000600.0
+    cte_bench_timed.putget.time_max_us: 30000806.0
+    cte_bench_timed.putget.time_min_us: 30000430.0
+    cte_bench_timed.putget.total_data_mb: 422.531
+    cte_bench_timed.putget.total_ops: 108168.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:03:37.760399'
+  repeat_idx: 3
+  runtime: 37.14744758605957
+  start_time: '2026-04-19T19:03:00.578994'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 13.8385
+    cte_bench_timed.putget.agg_ops_per_sec: 3542.67
+    cte_bench_timed.putget.avg_latency_per_op_us: 564.547
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 6.91927
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 6.91925
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 6.91929
+    cte_bench_timed.putget.latency_stddev_us: 95.0
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1771.33
+    cte_bench_timed.putget.time_avg_us: 30001100.0
+    cte_bench_timed.putget.time_max_us: 30001233.0
+    cte_bench_timed.putget.time_min_us: 30001043.0
+    cte_bench_timed.putget.total_data_mb: 415.172
+    cte_bench_timed.putget.total_ops: 106284.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:04:14.956475'
+  repeat_idx: 4
+  runtime: 37.15179753303528
+  start_time: '2026-04-19T19:03:37.770967'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 13.8637
+    cte_bench_timed.putget.agg_ops_per_sec: 3549.12
+    cte_bench_timed.putget.avg_latency_per_op_us: 563.52
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 6.93187
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 6.93185
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 6.93189
+    cte_bench_timed.putget.latency_stddev_us: 76.5
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1774.56
+    cte_bench_timed.putget.time_avg_us: 30000700.0
+    cte_bench_timed.putget.time_max_us: 30000763.0
+    cte_bench_timed.putget.time_min_us: 30000610.0
+    cte_bench_timed.putget.total_data_mb: 415.922
+    cte_bench_timed.putget.total_ops: 106476.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:04:52.114312'
+  repeat_idx: 5
+  runtime: 37.13516855239868
+  start_time: '2026-04-19T19:04:14.966384'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 14.1464
+    cte_bench_timed.putget.agg_ops_per_sec: 3621.49
+    cte_bench_timed.putget.avg_latency_per_op_us: 552.259
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 7.07322
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 7.07317
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 7.07327
+    cte_bench_timed.putget.latency_stddev_us: 216.0
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1810.74
+    cte_bench_timed.putget.time_avg_us: 30000900.0
+    cte_bench_timed.putget.time_max_us: 30001135.0
+    cte_bench_timed.putget.time_min_us: 30000703.0
+    cte_bench_timed.putget.total_data_mb: 424.406
+    cte_bench_timed.putget.total_ops: 108648.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:05:29.282073'
+  repeat_idx: 6
+  runtime: 37.14721155166626
+  start_time: '2026-04-19T19:04:52.122385'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 13.9604
+    cte_bench_timed.putget.agg_ops_per_sec: 3573.85
+    cte_bench_timed.putget.avg_latency_per_op_us: 559.62
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 6.98018
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 6.98014
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 6.98023
+    cte_bench_timed.putget.latency_stddev_us: 192.5
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1786.93
+    cte_bench_timed.putget.time_avg_us: 30002400.0
+    cte_bench_timed.putget.time_max_us: 30002549.0
+    cte_bench_timed.putget.time_min_us: 30002164.0
+    cte_bench_timed.putget.total_data_mb: 418.844
+    cte_bench_timed.putget.total_ops: 107224.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:06:06.463422'
+  repeat_idx: 7
+  runtime: 37.142168045043945
+  start_time: '2026-04-19T19:05:29.290770'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 13.9911
+    cte_bench_timed.putget.agg_ops_per_sec: 3581.72
+    cte_bench_timed.putget.avg_latency_per_op_us: 558.391
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 6.99555
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 6.99555
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 6.99555
+    cte_bench_timed.putget.latency_stddev_us: 4.0
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1790.86
+    cte_bench_timed.putget.time_avg_us: 30000100.0
+    cte_bench_timed.putget.time_max_us: 30000108.0
+    cte_bench_timed.putget.time_min_us: 30000100.0
+    cte_bench_timed.putget.total_data_mb: 419.734
+    cte_bench_timed.putget.total_ops: 107452.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:06:43.655748'
+  repeat_idx: 8
+  runtime: 37.14969825744629
+  start_time: '2026-04-19T19:06:06.473208'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 12.6805
+    cte_bench_timed.putget.agg_ops_per_sec: 3246.21
+    cte_bench_timed.putget.avg_latency_per_op_us: 616.103
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 6.34025
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 6.34021
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 6.34029
+    cte_bench_timed.putget.latency_stddev_us: 192.5
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1623.1
+    cte_bench_timed.putget.time_avg_us: 30000500.0
+    cte_bench_timed.putget.time_max_us: 30000719.0
+    cte_bench_timed.putget.time_min_us: 30000334.0
+    cte_bench_timed.putget.total_data_mb: 380.422
+    cte_bench_timed.putget.total_ops: 97388.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+- combination_idx: 0
+  end_time: '2026-04-19T19:07:20.841514'
+  repeat_idx: 9
+  runtime: 37.150001764297485
+  start_time: '2026-04-19T19:06:43.665731'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 13.8769
+    cte_bench_timed.putget.agg_ops_per_sec: 3552.5
+    cte_bench_timed.putget.avg_latency_per_op_us: 562.984
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 6.93847
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 6.93846
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 6.93849
+    cte_bench_timed.putget.latency_stddev_us: 66.5
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 1776.25
+    cte_bench_timed.putget.time_avg_us: 30000300.0
+    cte_bench_timed.putget.time_max_us: 30000356.0
+    cte_bench_timed.putget.time_min_us: 30000223.0
+    cte_bench_timed.putget.total_data_mb: 416.312
+    cte_bench_timed.putget.total_ops: 106576.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 4k
+    cte_bench_timed.num_threads: 2
+test_name: cte_bench_4k_2t_repro
+total_runs: 10
+variables:
+  cte_bench_timed.io_size:
+  - 4k
+  cte_bench_timed.num_threads:
+  - 2

@@ -1,0 +1,66 @@
+=== lsof for PID 57661 ===
+COMMAND    PID   USER   FD      TYPE             DEVICE  SIZE/OFF             NODE NAME
+chimaera 57661 iowarp  cwd       DIR               0,67       512 4785074604444284 /workspace
+chimaera 57661 iowarp  rtd       DIR               0,85      4096           973016 /
+chimaera 57661 iowarp  txt       REG               0,85    527888          1034893 /home/iowarp/.local/bin/chimaera
+chimaera 57661 iowarp  mem       REG               8,48                    1034893 /home/iowarp/.local/bin/chimaera (path dev=0,85)
+chimaera 57661 iowarp  DEL       REG                0,1                       9225 /memfd:chimaera_58133_0
+chimaera 57661 iowarp  DEL       REG                0,1                       9224 /memfd:chimaera_57717_0
+chimaera 57661 iowarp  DEL       REG                0,1                      10246 /memfd:chimaera_57695_0
+chimaera 57661 iowarp  mem       REG               0,67   1066880 3940649674337670 /workspace/build/bin/libwrp_cte_core_runtime.so
+chimaera 57661 iowarp  mem       REG               8,48                     542298 /usr/local/lib/libaio.so.1.0.2 (path dev=0,85)
+chimaera 57661 iowarp  mem       REG               0,67    341872 1970324837356661 /workspace/build/bin/libchimaera_bdev_runtime.so
+chimaera 57661 iowarp  mem       REG               0,67    658320 2251799814067149 /workspace/build/bin/libchimaera_admin_runtime.so
+chimaera 57661 iowarp  DEL       REG                0,1                         50 /memfd:chi_main_segment_iowarp
+chimaera 57661 iowarp  mem       REG               8,48                     409749 /usr/lib/x86_64-linux-gnu/libm.so.6 (path dev=0,85)
+chimaera 57661 iowarp  mem       REG               8,48                     409707 /usr/lib/x86_64-linux-gnu/libc.so.6 (path dev=0,85)
+chimaera 57661 iowarp  mem       REG               8,48                     976719 /opt/spack-env/install/linux-ubuntu24.04-skylake/gcc-13.3.0/gcc-runtime-13.3.0-chcq57ufnfu6xkuxg35cetmhvnztijsv/lib/libgcc_s.so.1 (path dev=0,85)
+chimaera 57661 iowarp  mem       REG               8,48                     976726 /opt/spack-env/install/linux-ubuntu24.04-skylake/gcc-13.3.0/gcc-runtime-13.3.0-chcq57ufnfu6xkuxg35cetmhvnztijsv/lib/libstdc++.so.6 (path dev=0,85)
+chimaera 57661 iowarp  mem       REG               8,48                     542254 /usr/local/lib/libzmq.so.5.2.5 (path dev=0,85)
+chimaera 57661 iowarp  mem       REG               0,67    866960  562949953925661 /workspace/build/bin/libhermes_shm_host.so
+chimaera 57661 iowarp  mem       REG               0,67   1454448  562949953925716 /workspace/build/bin/libchimaera_cxx.so.1.0.0
+chimaera 57661 iowarp  mem       REG               8,48                     409687 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 (path dev=0,85)
+chimaera 57661 iowarp    0u      CHR              136,2       0t0                5 /dev/pts/2
+chimaera 57661 iowarp    1w     FIFO               0,14       0t0         10770516 pipe
+chimaera 57661 iowarp    2w     FIFO               0,14       0t0         10770517 pipe
+chimaera 57661 iowarp    3u      REG                0,1  37499408               50 /memfd:chi_main_segment_iowarp (deleted)
+chimaera 57661 iowarp    4u  a_inode               0,15         0             1042 [eventfd:137]
+chimaera 57661 iowarp    5u  a_inode               0,15         0             1042 [eventfd:138]
+chimaera 57661 iowarp    6u  a_inode               0,15         0             1042 [eventpoll:5]
+chimaera 57661 iowarp    7u  a_inode               0,15         0             1042 [eventfd:139]
+chimaera 57661 iowarp    8u  a_inode               0,15         0             1042 [eventpoll:7,12]
+chimaera 57661 iowarp    9u  a_inode               0,15         0             1042 [eventfd:140]
+chimaera 57661 iowarp   10u  a_inode               0,15         0             1042 [eventpoll:9]
+chimaera 57661 iowarp   11u  a_inode               0,15         0             1042 [eventfd:141]
+chimaera 57661 iowarp   12u     IPv4           10770523       0t0              TCP localhost:9413 (LISTEN)
+chimaera 57661 iowarp   13u  a_inode               0,15         0             1042 [eventfd:142]
+chimaera 57661 iowarp   14u  a_inode               0,15         0             1042 [eventfd:143]
+chimaera 57661 iowarp   15u  a_inode               0,15         0             1042 [eventpoll:14]
+chimaera 57661 iowarp   16u  a_inode               0,15         0             1042 [eventfd:144]
+chimaera 57661 iowarp   17u  a_inode               0,15         0             1042 [eventpoll:16,21]
+chimaera 57661 iowarp   18u  a_inode               0,15         0             1042 [eventfd:145]
+chimaera 57661 iowarp   19u  a_inode               0,15         0             1042 [eventpoll:18,40]
+chimaera 57661 iowarp   20u  a_inode               0,15         0             1042 [eventfd:146]
+chimaera 57661 iowarp   21u     IPv4           10770525       0t0              TCP *:9416 (LISTEN)
+chimaera 57661 iowarp   22u     unix 0x00000000b303b049       0t0         10770526 /tmp/chimaera_iowarp/chimaera_9413.ipc type=STREAM (LISTEN)
+chimaera 57661 iowarp   23u  a_inode               0,15         0             1042 [eventpoll:27]
+chimaera 57661 iowarp   24u  a_inode               0,15         0             1042 [eventpoll:28]
+chimaera 57661 iowarp   25u  a_inode               0,15         0             1042 [eventpoll:29]
+chimaera 57661 iowarp   26u  a_inode               0,15         0             1042 [eventpoll:11,20,22,30]
+chimaera 57661 iowarp   27u  a_inode               0,15         0             1042 [signalfd]
+chimaera 57661 iowarp   28u  a_inode               0,15         0             1042 [signalfd]
+chimaera 57661 iowarp   29u  a_inode               0,15         0             1042 [signalfd]
+chimaera 57661 iowarp   30u  a_inode               0,15         0             1042 [signalfd]
+chimaera 57661 iowarp   31u  a_inode               0,15         0             1042 [eventfd:148]
+chimaera 57661 iowarp   32u  a_inode               0,15         0             1042 [eventfd:147]
+chimaera 57661 iowarp   33u  a_inode               0,15         0             1042 [eventfd:149]
+chimaera 57661 iowarp   34u  a_inode               0,15         0             1042 [eventpoll:31]
+chimaera 57661 iowarp   35u  a_inode               0,15         0             1042 [eventfd:150]
+chimaera 57661 iowarp   36u  a_inode               0,15         0             1042 [eventpoll:33,39]
+chimaera 57661 iowarp   37u  a_inode               0,15         0             1042 [eventpoll:35]
+chimaera 57661 iowarp   38u  a_inode               0,15         0             1042 [eventfd:151]
+chimaera 57661 iowarp   39u     IPv4           10770528       0t0              TCP localhost:9414 (LISTEN)
+chimaera 57661 iowarp   40u     IPv4           11098935       0t0              TCP localhost:9416->localhost:38304 (ESTABLISHED)
+chimaera 57661 iowarp   41u      REG                0,1 570429440            10246 /memfd:chimaera_57695_0 (deleted)
+chimaera 57661 iowarp   42u      REG                0,1 570429440             9224 /memfd:chimaera_57717_0 (deleted)
+chimaera 57661 iowarp   43u      REG                0,1 570429440             9225 /memfd:chimaera_58133_0 (deleted)

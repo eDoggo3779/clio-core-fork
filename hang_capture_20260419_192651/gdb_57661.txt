@@ -1,0 +1,140 @@
+=== gdb backtrace for PID 57661 ===
+[New LWP 57674]
+[New LWP 57673]
+[New LWP 57672]
+[New LWP 57671]
+[New LWP 57670]
+[New LWP 57669]
+[New LWP 57668]
+[New LWP 57667]
+[New LWP 57666]
+[New LWP 57665]
+[New LWP 57664]
+[New LWP 57663]
+[New LWP 57662]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x00007a3791f6aadf in __GI___clock_nanosleep (clock_id=clock_id@entry=0, flags=flags@entry=0, req=0x7fff2ee3aac0, rem=0x7fff2ee3aac0) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+
+warning: 78	../sysdeps/unix/sysv/linux/clock_nanosleep.c: No such file or directory
+
+Thread 14 (Thread 0x7a378f9c96c0 (LWP 57662) "ZMQbg/Reaper"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=6, events=0x7a378f9c81d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 13 (Thread 0x7a378f1c86c0 (LWP 57663) "ZMQbg/IO/0"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=8, events=0x7a378f1c71d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 12 (Thread 0x7a378e9c76c0 (LWP 57664) "ZMQbg/IO/1"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=10, events=0x7a378e9c61d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 11 (Thread 0x7a378e1c66c0 (LWP 57665) "ZMQbg/Reaper"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=15, events=0x7a378e1c51d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 10 (Thread 0x7a378d9c56c0 (LWP 57666) "ZMQbg/IO/0"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=17, events=0x7a378d9c41d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 9 (Thread 0x7a378d1c46c0 (LWP 57667) "ZMQbg/IO/1"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=19, events=0x7a378d1c31d0, maxevents=256, timeout=999) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 8 (Thread 0x7a378c80e6c0 (LWP 57668) "chimaera"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x00007a37924fb266 in chi::Worker::SuspendMe() () from /workspace/build/bin/libchimaera_cxx.so.1
+#2  0x00007a37924fc4d8 in chi::Worker::Run() () from /workspace/build/bin/libchimaera_cxx.so.1
+#3  0x00007a37924efb80 in void* hshm::thread::Pthread::SpawnWrapper<chi::WorkOrchestrator::SpawnWorkerThreads()::{lambda(int)#1}, int>(void*) () from /workspace/build/bin/libchimaera_cxx.so.1
+#4  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#5  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 7 (Thread 0x7a3787fff6c0 (LWP 57669) "chimaera"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=24, events=0x63dc64c43c34, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a37924fb492 in chi::Worker::SuspendMe() () from /workspace/build/bin/libchimaera_cxx.so.1
+#2  0x00007a37924fc4d8 in chi::Worker::Run() () from /workspace/build/bin/libchimaera_cxx.so.1
+#3  0x00007a37924efb80 in void* hshm::thread::Pthread::SpawnWrapper<chi::WorkOrchestrator::SpawnWorkerThreads()::{lambda(int)#1}, int>(void*) () from /workspace/build/bin/libchimaera_cxx.so.1
+#4  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#5  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 6 (Thread 0x7a37877fe6c0 (LWP 57670) "chimaera"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=25, events=0x63dc64c460e4, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a37924fb492 in chi::Worker::SuspendMe() () from /workspace/build/bin/libchimaera_cxx.so.1
+#2  0x00007a37924fc4d8 in chi::Worker::Run() () from /workspace/build/bin/libchimaera_cxx.so.1
+#3  0x00007a37924efb80 in void* hshm::thread::Pthread::SpawnWrapper<chi::WorkOrchestrator::SpawnWorkerThreads()::{lambda(int)#1}, int>(void*) () from /workspace/build/bin/libchimaera_cxx.so.1
+#4  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#5  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 5 (Thread 0x7a3786ffd6c0 (LWP 57671) "chimaera"):
+#0  0x00007a3791f994fd in __GI___poll (fds=0x7a3786ffc470, nfds=1, timeout=0) at ../sysdeps/unix/sysv/linux/poll.c:29
+#1  0x00007a37923c4582 in zmq::signaler_t::wait(int) const () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923a386e in zmq::mailbox_t::recv(zmq::command_t*, int) () from /usr/local/lib/libzmq.so.5
+#3  0x00007a37923c7de9 in zmq::socket_base_t::process_commands(int, bool) () from /usr/local/lib/libzmq.so.5
+#4  0x00007a37923c9324 in zmq::socket_base_t::recv(zmq::msg_t*, int) () from /usr/local/lib/libzmq.so.5
+#5  0x00007a37923e9780 in zmq_msg_recv () from /usr/local/lib/libzmq.so.5
+#6  0x000063dc2704d111 in int hshm::lbm::ZeroMqTransport::RecvMetadata<chi::LoadTaskArchive>(chi::LoadTaskArchive&, hshm::lbm::LbmContext const&) [clone .isra.0] ()
+#7  0x000063dc2704d6fc in hshm::lbm::ClientInfo hshm::lbm::Transport::Recv<chi::LoadTaskArchive>(chi::LoadTaskArchive&, hshm::lbm::LbmContext const&) ()
+#8  0x00007a378c96d792 in chimaera::admin::Runtime::ClientRecv(chimaera::admin::Runtime::ClientRecv(hshm::ipc::FullPtr<chimaera::admin::ClientRecvTask, false>, chi::RunContext&)::_ZN8chimaera5admin7Runtime10ClientRecvEN4hshm3ipc7FullPtrINS0_14ClientRecvTaskELb0EEERN3chi10RunContextE.Frame*) [clone .actor] () from /workspace/build/bin/libchimaera_admin_runtime.so
+#9  0x00007a378c9735de in bool chi::TaskResume::await_suspend<chi::TaskResume::promise_type>(std::__n4861::coroutine_handle<chi::TaskResume::promise_type>) () from /workspace/build/bin/libchimaera_admin_runtime.so
+#10 0x00007a378c9a488b in chimaera::admin::Runtime::Run(chimaera::admin::Runtime::Run(unsigned int, hshm::ipc::FullPtr<chi::Task, false>, chi::RunContext&)::_ZN8chimaera5admin7Runtime3RunEjN4hshm3ipc7FullPtrIN3chi4TaskELb0EEERNS5_10RunContextE.Frame*) [clone .actor] () from /workspace/build/bin/libchimaera_admin_runtime.so
+#11 0x00007a37924f7398 in chi::Worker::StartCoroutine(hshm::ipc::FullPtr<chi::Task, false> const&, chi::RunContext*) () from /workspace/build/bin/libchimaera_cxx.so.1
+#12 0x00007a37924fa05c in chi::Worker::ExecTask(hshm::ipc::FullPtr<chi::Task, false> const&, chi::RunContext*, bool) () from /workspace/build/bin/libchimaera_cxx.so.1
+#13 0x00007a37924fa631 in chi::Worker::ProcessPeriodicQueue(std::queue<chi::RunContext*, std::deque<chi::RunContext*, std::allocator<chi::RunContext*> > >&, unsigned int) () from /workspace/build/bin/libchimaera_cxx.so.1
+#14 0x00007a37924fafe2 in chi::Worker::ContinueBlockedTasks(bool) () from /workspace/build/bin/libchimaera_cxx.so.1
+#15 0x00007a37924fc4d8 in chi::Worker::Run() () from /workspace/build/bin/libchimaera_cxx.so.1
+#16 0x00007a37924efb80 in void* hshm::thread::Pthread::SpawnWrapper<chi::WorkOrchestrator::SpawnWorkerThreads()::{lambda(int)#1}, int>(void*) () from /workspace/build/bin/libchimaera_cxx.so.1
+#17 0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#18 0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 4 (Thread 0x7a37867fc6c0 (LWP 57672) "ZMQbg/Reaper"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=34, events=0x7a37867fb1d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 3 (Thread 0x7a3785ffb6c0 (LWP 57673) "ZMQbg/IO/0"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=36, events=0x7a3785ffa1d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 2 (Thread 0x7a37857fa6c0 (LWP 57674) "ZMQbg/IO/1"):
+#0  0x00007a3791fa8072 in epoll_wait (epfd=37, events=0x7a37857f91d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x00007a379239eac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x00007a37923dd420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007a3791f1aaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x00007a3791fa7c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 1 (Thread 0x7a3791d94500 (LWP 57661) "chimaera"):
+#0  0x00007a3791f6aadf in __GI___clock_nanosleep (clock_id=clock_id@entry=0, flags=flags@entry=0, req=0x7fff2ee3aac0, rem=0x7fff2ee3aac0) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x00007a3791f77a27 in __GI___nanosleep (req=<optimized out>, rem=<optimized out>) at ../sysdeps/unix/sysv/linux/nanosleep.c:25
+#2  0x000063dc2703ebf9 in RuntimeStart(int, char**) ()
+#3  0x000063dc27038e98 in main ()
+[Inferior 1 (process 57661) detached]

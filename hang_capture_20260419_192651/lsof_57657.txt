@@ -1,0 +1,11 @@
+=== lsof for PID 57657 ===
+COMMAND   PID   USER   FD   TYPE DEVICE SIZE/OFF             NODE NAME
+sh      57657 iowarp  cwd    DIR   0,67      512 4785074604444284 /workspace
+sh      57657 iowarp  rtd    DIR   0,85     4096           973016 /
+sh      57657 iowarp  txt    REG   0,85   129784           409073 /usr/bin/dash
+sh      57657 iowarp  mem    REG   8,48                    409073 /usr/bin/dash (path dev=0,85)
+sh      57657 iowarp  mem    REG   8,48                    409707 /usr/lib/x86_64-linux-gnu/libc.so.6 (path dev=0,85)
+sh      57657 iowarp  mem    REG   8,48                    409687 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 (path dev=0,85)
+sh      57657 iowarp    0u   CHR  136,2      0t0                5 /dev/pts/2
+sh      57657 iowarp    1w  FIFO   0,14      0t0         10770516 pipe
+sh      57657 iowarp    2w  FIFO   0,14      0t0         10770517 pipe

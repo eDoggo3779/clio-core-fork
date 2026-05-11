@@ -1,0 +1,4 @@
+=== ss -tnp (TCP) ===
+ESTAB 0      0          127.0.0.1:9416      127.0.0.1:58640 users:(("chimaera",pid=53430,fd=40))     
+ESTAB 0      0          127.0.0.1:58640     127.0.0.1:9416  users:(("wrp_cte_bench",pid=53472,fd=11))
+=== ss -xp (Unix domain) ===

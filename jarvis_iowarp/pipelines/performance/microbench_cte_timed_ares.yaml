@@ -27,7 +27,7 @@ config:
       #   shm  — shared memory (lowest latency, single-node)
       #   ipc  — Unix domain sockets
       #   tcp  — TCP sockets (required for multi-node)
-      ipc_mode: "shm"
+      ipc_mode: "tcp"
 
     # ==================================================================
     # CTE Service — Storage Configuration
@@ -54,7 +54,7 @@ config:
     - pkg_type: jarvis_iowarp.wrp_cte_bench_timed
       pkg_name: cte_bench_timed
 
-      test_case: "Get"
+      test_case: "PutGet"
       num_threads: 1
       depth: 4
       io_size: "4k"

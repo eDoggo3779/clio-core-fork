@@ -1,0 +1,52 @@
+# CTE Grid: 1 node, ipc_mode=shm
+# Part of the gridsearch suite: {nodes: [1,2,4]} x {test_case: [Put,Get,PutGet]} x {ipc_mode: [shm,tcp]}.
+# This pipeline covers the shm-only corner (shm cannot extend past a single OS image).
+#
+# Sweep shape: 3 test_cases x 5 io_sizes x 3 thread counts x 3 repeats = 135 runs.
+#
+# Submit with: sbatch run_ares_cte_grid_1node.sbatch \
+#                jarvis_iowarp/pipelines/performance/microbench_cte_grid_1node_shm.yaml
+
+config:
+  name: cte_grid_1node_shm
+  pkgs:
+    - pkg_type: jarvis_iowarp.wrp_runtime
+      pkg_name: runtime
+      do_dbg: false
+      dbg_port: 4000
+      log_level: "info"
+      ipc_mode: "shm"
+
+    - pkg_type: jarvis_iowarp.wrp_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cache", "500MB", 0.8]
+        - ["/mnt/nvme/$USER/storage1.bin", "64g", 0.8]
+      dpe_type: "max_bw"
+      neighborhood: 4
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    - pkg_type: jarvis_iowarp.wrp_cte_bench_timed
+      pkg_name: cte_bench_timed
+      test_case: "Get"
+      num_threads: 1
+      depth: 4
+      io_size: "4k"
+      duration_sec: 30
+      nprocs: 1
+      ppn: 1
+
+vars:
+  cte_bench_timed.test_case: ["Put", "Get", "PutGet"]
+  cte_bench_timed.io_size: ["4k", "16k", "64k", "256k", "1m"]
+  cte_bench_timed.num_threads: [1, 2, 4]
+
+loop:
+  - [cte_bench_timed.test_case]
+  - [cte_bench_timed.io_size]
+  - [cte_bench_timed.num_threads]
+
+repeat: 3
+
+output: "/home/anaik18/clio-core-fork/results/cte_grid_1node_shm_results"

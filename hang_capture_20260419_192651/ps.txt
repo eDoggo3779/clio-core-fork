@@ -1,0 +1,6 @@
+=== ps: runtime/cte/chimaera processes ===
+iowarp   57652  0.3  0.2 324320 22656 pts/2    Sl+  19:26   0:00      |   |   \_ /home/iowarp/venv/bin/python3 /home/iowarp/venv/bin/jarvis ppl run yaml jarvis_iowarp/pipelines/performance/microbench_cte_timed.yaml
+iowarp   57657  0.0  0.0   2804  1536 pts/2    S+   19:26   0:00      |   |       \_ /bin/sh -c chimaera runtime start
+iowarp   57661 36.3  6.9 2403408 562156 pts/2  Sl+  19:26   0:12      |   |       |   \_ chimaera runtime start
+iowarp   57714  0.0  0.0   2804  1664 pts/2    S+   19:26   0:00      |   |       \_ /bin/sh -c wrp_cte_bench PutGet 4 4 4k 30s
+iowarp   57717  400  0.1 1069964 11136 pts/2   Sl+  19:26   2:13      |   |           \_ wrp_cte_bench PutGet 4 4 4k 30s

@@ -63,7 +63,7 @@ config:
     - pkg_type: jarvis_iowarp.wrp_cte_bench_timed
       pkg_name: cte_bench_timed
 
-      test_case: "Get"
+      test_case: "PutGet"
       num_threads: 1
       depth: 4
       io_size: "4k"

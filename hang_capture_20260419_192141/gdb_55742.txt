@@ -1,0 +1,111 @@
+=== gdb backtrace for PID 55742 ===
+[New LWP 55754]
+[New LWP 55753]
+[New LWP 55752]
+[New LWP 55751]
+[New LWP 55747]
+[New LWP 55746]
+[New LWP 55745]
+[New LWP 55744]
+[New LWP 55743]
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x00007208609f7d71 in __futex_abstimed_wait_common64 (private=128, cancel=true, abstime=0x0, op=265, expected=55751, futex_word=0x7208577fe990) at ./nptl/futex-internal.c:57
+
+warning: 57	./nptl/futex-internal.c: No such file or directory
+
+Thread 10 (Thread 0x7208609566c0 (LWP 55743) "ZMQbg/Reaper"):
+#0  0x0000720860a89072 in epoll_wait (epfd=5, events=0x7208609551d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x0000720860f68ac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x0000720860fa7420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 9 (Thread 0x7208601556c0 (LWP 55744) "ZMQbg/IO/0"):
+#0  0x0000720860a89072 in epoll_wait (epfd=7, events=0x7208601541d0, maxevents=256, timeout=1000) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x0000720860f68ac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x0000720860fa7420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 8 (Thread 0x72085f9546c0 (LWP 55745) "ZMQbg/IO/1"):
+#0  0x0000720860a89072 in epoll_wait (epfd=9, events=0x72085f9531d0, maxevents=256, timeout=-1) at ../sysdeps/unix/sysv/linux/epoll_wait.c:30
+#1  0x0000720860f68ac8 in zmq::epoll_t::loop() () from /usr/local/lib/libzmq.so.5
+#2  0x0000720860fa7420 in thread_routine () from /usr/local/lib/libzmq.so.5
+#3  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 7 (Thread 0x720857fff6c0 (LWP 55746) "wrp_cte_bench"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x00007208610804a9 in chi::IpcManager::RecvZmqClientThread() () from /workspace/build/bin/libchimaera_cxx.so.1
+#2  0x0000720860d76db4 in ?? () from /opt/spack-env/.spack-env/view/lib/libstdc++.so.6
+#3  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#4  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 6 (Thread 0x72085f1536c0 (LWP 55747) "wrp_cte_bench"):
+#0  0x0000720860a4badf in __GI___clock_nanosleep (clock_id=clock_id@entry=0, flags=flags@entry=0, req=0x72085f152e70, rem=0x72085f152e70) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000720860a58a27 in __GI___nanosleep (req=<optimized out>, rem=<optimized out>) at ../sysdeps/unix/sysv/linux/nanosleep.c:25
+#2  0x0000720861071da8 in chi::IpcManager::HeartbeatThread() () from /workspace/build/bin/libchimaera_cxx.so.1
+#3  0x0000720860d76db4 in ?? () from /opt/spack-env/.spack-env/view/lib/libstdc++.so.6
+#4  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#5  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 5 (Thread 0x7208577fe6c0 (LWP 55751) "wrp_cte_bench"):
+#0  0x0000720860a6d80b in __GI_sched_yield () at ../sysdeps/unix/syscall-template.S:120
+#1  0x000058894aa9fd67 in hshm::lbm::ShmTransport::ReadTransfer(char*, unsigned long, hshm::lbm::LbmContext const&) ()
+#2  0x000058894aab5a9f in hshm::lbm::ClientInfo hshm::lbm::Transport::Recv<chi::LoadTaskArchive>(chi::LoadTaskArchive&, hshm::lbm::LbmContext const&) ()
+#3  0x000058894aab8dbb in bool chi::IpcManager::Recv<wrp_cte::core::PutBlobTask>(chi::Future<wrp_cte::core::PutBlobTask, hshm::ipc::BaseAllocator<hshm::ipc::_ArenaAllocator<false> > >&, float) ()
+#4  0x000058894aab930c in chi::Future<wrp_cte::core::PutBlobTask, hshm::ipc::BaseAllocator<hshm::ipc::_ArenaAllocator<false> > >::Wait(float) ()
+#5  0x000058894aabd0b7 in CTEBenchmark::PutGetWorkerThread(unsigned long, std::atomic<bool>&, std::vector<long long, std::allocator<long long> >&) ()
+#6  0x0000720860d76db4 in ?? () from /opt/spack-env/.spack-env/view/lib/libstdc++.so.6
+#7  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 4 (Thread 0x720856ffd6c0 (LWP 55752) "wrp_cte_bench"):
+#0  0x0000720860a6d80b in __GI_sched_yield () at ../sysdeps/unix/syscall-template.S:120
+#1  0x000058894aa9fd67 in hshm::lbm::ShmTransport::ReadTransfer(char*, unsigned long, hshm::lbm::LbmContext const&) ()
+#2  0x000058894aab5a9f in hshm::lbm::ClientInfo hshm::lbm::Transport::Recv<chi::LoadTaskArchive>(chi::LoadTaskArchive&, hshm::lbm::LbmContext const&) ()
+#3  0x000058894aabc5bb in bool chi::IpcManager::Recv<wrp_cte::core::GetBlobTask>(chi::Future<wrp_cte::core::GetBlobTask, hshm::ipc::BaseAllocator<hshm::ipc::_ArenaAllocator<false> > >&, float) ()
+#4  0x000058894aabcafc in chi::Future<wrp_cte::core::GetBlobTask, hshm::ipc::BaseAllocator<hshm::ipc::_ArenaAllocator<false> > >::Wait(float) ()
+#5  0x000058894aabd20f in CTEBenchmark::PutGetWorkerThread(unsigned long, std::atomic<bool>&, std::vector<long long, std::allocator<long long> >&) ()
+#6  0x0000720860d76db4 in ?? () from /opt/spack-env/.spack-env/view/lib/libstdc++.so.6
+#7  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 3 (Thread 0x7208567fc6c0 (LWP 55753) "wrp_cte_bench"):
+#0  0x0000720860a6d80b in __GI_sched_yield () at ../sysdeps/unix/syscall-template.S:120
+#1  0x000058894aa9fd67 in hshm::lbm::ShmTransport::ReadTransfer(char*, unsigned long, hshm::lbm::LbmContext const&) ()
+#2  0x000058894aab5a9f in hshm::lbm::ClientInfo hshm::lbm::Transport::Recv<chi::LoadTaskArchive>(chi::LoadTaskArchive&, hshm::lbm::LbmContext const&) ()
+#3  0x000058894aabc5bb in bool chi::IpcManager::Recv<wrp_cte::core::GetBlobTask>(chi::Future<wrp_cte::core::GetBlobTask, hshm::ipc::BaseAllocator<hshm::ipc::_ArenaAllocator<false> > >&, float) ()
+#4  0x000058894aabcafc in chi::Future<wrp_cte::core::GetBlobTask, hshm::ipc::BaseAllocator<hshm::ipc::_ArenaAllocator<false> > >::Wait(float) ()
+#5  0x000058894aabd20f in CTEBenchmark::PutGetWorkerThread(unsigned long, std::atomic<bool>&, std::vector<long long, std::allocator<long long> >&) ()
+#6  0x0000720860d76db4 in ?? () from /opt/spack-env/.spack-env/view/lib/libstdc++.so.6
+#7  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 2 (Thread 0x720855ffb6c0 (LWP 55754) "wrp_cte_bench"):
+#0  0x0000720860a6d80b in __GI_sched_yield () at ../sysdeps/unix/syscall-template.S:120
+#1  0x000058894aa9fd67 in hshm::lbm::ShmTransport::ReadTransfer(char*, unsigned long, hshm::lbm::LbmContext const&) ()
+#2  0x000058894aab5a9f in hshm::lbm::ClientInfo hshm::lbm::Transport::Recv<chi::LoadTaskArchive>(chi::LoadTaskArchive&, hshm::lbm::LbmContext const&) ()
+#3  0x000058894aabc5bb in bool chi::IpcManager::Recv<wrp_cte::core::GetBlobTask>(chi::Future<wrp_cte::core::GetBlobTask, hshm::ipc::BaseAllocator<hshm::ipc::_ArenaAllocator<false> > >&, float) ()
+#4  0x000058894aabcafc in chi::Future<wrp_cte::core::GetBlobTask, hshm::ipc::BaseAllocator<hshm::ipc::_ArenaAllocator<false> > >::Wait(float) ()
+#5  0x000058894aabd20f in CTEBenchmark::PutGetWorkerThread(unsigned long, std::atomic<bool>&, std::vector<long long, std::allocator<long long> >&) ()
+#6  0x0000720860d76db4 in ?? () from /opt/spack-env/.spack-env/view/lib/libstdc++.so.6
+#7  0x00007208609fbaa4 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#8  0x0000720860a88c6c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 1 (Thread 0x72086095a740 (LWP 55742) "wrp_cte_bench"):
+#0  0x00007208609f7d71 in __futex_abstimed_wait_common64 (private=128, cancel=true, abstime=0x0, op=265, expected=55751, futex_word=0x7208577fe990) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=128, abstime=0x0, clockid=0, expected=55751, futex_word=0x7208577fe990) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x7208577fe990, expected=55751, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=128) at ./nptl/futex-internal.c:139
+#3  0x00007208609fd7a3 in __pthread_clockjoin_ex (threadid=125380153304768, thread_return=0x0, clockid=0, abstime=0x0, block=<optimized out>) at ./nptl/pthread_join_common.c:102
+#4  0x0000720860d76e33 in std::thread::join() () from /opt/spack-env/.spack-env/view/lib/libstdc++.so.6
+#5  0x000058894aaabc58 in CTEBenchmark::RunPutGetBenchmark() ()
+#6  0x000058894aa98e4e in main ()
+[Inferior 1 (process 55742) detached]

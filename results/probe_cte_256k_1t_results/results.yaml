@@ -1,0 +1,35 @@
+loop:
+- - cte_bench_timed.io_size
+- - cte_bench_timed.num_threads
+repeat: 1
+results:
+- combination_idx: 0
+  end_time: '2026-04-21T21:30:19.036539'
+  repeat_idx: 0
+  runtime: 37.130499839782715
+  start_time: '2026-04-21T21:29:41.877014'
+  stats:
+    cte_bench_timed.putget.agg_bw_mbps: 1541.28
+    cte_bench_timed.putget.agg_ops_per_sec: 6165.14
+    cte_bench_timed.putget.avg_latency_per_op_us: 162.202
+    cte_bench_timed.putget.bw_per_thread_avg_mbps: 1541.28
+    cte_bench_timed.putget.bw_per_thread_max_mbps: 1541.28
+    cte_bench_timed.putget.bw_per_thread_min_mbps: 1541.28
+    cte_bench_timed.putget.latency_stddev_us: 0.0
+    cte_bench_timed.putget.ops_per_thread_avg_per_sec: 6165.14
+    cte_bench_timed.putget.time_avg_us: 30000300.0
+    cte_bench_timed.putget.time_max_us: 30000310.0
+    cte_bench_timed.putget.time_min_us: 30000310.0
+    cte_bench_timed.putget.total_data_mb: 46239.0
+    cte_bench_timed.putget.total_ops: 184956.0
+  status: success
+  variables:
+    cte_bench_timed.io_size: 256k
+    cte_bench_timed.num_threads: 1
+test_name: probe_cte_256k_1t
+total_runs: 1
+variables:
+  cte_bench_timed.io_size:
+  - 256k
+  cte_bench_timed.num_threads:
+  - 1
