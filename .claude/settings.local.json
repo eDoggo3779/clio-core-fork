@@ -76,7 +76,18 @@
       "Bash(ps -eo pid,cmd)",
       "Bash(pkill -9 -f chi_rss)",
       "Read(//home/iowarp/.clio/**)",
-      "Bash(pkill -9 -f 'clio_run runtime\\\\|chimaera runtime')"
+      "Bash(pkill -9 -f 'clio_run runtime\\\\|chimaera runtime')",
+      "Read(//home/iowarp/.claude/**)",
+      "Read(//home/iowarp/.claude/projects/**)",
+      "Bash(docker version *)",
+      "Read(//run/**)",
+      "Bash(ls -la /.dockerenv)",
+      "Read(//proc/1/**)",
+      "Bash(mount)",
+      "Bash(docker volume *)",
+      "Bash(timeout 90 docker run --rm -v /var/lib/docker:/hostdocker:ro alpine sh -c ' *)",
+      "Bash(timeout 120 docker run --rm -v /var/lib/docker:/hostdocker:ro alpine sh -c ' *)",
+      "Bash(git ls-tree *)"
     ],
     "deny": [],
     "ask": []

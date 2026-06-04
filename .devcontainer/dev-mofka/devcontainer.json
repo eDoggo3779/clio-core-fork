@@ -1,0 +1,62 @@
+{
+  "name": "IOWarp + Mofka Development",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "args": {
+      "HOST_UID": "${localEnv:HOST_UID:1000}",
+      "HOST_GID": "${localEnv:HOST_GID:1000}"
+    },
+    "options": [
+      "--tag=iowarp-mofka-devcontainer:latest"
+    ]
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "containerEnv": {
+    "IOWARP_CORE_ROOT": "${localWorkspaceFolder}",
+    "SPACK_ROOT": "/opt/spack",
+    "LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib/x86_64-linux-gnu"
+  },
+  "mounts": [
+    "source=${localEnv:USERPROFILE}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
+    "source=${localEnv:USERPROFILE}/.claude,target=/tmp/host-claude,type=bind,readonly",
+    "source=${localEnv:USERPROFILE}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+  ],
+  "runArgs": [
+    "--privileged"
+  ],
+  "updateRemoteUserUID": true,
+  "initializeCommand": "powershell -Command \"mkdir -Force $HOME/.ssh; if (!(Test-Path $HOME/.claude)) { mkdir $HOME/.claude }; if (!(Test-Path $HOME/.claude.json)) { New-Item -Path $HOME/.claude.json -ItemType File }\"",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "KylinIdeTeam.cppdebug",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "ms-azuretools.vscode-docker",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy"
+      ],
+      "settings": {
+        "cmake.configureOnOpen": false,
+        "python.defaultInterpreterPath": "/home/iowarp/venv/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "python.venvPath": "/home/iowarp",
+        "python.formatting.provider": "black",
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": false,
+        "python.linting.flake8Enabled": true,
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "postCreateCommand": ".devcontainer/post-create.sh",
+  "postStartCommand": ".devcontainer/post-start.sh",
+  "remoteUser": "iowarp"
+}
