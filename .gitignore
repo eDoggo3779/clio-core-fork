@@ -8,6 +8,7 @@ cmake-build-*/
 context-transfer-engine/compressor/test/results
 context-transfer-engine/compressor/results
 .claude/worktrees/
+.claude/settings.local.json
 
 # CMake generated files (only in build directories)
 # Build directories already ignored above, but add specific patterns for safety
