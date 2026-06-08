@@ -1,0 +1,76 @@
+# Mofka Benchmark — Ares Single-Node SMOKE (Pattern B: jarvis `dev` scheduler block)
+#
+# Purpose: cheap end-to-end validation of the Mofka stack on a single Ares
+# compute node before committing to the full 45-run sweep. 2 iterations.
+#
+# Validates:
+#   - conda + spack env activation via scheduler `pre_cmds`
+#   - bedrock daemon startup, mofka.json creation, mofkactl reachability
+#   - $USER expansion in workdir (mofka_server _configure)
+#   - producer/consumer stdout parsed into results.csv (RESULTS header check)
+#
+# Requires jarvis from the `dev` branch (`ppl submit` + `scheduler:` block).
+# Submit with:   jarvis ppl submit <this file>
+# Write-only:    jarvis ppl submit <this file> +no_submit   (inspect submit.slurm)
+# Monitor with:  squeue -u $USER     Output: mofka_smoke_<jobid>.log
+
+scheduler:
+  name: slurm
+  job_name: mofka_smoke
+  nodes: 1
+  ntasks_per_node: 1
+  partition: compute
+  time: "00:30:00"
+  exclusive: true
+  output: mofka_smoke_%j.log
+  error: mofka_smoke_%j.err
+  # pre_cmds run inside the batch job BEFORE `jarvis ppl run yaml`. `set +u`
+  # guards conda/spack activation scripts that reference unbound vars under
+  # the scheduler's `set -euo pipefail`. mofka_server picks up $SPACK_ENV and
+  # prepends the view's bin/lib/site-packages.
+  pre_cmds:
+    - 'set +u'
+    - 'source ~/miniconda3/etc/profile.d/conda.sh && conda activate iowarp'
+    - 'source ~/spack/share/spack/setup-env.sh && spack env activate ~/mofka-spack-env'
+    - 'set -u'
+
+config:
+  name: mofka_bench_ares_smoke
+  pkgs:
+    - pkg_type: jarvis_clio_core.mofka_server
+      pkg_name: mofka_srv
+      protocol: "tcp"
+      # /mnt/nvme/$USER is the per-node 250G scratch already used by CTE.
+      # $USER is expanded server-side in mofka_server._configure() — do NOT
+      # pre-expand here. Node-local is fine single-node (server + client
+      # share the one node).
+      workdir: "/mnt/nvme/$USER/mofka-bench"
+      topic: "benchmark_topic"
+      partition_type: "memory"
+
+    - pkg_type: jarvis_clio_core.mofka_bench
+      pkg_name: mofka_bench
+      mode: "both"
+      num_events: 1000
+      data_size: 1024
+      metadata_size: 64
+      batch_size: 16
+      num_threads: 1
+      data_selectivity: 1.0
+      use_progress_thread: true
+      # Single-node: 1 host allocation → mofka_bench runs producer/consumer
+      # locally (see _is_multinode). nprocs/ppn are the multi-node knobs.
+      nprocs: 1
+      ppn: 1
+
+vars:
+  mofka_bench.data_size: [1024, 16384]
+  mofka_bench.num_threads: [1]
+
+loop:
+  - [mofka_bench.data_size]
+  - [mofka_bench.num_threads]
+
+repeat: 1
+
+output: "${HOME}/mofka_bench_ares_smoke_results"
