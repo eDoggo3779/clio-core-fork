@@ -1,36 +1,20 @@
-# Mofka Benchmark — Ares Multi-Node SMOKE, 2 nodes, TCP (Pattern B: jarvis `dev`)
+# Mofka Benchmark — Ares Multi-Node SMOKE, 2 nodes, TCP (Pattern A: manual sbatch)
 #
 # Topology: 1 bedrock server (the batch/head node, LocalExecInfo) + 1 client
-# node (PSSH). The scheduler seeds the hostfile with BOTH nodes; mofka_bench
-# drops the server host (MOFKA_SERVER_HOST) so producer/consumer run only on
-# the 1 client node. See pipelines/mofka/architecture_decisions.md.
+# node (PSSH). The .sbatch sets the jarvis hostfile to BOTH allocated nodes;
+# mofka_bench drops the server host (MOFKA_SERVER_HOST) so producer/consumer run
+# only on the 1 client node. See pipelines/mofka/architecture_decisions.md.
 #
 # Quick sanity pass for the multi-node plumbing before the full sweep.
 # Validates:
-#   - scheduler hostfile (all nodes) + in-package head exclusion
+#   - jarvis hostfile (all nodes) + in-package head exclusion
 #   - mofka_bench._is_multinode() True (len(hosts) > 1 → PSSH branch)
 #   - mofka.json on shared NFS reachable from the client node
 #   - bedrock binds to a non-loopback address
 #   - per-host {role}_output.txt.<hostname> written, parsed, folded
 #
-# Requires jarvis `dev`. Submit: jarvis ppl submit <this file>
+# Submit with: sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_multinode_2n_smoke.sbatch
 # Output: mofka_smoke_2n_<jobid>.log
-
-scheduler:
-  name: slurm
-  job_name: mofka_smoke_2n
-  nodes: 2
-  ntasks_per_node: 1
-  partition: compute
-  time: "00:30:00"
-  exclusive: true
-  output: mofka_smoke_2n_%j.log
-  error: mofka_smoke_2n_%j.err
-  pre_cmds:
-    - 'set +u'
-    - 'source ~/miniconda3/etc/profile.d/conda.sh && conda activate iowarp'
-    - 'source ~/spack/share/spack/setup-env.sh && spack env activate ~/mofka-spack-env'
-    - 'set -u'
 
 config:
   name: mofka_bench_ares_multinode_2n_smoke

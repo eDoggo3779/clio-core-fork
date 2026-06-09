@@ -12,7 +12,10 @@ reimplementation session are dated **2026-06-08**.
 
 ---
 
-## 2026-06-08 — Launch pattern: Jarvis `scheduler:` block + `jarvis ppl submit` (Pattern B)
+## 2026-06-08 — Launch pattern: Jarvis `scheduler:` block + `jarvis ppl submit` (Pattern B) — SUPERSEDED 2026-06-09
+
+> **SUPERSEDED by the 2026-06-09 pivot to Pattern A below.** Pattern B did not
+> work on Ares. Kept here for the record.
 
 **Decision.** Mofka pipelines are single YAML files carrying a top-level
 `scheduler:` block plus a `config:`-wrapped sweep (`vars`/`loop`/`repeat`/
@@ -32,6 +35,50 @@ but is not the primary path.
 mechanism, so allocation shape, env capture, and hostfile construction are
 identical across the two benchmarks — differences in results are attributable
 to the systems, not the launchers.
+
+## 2026-06-09 — Pivot to Pattern A (manual `.sbatch` + in-process sweep)
+
+**Decision.** Replace the `scheduler:`-block YAMLs with **Pattern A**: a
+standalone `.sbatch` per scenario (`run_ares_mofka*.sbatch`) that takes one
+allocation, activates conda+spack, sets the jarvis hostfile from
+`$SLURM_JOB_NODELIST`, clears any stale `results.csv`, then runs
+`jarvis ppl run yaml <no-scheduler YAML>`. The whole sweep runs **in-process**
+inside the single allocation. The four pipeline YAMLs had their top-level
+`scheduler:` blocks removed (they stay `config:`-wrapped sweeps).
+
+**Why Pattern B failed on Ares.** jarvis `dev` executes a scheduler-block sweep
+as **one Slurm job per iteration**: `PipelineTest._run_single` does
+`if pipeline.scheduler: pipeline.submit(wait=True)` (i.e. `sbatch --wait`) for
+every combination, and `_apply_variables` copies the top-level scheduler into
+each iteration's config so every iteration takes that path. `jarvis ppl submit`
+then wraps the whole thing in an outer job, so the per-iteration `sbatch` runs
+*from a compute node*. Two hard failures on Ares, both observed in the smoke
+run (job 20815):
+  1. **Nested submission** — Ares compute nodes can't `sbatch`; the inner
+     submit returned exit 1 (`Scheduler submission failed (exit 1): sbatch
+     --wait …/run1/submit.slurm`).
+  2. **Node-local temp YAML** — the generated `…/run1/submit.slurm` runs
+     `jarvis ppl run yaml /tmp/tmpufyul4ba.yaml`; that `/tmp` file is written on
+     one node and isn't visible on the node the iteration lands on.
+Neither is fixable by changing the launch command — the per-iteration model is
+intrinsic to the scheduler block. Pattern A sidesteps both: with no scheduler
+block, `_run_single` takes the in-process `start()/stop()` path; nothing nests.
+
+**Consequences / relaxations.**
+- The "jarvis must be `dev`" constraint is **relaxed for Mofka**: Pattern A uses
+  only `jarvis ppl run yaml`, which exists on `main` too. (The repo's CTE
+  scheduler-block pipelines still need `dev`; the Ares env is already on `dev`,
+  so nothing changes operationally.)
+- **Resume gotcha:** jarvis's sweep resume counts *failed* rows as completed and
+  skips them, so a stale `results.csv` silently no-ops a re-run. The `.sbatch`
+  scripts `rm -f <output>/results.csv` before each run to force a clean sweep.
+- Efficiency win: one allocation for all 45 runs vs. 45 separate allocations the
+  scheduler block would have wanted.
+
+**Mofka-vs-CTE note.** This is the same standalone-`.sbatch` model the archived
+Mofka work validated, and it's functionally what the CTE `*_sbatch_*` pipelines
+do once their scheduler block is expanded — so the comparison stays apples-to-
+apples at the allocation level.
 
 ## 2026-06-08 — Jarvis MUST be the `dev` branch (scheduler support is dev-only)
 

@@ -1,7 +1,7 @@
-# Mofka Benchmark — Ares Multi-Node FULL SWEEP, 2 nodes, TCP (Pattern B: jarvis `dev`)
+# Mofka Benchmark — Ares Multi-Node FULL SWEEP, 2 nodes, TCP (Pattern A: manual sbatch)
 #
 # Topology: 1 bedrock server (batch/head node, LocalExecInfo) + 1 client node
-# (PSSH). The scheduler seeds the hostfile with both nodes; mofka_bench drops
+# (PSSH). The .sbatch sets the jarvis hostfile to both nodes; mofka_bench drops
 # the server host so producer/consumer run only on the client node. Per-host
 # stat fold (mofka_bench._fold_host_stats) SUMs throughput/events/data and
 # MAXes wall time across client hosts (degenerate single client here).
@@ -9,27 +9,14 @@
 # Sweep: 5 data sizes x 3 thread counts x 3 repeats = 45 runs.
 # Run the 2n smoke variant first.
 #
-# Requires jarvis `dev`. Submit: jarvis ppl submit <this file>
+# Pattern A: one 2-node allocation, sweep runs in-process via `jarvis ppl run
+# yaml` (no jarvis scheduler block). See pipelines/mofka/architecture_decisions.md.
+#
+# Submit with: sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_multinode_2n.sbatch
 # Output: mofka_bench_2n_<jobid>.log
 #
 # Time budget: 45 runs x ~30s + bedrock startup + PSSH startup variance.
 # 3 h ceiling leaves slack.
-
-scheduler:
-  name: slurm
-  job_name: mofka_bench_2n
-  nodes: 2
-  ntasks_per_node: 1
-  partition: compute
-  time: "03:00:00"
-  exclusive: true
-  output: mofka_bench_2n_%j.log
-  error: mofka_bench_2n_%j.err
-  pre_cmds:
-    - 'set +u'
-    - 'source ~/miniconda3/etc/profile.d/conda.sh && conda activate iowarp'
-    - 'source ~/spack/share/spack/setup-env.sh && spack env activate ~/mofka-spack-env'
-    - 'set -u'
 
 config:
   name: mofka_bench_ares_multinode_2n

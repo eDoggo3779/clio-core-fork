@@ -1,32 +1,19 @@
-# Mofka Benchmark — Ares Single-Node FULL SWEEP (Pattern B: jarvis `dev` scheduler block)
+# Mofka Benchmark — Ares Single-Node FULL SWEEP (Pattern A: manual sbatch, in-process)
 #
 # 45-run producer/consumer sweep on one Ares compute node, TCP transport,
 # memory partition. Run the smoke variant first to confirm the env is healthy.
 #
 # Sweep: 5 data sizes x 3 thread counts x 3 repeats = 45 runs.
 #
-# Requires jarvis from the `dev` branch (`ppl submit` + `scheduler:` block).
-# Submit with:   jarvis ppl submit <this file>
-# Monitor with:  squeue -u $USER     Output: mofka_bench_<jobid>.log
+# Pattern A: one allocation, sweep runs in-process via `jarvis ppl run yaml`
+# (no jarvis scheduler block — that would submit one job per iteration, which
+# fails on Ares). See pipelines/mofka/architecture_decisions.md.
+#
+# Submit with:  sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka.sbatch
+# Monitor with: squeue -u $USER     Output: mofka_bench_<jobid>.log
 #
 # Time budget: 45 runs x ~30s + per-iteration bedrock startup ≈ 30 min.
 # 2 h ceiling leaves slack for startup variance and outliers.
-
-scheduler:
-  name: slurm
-  job_name: mofka_bench
-  nodes: 1
-  ntasks_per_node: 1
-  partition: compute
-  time: "02:00:00"
-  exclusive: true
-  output: mofka_bench_%j.log
-  error: mofka_bench_%j.err
-  pre_cmds:
-    - 'set +u'
-    - 'source ~/miniconda3/etc/profile.d/conda.sh && conda activate iowarp'
-    - 'source ~/spack/share/spack/setup-env.sh && spack env activate ~/mofka-spack-env'
-    - 'set -u'
 
 config:
   name: mofka_bench_ares

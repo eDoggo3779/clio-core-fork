@@ -1,38 +1,21 @@
-# Mofka Benchmark — Ares Single-Node SMOKE (Pattern B: jarvis `dev` scheduler block)
+# Mofka Benchmark — Ares Single-Node SMOKE (Pattern A: manual sbatch, in-process sweep)
 #
 # Purpose: cheap end-to-end validation of the Mofka stack on a single Ares
-# compute node before committing to the full 45-run sweep. 2 iterations.
+# compute node before the full 45-run sweep. 2 iterations.
 #
-# Validates:
-#   - conda + spack env activation via scheduler `pre_cmds`
-#   - bedrock daemon startup, mofka.json creation, mofkactl reachability
-#   - $USER expansion in workdir (mofka_server _configure)
-#   - producer/consumer stdout parsed into results.csv (RESULTS header check)
+# Why Pattern A (no jarvis `scheduler:` block): jarvis dev runs a scheduler-block
+# sweep as ONE Slurm job PER ITERATION — PipelineTest._run_single does
+# `sbatch --wait` per combination against a node-local /tmp temp YAML. On Ares
+# that fails twice over (compute nodes can't submit jobs; the /tmp YAML isn't
+# visible across nodes). So we allocate ONCE via a .sbatch and run the whole
+# sweep in-process with `jarvis ppl run yaml` — with no scheduler block,
+# _run_single takes the in-process start()/stop() path. See
+# pipelines/mofka/architecture_decisions.md.
 #
-# Requires jarvis from the `dev` branch (`ppl submit` + `scheduler:` block).
-# Submit with:   jarvis ppl submit <this file>
-# Write-only:    jarvis ppl submit <this file> +no_submit   (inspect submit.slurm)
-# Monitor with:  squeue -u $USER     Output: mofka_smoke_<jobid>.log
-
-scheduler:
-  name: slurm
-  job_name: mofka_smoke
-  nodes: 1
-  ntasks_per_node: 1
-  partition: compute
-  time: "00:30:00"
-  exclusive: true
-  output: mofka_smoke_%j.log
-  error: mofka_smoke_%j.err
-  # pre_cmds run inside the batch job BEFORE `jarvis ppl run yaml`. `set +u`
-  # guards conda/spack activation scripts that reference unbound vars under
-  # the scheduler's `set -euo pipefail`. mofka_server picks up $SPACK_ENV and
-  # prepends the view's bin/lib/site-packages.
-  pre_cmds:
-    - 'set +u'
-    - 'source ~/miniconda3/etc/profile.d/conda.sh && conda activate iowarp'
-    - 'source ~/spack/share/spack/setup-env.sh && spack env activate ~/mofka-spack-env'
-    - 'set -u'
+# Submit with:  sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_smoke.sbatch
+#   (from the repo root; the .sbatch activates conda+spack, sets the hostfile,
+#    clears any stale results.csv, then runs `jarvis ppl run yaml <this file>`.)
+# Monitor with: squeue -u $USER     Output: mofka_smoke_<jobid>.log
 
 config:
   name: mofka_bench_ares_smoke
