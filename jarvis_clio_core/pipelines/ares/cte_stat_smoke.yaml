@@ -1,0 +1,74 @@
+# CTE statistic-metrics smoke sweep (Ares, single node).
+#
+# Purpose: validate the restored metric-capture pipeline end to end --
+#   (1) the rich C++ PrintResults() in bench_common.h, and
+#   (2) the _get_stat()/_parse_output() parser in clio_cte_bench/pkg.py.
+# A successful run produces ${HOME}/cte_stat_smoke_results/results.csv with
+# every cte_bench.putget.* metric column populated with logical data.
+#
+# Breadth-focused (not exactly 15 runs): 3 io_sizes x 3 thread counts x 3
+# repeats = 27 runs, ~30 s each (~15-20 min total). PutGet exercises both
+# the write and read paths in a single phase.
+#
+# Brings up the Chimaera runtime + a single-tier (16 GB RAM) CTE core, then
+# runs clio_cte_bench under each parameter combination.
+#
+# Requires: clio_cte_bench on PATH (rebuild after the bench_common.h change),
+#           runtime/CTE deployable on this node.
+#
+# Usage:
+#   jarvis pipeline test cte_stat_smoke.yaml
+
+config:
+  name: cte_stat_smoke
+  pkgs:
+    # --- Chimaera runtime (owns the daemon; SHM transport on one node) ---
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      client_data_segment_size: "4G"
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      sleep: 4
+
+    # --- CTE core: single 16 GB RAM tier ---
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "16GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    # --- CTE benchmark (PutGet, time-based) ---
+    - pkg_type: jarvis_clio_core.clio_cte_bench
+      pkg_name: cte_bench
+      test_case: "PutGet"
+      num_threads: 1
+      depth: 4
+      io_size: "1m"
+      time_limit: 30
+      max_total_blobs: 1024
+      nprocs: 1
+      ppn: 1
+      init_runtime: false
+
+vars:
+  # io_size zipped with a ~1 GiB GLOBAL keyspace cap so the 16 GB RAM tier is
+  # not overrun during the 30 s runs. --max-total-blobs is split evenly across
+  # threads, so the working set stays ~1 GiB at every thread count:
+  #   4k   -> 262144 keys, 256k -> 4096 keys, 4m -> 256 keys.
+  cte_bench.io_size:         ["4k",   "256k", "4m"]
+  cte_bench.max_total_blobs: [262144, 4096,   256]
+
+  # Client thread scaling.
+  cte_bench.num_threads:     [1, 2, 4]
+
+loop:
+  - [cte_bench.io_size, cte_bench.max_total_blobs]
+  - [cte_bench.num_threads]
+
+repeat: 3
+output: "${HOME}/cte_stat_smoke_results"
