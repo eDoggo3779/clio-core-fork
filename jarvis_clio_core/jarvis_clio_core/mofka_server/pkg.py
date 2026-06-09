@@ -176,21 +176,22 @@ class MofkaServer(Service):
                 f'{bound_addr} (silent fallback?)'
             )
 
-        # Step 3: Create topic
+        # Step 3+4: Create topic + add partition via the MofkaDriver Python
+        # API (scripts/setup_topic.py). We do NOT use `mofkactl` here: on
+        # current mochi builds its typer/Click CLI crashes — Click 8.2 changed
+        # Parameter.make_metavar() to require a `ctx` arg and the bundled typer
+        # calls it the old way, so any mofkactl invocation that renders options
+        # raises "make_metavar() missing 1 required positional argument: 'ctx'".
+        # The bindings themselves are fine, so we drive MofkaDriver directly.
+        # See pipelines/mofka/architecture_decisions.md.
         topic = self.config['topic']
-        self.log(f'Creating topic: {topic}')
+        setup_script = os.path.join(self.pkg_dir, 'scripts', 'setup_topic.py')
+        self.log(f'Creating topic + partition via MofkaDriver API: {topic}')
         Exec(
-            f'python -m mochi.mofka.mofkactl topic create {topic}'
-            f' -g {group_file}',
-            LocalExecInfo(env=self.mod_env),
-        ).run()
-
-        # Step 4: Add partition
-        self.log('Adding memory partition (rank 0)')
-        Exec(
-            f'python -m mochi.mofka.mofkactl partition add {topic}'
-            f' -r 0 -t {self.config["partition_type"]}'
-            f' -g {group_file}',
+            f'python3 {setup_script}'
+            f' --group-file {group_file}'
+            f' --topic {topic}'
+            f' --partition-type {self.config["partition_type"]}',
             LocalExecInfo(env=self.mod_env),
         ).run()
 

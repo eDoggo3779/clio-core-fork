@@ -96,6 +96,30 @@ binding with the progress thread on would land lower. Cite Mofka producer
 numbers with this caveat. The consumer keeps `use_progress_thread=True` (its
 no-callback path is unaffected).
 
+## 2026-06-09 — Topic/partition setup uses the MofkaDriver API, not `mofkactl`
+
+**Decision.** `mofka_server` creates the topic and adds the memory partition via
+the `MofkaDriver` Python API (`scripts/setup_topic.py`: `create_topic` +
+`add_memory_partition`, guarded by `topic_exists`), **not** the `mofkactl` CLI
+the archived server shelled out to.
+
+**Why.** On the current mochi build (built fresh on Ares 2026-06-09), `mofkactl`
+is broken by a typer/Click version conflict: Click 8.2.0 changed
+`Parameter.make_metavar()` to require a `ctx` argument, but the bundled `typer`
+calls it the old way, so any mofkactl invocation that renders options crashes
+with `TypeError: Parameter.make_metavar() missing 1 required positional
+argument: 'ctx'`. The `mochi.mofka.client` bindings are unaffected, so routing
+topic/partition creation through `MofkaDriver` sidesteps the broken CLI layer
+entirely and removes a fragile cross-dependency. Chosen over pinning
+`click<8.2` in the spack env because the fix lives in code we own and doesn't
+require rebuilding the env.
+
+**Mofka-vs-CTE note.** Pure plumbing — does not affect measured throughput.
+Worth recording because it reflects real friction in the mochi Python tooling
+on current Spack (package rename `mochi-mofka`→`mofka`, `py-mochi-mofka` folded
+into `mofka +python`, and this mofkactl/typer breakage) that a CTE comparison
+write-up should mention when describing how much harder Mofka was to stand up.
+
 ## 2026-06-08 — Bedrock provider topology: flock + yokan (map) + warabi (memory)
 
 **Decision.** `mofka_server/config/config.json` runs one bedrock daemon with a
