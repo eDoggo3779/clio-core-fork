@@ -3,7 +3,10 @@
 # Run the smoke variant first (run_ares_mofka_smoke.sbatch).
 #
 # Pattern A: one allocation; the 45-run sweep runs in-process via
-# `jarvis ppl run yaml`. ~30 min of work; 2 h ceiling for slack.
+# `jarvis ppl run yaml`. Each iteration restarts bedrock (start, wait for
+# mofka.json, create topic, run, teardown) at ~5 min/run, so 45 runs ~= 3.75 h;
+# 4 h ceiling. To resume a timed-out run, drop the `rm -f results.csv` line below
+# (jarvis skips already-completed rows) and resubmit.
 #
 # Submit from the repo root:
 #   sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka.sbatch
@@ -14,7 +17,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=mofka_bench_%j.log
 #SBATCH --error=mofka_bench_%j.err
 

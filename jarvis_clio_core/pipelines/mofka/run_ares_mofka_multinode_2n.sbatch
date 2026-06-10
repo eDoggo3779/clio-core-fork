@@ -4,7 +4,10 @@
 #
 # Topology: bedrock on the batch/head node; jarvis hostfile = both nodes;
 # mofka_bench drops the bedrock host so producer/consumer run only on the
-# client node. ~30-45 min of work; 3 h ceiling for PSSH/startup slack.
+# client node. Each iteration restarts bedrock + runs producer/consumer over
+# PSSH (~5 min/run), so 45 runs ~= 3.75 h plus PSSH/startup slack; 6 h ceiling.
+# To resume a timed-out run, drop the `rm -f results.csv` line below (jarvis
+# skips already-completed rows) and resubmit.
 #
 # Submit from the repo root:
 #   sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_multinode_2n.sbatch
@@ -15,7 +18,7 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=mofka_bench_2n_%j.log
 #SBATCH --error=mofka_bench_2n_%j.err
 
