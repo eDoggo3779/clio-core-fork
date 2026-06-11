@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -59,6 +60,7 @@
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
 #include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
+#include "clio_runtime/ipc/ipc_run2run.h"
 #include "clio_ctp/data_structures/serialization/serialize_common.h"
 #include "clio_ctp/lightbeam/transport_factory_impl.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
@@ -193,6 +195,12 @@ class IpcManager {
 
  public:
   /**
+   * Get the run-to-run IPC manager (cross-node task transfer logic).
+   * @return Pointer to the IpcManagerRun2Run instance owned by this IpcManager.
+   */
+  IpcManagerRun2Run *GetRun2Run() { return &run2run_; }
+
+  /**
    * Initialize client components
    * @return true if initialization successful, false otherwise
    */
@@ -216,6 +224,19 @@ class IpcManager {
    * are owned by Worker objects freed during Finalize().
    */
   void ClearTransports();
+
+  /**
+   * Register a callback to run at the very start of ClearTransports(), while
+   * the transport objects are still alive. Modules that spawn background
+   * threads holding a raw transport pointer (e.g. the admin module's
+   * peer/client recv threads, which cache GetMainTransport()) MUST register a
+   * hook here that stops and joins those threads. Otherwise the threads keep
+   * calling Recv() on a transport that ClearTransports() has freed -- a
+   * use-after-free that is benign on Linux (Recv returns EAGAIN and the thread
+   * sleeps) but a hard crash on macOS (Recv busy-spins on ENOTSOCK over freed
+   * memory). Hooks run once and are then cleared.
+   */
+  void RegisterTransportShutdownHook(std::function<void()> hook);
 
   /**
    * Server finalize - cleanup all IPC resources
@@ -1283,6 +1304,10 @@ class IpcManager {
 
   bool is_initialized_ = false;
 
+  // Run-to-run IPC manager: owns all cross-node task-transfer state
+  // (send/recv maps, retry queues, per-peer net stats, recv threads).
+  IpcManagerRun2Run run2run_;
+
   // CLIO_FORCE_NET: read once at ServerInit (and only on the server
   // path — clients route via the server's IsTaskLocal decision so a
   // client-side override would be a no-op).  When set, every task
@@ -1348,6 +1373,11 @@ class IpcManager {
 
   // Main ZeroMQ transport (server mode) for distributed communication
   ctp::lbm::TransportPtr main_transport_;
+
+  // Callbacks run at the start of ClearTransports() to stop module-owned
+  // threads that hold raw transport pointers. See RegisterTransportShutdownHook.
+  std::mutex transport_shutdown_hooks_mutex_;
+  std::vector<std::function<void()>> transport_shutdown_hooks_;
 
   // IPC transport mode (TCP default, configurable via CHI_IPC_MODE)
   IpcMode ipc_mode_ = IpcMode::kTcp;
@@ -1700,7 +1730,12 @@ Future<TaskT, AllocT>::GetFutureShm() const {
     return ctp::ipc::FullPtr<FutureT>();
   }
 #if CTP_IS_GPU
-  return CLIO_IPC->ToFullPtr(future_shm_);
+  // On device, ShmPtr::off_ already holds the resolved device-side address of
+  // the FutureShm (the host pre-built the task+FutureShm pair in a registered
+  // backend), so no allocator lookup / ToFullPtr is needed here — that path is
+  // host-only. Mirrors gpu::Future::GetFutureShmPtrRaw().
+  return ctp::ipc::FullPtr<FutureT>(
+      reinterpret_cast<FutureT *>(future_shm_.off_.load()));
 #else
   return CLIO_CPU_IPC->ToFullPtr(future_shm_);
 #endif

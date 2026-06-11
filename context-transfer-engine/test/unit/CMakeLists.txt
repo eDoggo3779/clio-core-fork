@@ -547,44 +547,47 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
-if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
-# GPU coroutine subtask tests (gpu2gpu dispatch + coroutine suspend/resume)
-add_test(NAME cte_gpu_coroutine
-    COMMAND test_cte_gpu_coroutine)
+# ---------------------------------------------------------------------------
+# CLIO_FORCE_NET stress variants (one per CTE task-path test binary)
+# Route every non-Local task through the loopback run-to-run network path so
+# the serialize/send/recv/aggregate path is exercised for all CTE task types
+# (PutBlob/GetBlob/Tag/Query/Reorganize/...) on a single node. GPU-only and
+# pure-stress binaries are intentionally excluded.
+# ---------------------------------------------------------------------------
+set(_cte_fn_env_basic "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+set(_cte_fn_env_data "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+clio_add_force_net_test(NAME cte_core_unit_force_net
+    COMMAND cte_core_unit_tests ENVIRONMENT "${_cte_fn_env_basic}")
+clio_add_force_net_test(NAME cte_core_simple_force_net
+    COMMAND cte_core_functionality_simple_tests ENVIRONMENT "${_cte_fn_env_basic}")
+clio_add_force_net_test(NAME cte_functional_force_net
+    COMMAND test_core_functionality ENVIRONMENT "${_cte_fn_env_data}")
+clio_add_force_net_test(NAME cte_tag_force_net
+    COMMAND test_tag_operations ENVIRONMENT "${_cte_fn_env_data}")
+clio_add_force_net_test(NAME cte_query_force_net
+    COMMAND test_query ENVIRONMENT "${_cte_fn_env_data}")
+clio_add_force_net_test(NAME cte_reorganize_force_net
+    COMMAND test_reorganize_blob ENVIRONMENT "${_cte_fn_env_data}")
+# Put(1MB)+DelBlob exercises the 1 MiB-bulk + free-to-partition net round-trip.
+# The full 1024-cycle regression is ~300 ms/cycle over the loopback net path
+# (~5 min), so cap the force-net variant at 64 cycles via BLOCK_REUSE_CYCLES —
+# enough to stress the path without blowing the timeout. Passes.
+clio_add_force_net_test(NAME cte_block_reuse_force_net
+    COMMAND test_blob_block_reuse
+    ENVIRONMENT "${_cte_fn_env_data};BLOCK_REUSE_CYCLES=64")
+clio_add_force_net_test(NAME cte_runtime_coverage_force_net
+    COMMAND test_core_runtime_coverage ENVIRONMENT "${_cte_fn_env_data}" TIMEOUT 600)
+clio_add_force_net_test(NAME cte_client_config_force_net
+    COMMAND test_core_client_config ENVIRONMENT "${_cte_fn_env_basic}" TIMEOUT 600)
+clio_add_force_net_test(NAME cte_config_dpe_force_net
+    COMMAND test_cte_config_dpe ENVIRONMENT "${_cte_fn_env_basic}")
 
-# GPU core tests run together in one process so Put and Get share the same
-# initialized fixture and the stored blob persists between test cases.
-add_test(NAME cte_gpu_core_all
-    COMMAND test_gpu_core)
-
-# GPU create tests - AsyncCreate from GPU kernel
-add_test(NAME cte_gpu_create
-    COMMAND test_gpu_create)
-
-set_tests_properties(
-    cte_gpu_coroutine
-    PROPERTIES
-        TIMEOUT 120
-        LABELS "gpu;cte;coroutine;msan_skip"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
-)
-
-set_tests_properties(
-    cte_gpu_core_all
-    PROPERTIES
-        TIMEOUT 120
-        LABELS "gpu;cte;core;msan_skip"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
-)
-
-set_tests_properties(
-    cte_gpu_create
-    PROPERTIES
-        TIMEOUT 120
-        LABELS "gpu;cte;create;msan_skip"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
-)
-endif()  # CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM
+# NOTE: the legacy GPU CTE tests cte_gpu_coroutine / cte_gpu_core_all /
+# cte_gpu_create were removed — their executables (test_cte_gpu_coroutine /
+# test_gpu_core / test_gpu_create) no longer exist, so the old add_test()
+# registrations were dead (ctest reported them "Not Run: Could not find
+# executable"). The current GPU CTE test is cte_devmem_putget_cuda
+# (test_cte_devmem_putget, defined below).
 
 # Mark all CTE tests as msan_skip (they use ZMQ via chimaera runtime which is uninstrumented)
 set_tests_properties(
@@ -634,14 +637,6 @@ set_tests_properties(
     cte_reorganize_all
     PROPERTIES LABELS "msan_skip"
 )
-if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
-set_tests_properties(
-    cte_gpu_coroutine
-    cte_gpu_core_all
-    cte_gpu_create
-    PROPERTIES LABELS "msan_skip"
-)
-endif()
 
 # Tests that start a full CLIO Runtime runtime share /tmp/chimaera_iowarp SHM
 # segments and TCP/IPC ports, so they must NOT run in parallel. They also
@@ -689,24 +684,25 @@ set_tests_properties(
         # test runs. Until that's fixed upstream, just dodge.
         ENVIRONMENT "CLIO_PORT=10500"
 )
-if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
-set_tests_properties(
-    cte_gpu_coroutine
-    cte_gpu_core_all
-    cte_gpu_create
-    PROPERTIES RESOURCE_LOCK "chimaera_runtime"
-)
-endif()
-
 # All cte_functional_* tests run test_core_functionality (9 test cases, each
 # initializing and finalizing the full chimaera runtime).  After multiple
 # runtime init/finalize cycles, ZMQ background threads fire callbacks on
 # already-freed runtime memory, producing non-deterministic heap-use-after-free
 # defects under ASan.  The same uninstrumented-runtime category caused all CTE
 # tests to be msan_skip'd.  Skip the whole functional group under ASan.
+#
+# IMPORTANT: keep the "functional" label here. set_tests_properties(LABELS ...)
+# REPLACES the label list, so this must repeat functional;core;cte (set above)
+# or it clobbers them -- which previously dropped cte_functional_all out of the
+# `ctest -LE functional` filter used by both the coverage gate
+# (CI/calculate_coverage.sh) and the macOS workflow, letting this heavy
+# functional test leak into those runs. On macOS it then SEGFAULTs
+# intermittently via a coroutine_handle use-after-free in the worker
+# (issue #485, the same UAF noted above). Restoring the label filters it out
+# consistently, as originally intended.
 set_tests_properties(
     cte_functional_all
-    PROPERTIES LABELS "msan_skip;asan_skip"
+    PROPERTIES LABELS "functional;core;cte;msan_skip;asan_skip"
 )
 
 # ------------------------------------------------------------------------------
@@ -714,10 +710,9 @@ set_tests_properties(
 # Install Targets
 # ------------------------------------------------------------------------------
 set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob)
-# (Legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create were
-# removed along with the GPU runtime — see deletions earlier in this
-# file. The new CUDA test target test_cuda_cte_kernel_putget is added
-# below with its own install rule via add_cuda_executable.)
+# (The legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create targets
+# and their ctest registrations were removed along with the GPU runtime. CTE
+# GPU coverage now lives in test_cte_devmem_putget (cte_devmem_putget_cuda).)
 install(TARGETS ${_CTE_TEST_TARGETS}
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib

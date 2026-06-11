@@ -53,6 +53,22 @@ NB_MODULE(clio_cee, m) {
          nb::arg("depends_on") = "", nb::arg("range_off") = 0, nb::arg("range_size") = 0,
          nb::arg("src_token") = "", nb::arg("dst_token") = "",
          "Full constructor")
+    .def("__init__",
+         [](clio::cae::core::AssimilationCtx *self,
+            const std::string &src, const std::string &dst,
+            const std::string &format, const std::string &src_data,
+            const std::string &depends_on, size_t range_off, size_t range_size,
+            const std::string &src_token, const std::string &dst_token) {
+           new (self) clio::cae::core::AssimilationCtx(
+               src, dst, format, depends_on, range_off, range_size,
+               src_token, dst_token);
+           self->src_data = src_data;
+         },
+         nb::arg("src"), nb::arg("dst"), nb::arg("format"),
+         nb::arg("src_data"),
+         nb::arg("depends_on") = "", nb::arg("range_off") = 0, nb::arg("range_size") = 0,
+         nb::arg("src_token") = "", nb::arg("dst_token") = "",
+         "Constructor with inline src_data payload (for src='string::<blob_name>')")
     .def_rw("src", &clio::cae::core::AssimilationCtx::src,
             "Source URL (e.g., file::/path/to/file)")
     .def_rw("dst", &clio::cae::core::AssimilationCtx::dst,
@@ -69,6 +85,9 @@ NB_MODULE(clio_cee, m) {
             "Authentication token for source")
     .def_rw("dst_token", &clio::cae::core::AssimilationCtx::dst_token,
             "Authentication token for destination")
+    .def_rw("src_data", &clio::cae::core::AssimilationCtx::src_data,
+            "Inline payload bytes for src='string::<blob_name>' sources. "
+            "Stored verbatim as a single blob named <blob_name>.")
     .def("__repr__", [](const clio::cae::core::AssimilationCtx& ctx) {
       return "<AssimilationCtx src='" + ctx.src + "' dst='" + ctx.dst +
              "' format='" + ctx.format + "'>";
@@ -88,12 +107,28 @@ NB_MODULE(clio_cee, m) {
          "Returns:\n"
          "  0 on success, non-zero error code on failure")
     .def("context_query", &iowarp::ContextInterface::ContextQuery,
-         nb::arg("tag_re"), nb::arg("blob_re"), nb::arg("max_results") = 0,
+         nb::arg("tag_re"), nb::arg("blob_re"),
+         nb::arg("max_results") = 0,
+         nb::arg("prompt") = "",
+         nb::arg("time_begin") = uint64_t{0},
+         nb::arg("time_end") = uint64_t{0},
          "Retrieve the identities of objects matching tag and blob patterns\n\n"
+         "Three modes, in priority order:\n"
+         "  1. Temporal (time_begin or time_end non-zero): returns blobs\n"
+         "     whose last_modified falls within [time_begin, time_end]\n"
+         "     (epoch nanoseconds; 0 = no bound), sorted ascending by\n"
+         "     timestamp, capped at max_results.\n"
+         "  2. Semantic (prompt non-empty): BM25 keyword search over the\n"
+         "     regex-filtered candidate blobs; top max_results returned\n"
+         "     by descending score (0 falls back to top-10).\n"
+         "  3. Regex (default): BlobQuery listing all matching blob names.\n\n"
          "Parameters:\n"
          "  tag_re: Tag regex pattern to match\n"
          "  blob_re: Blob regex pattern to match\n"
-         "  max_results: Maximum number of results to return (0 = unlimited, default: 0)\n\n"
+         "  max_results: Result cap (0 = unlimited for regex/temporal; top-10 for BM25)\n"
+         "  prompt: Optional BM25 query text — empty disables semantic search\n"
+         "  time_begin: Temporal lower bound, epoch nanoseconds (0 = no bound)\n"
+         "  time_end: Temporal upper bound, epoch nanoseconds (0 = no bound)\n\n"
          "Returns:\n"
          "  List of matching blob names")
     .def("context_retrieve", &iowarp::ContextInterface::ContextRetrieve,
@@ -101,15 +136,24 @@ NB_MODULE(clio_cee, m) {
          nb::arg("max_results") = 1024,
          nb::arg("max_context_size") = 256 * 1024 * 1024,
          nb::arg("batch_size") = 32,
+         nb::arg("prompt") = "",
+         nb::arg("time_begin") = 0,
+         nb::arg("time_end") = 0,
          "Retrieve the identities and data of objects matching patterns\n\n"
-         "Queries for blobs matching patterns and retrieves their data into a\n"
-         "packed binary buffer. Blobs are retrieved in batches for efficiency.\n\n"
+         "Same three query modes as context_query, then fetches and packs the data:\n"
+         "  1. Temporal (time_begin or time_end non-zero): blobs whose last_modified\n"
+         "     falls within [time_begin, time_end] (epoch nanoseconds; 0 = no bound).\n"
+         "  2. Semantic (prompt non-empty): BM25 keyword search; top max_results blobs.\n"
+         "  3. Regex (default): BlobQuery over tag_re/blob_re.\n\n"
          "Parameters:\n"
          "  tag_re: Tag regex pattern to match\n"
          "  blob_re: Blob regex pattern to match\n"
-         "  max_results: Max number of blobs (0=unlimited, default: 1024)\n"
+         "  max_results: Max number of blobs (0=unlimited for regex/temporal; top-10 for BM25; default: 1024)\n"
          "  max_context_size: Max total size in bytes (default: 256MB)\n"
-         "  batch_size: Concurrent AsyncGetBlob operations (default: 32)\n\n"
+         "  batch_size: Concurrent AsyncGetBlob operations (default: 32)\n"
+         "  prompt: Optional BM25 query text — empty disables semantic search\n"
+         "  time_begin: Temporal lower bound, epoch nanoseconds (0 = no bound)\n"
+         "  time_end: Temporal upper bound, epoch nanoseconds (0 = no bound)\n\n"
          "Returns:\n"
          "  List with one string containing packed binary context data (empty if none)")
     .def("context_splice", &iowarp::ContextInterface::ContextSplice,
