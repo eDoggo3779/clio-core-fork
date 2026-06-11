@@ -128,35 +128,67 @@ int ContextInterface::ContextBundle(
 std::vector<std::string> ContextInterface::ContextQuery(
     const std::string &tag_re,
     const std::string &blob_re,
-    unsigned int max_results) {
+    unsigned int max_results,
+    const std::string &prompt,
+    uint64_t time_begin,
+    uint64_t time_end) {
   if (!EnsureInitialized()) {
     HLOG(kError, "ContextInterface failed to initialize");
     return std::vector<std::string>();
   }
 
   try {
-    // Get the CTE client singleton
     auto* cte_client = CLIO_CTE_CLIENT;
     if (!cte_client) {
       HLOG(kError, "CTE client not initialized");
       return std::vector<std::string>();
     }
 
-    // Call AsyncBlobQuery with tag and blob regex patterns
-    // Use Broadcast to query across all nodes
+    // Mode 1: temporal — any non-zero bound routes here.
+    if (time_begin != 0 || time_end != 0) {
+      auto task = cte_client->AsyncTemporalSearch(
+          tag_re, blob_re,
+          time_begin, time_end,
+          static_cast<chi::u32>(max_results),
+          chi::PoolQuery::Broadcast());
+      task.Wait();
+
+      std::vector<std::string> results;
+      results.reserve(task->results_.size());
+      for (const auto& r : task->results_) {
+        results.push_back(r.blob_name_);
+      }
+      return results;
+    }
+
+    // Mode 2: semantic — BM25 keyword search.
+    if (!prompt.empty()) {
+      // max_results=0 means "unlimited" for the regex path, but BM25 needs
+      // a positive top-k; fall back to the SemanticSearchTask default (10).
+      chi::u32 k = max_results > 0 ? max_results : 10;
+      auto task = cte_client->AsyncSemanticSearch(
+          tag_re, blob_re, prompt, k, chi::PoolQuery::Broadcast());
+      task.Wait();
+
+      std::vector<std::string> results;
+      results.reserve(task->results_.size());
+      for (const auto& r : task->results_) {
+        results.push_back(r.blob_name_);
+      }
+      return results;
+    }
+
+    // Mode 3: regex-only via BlobQuery.
     auto task = cte_client->AsyncBlobQuery(
-        tag_re,
-        blob_re,
-        max_results,  // max_blobs (0 = unlimited)
+        tag_re, blob_re,
+        max_results,
         chi::PoolQuery::Broadcast());
     task.Wait();
 
-    // Extract results from task - blob names only
     std::vector<std::string> results;
     for (size_t i = 0; i < task->blob_names_.size(); ++i) {
       results.push_back(task->blob_names_[i]);
     }
-
     return results;
 
   } catch (const std::exception& e) {
@@ -170,7 +202,10 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
     const std::string &blob_re,
     unsigned int max_results,
     size_t max_context_size,
-    unsigned int batch_size) {
+    unsigned int batch_size,
+    const std::string &prompt,
+    uint64_t time_begin,
+    uint64_t time_end) {
   if (!EnsureInitialized()) {
     HLOG(kError, "ContextInterface failed to initialize");
     return std::vector<std::string>();
@@ -191,19 +226,43 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
       return std::vector<std::string>();
     }
 
-    // Use AsyncBlobQuery to get list of blobs matching the pattern
-    auto query_task = cte_client->AsyncBlobQuery(
-        tag_re,
-        blob_re,
-        max_results,
-        chi::PoolQuery::Broadcast());
-    query_task.Wait();
-
-    // Build query_results from separate tag_names_ and blob_names_ vectors
+    // Same three-mode dispatch as ContextQuery to resolve matching blob names.
     std::vector<std::pair<std::string, std::string>> query_results;
-    size_t result_count = std::min(query_task->tag_names_.size(), query_task->blob_names_.size());
-    for (size_t i = 0; i < result_count; ++i) {
-      query_results.emplace_back(query_task->tag_names_[i], query_task->blob_names_[i]);
+
+    if (time_begin != 0 || time_end != 0) {
+      // Mode 1: temporal search
+      auto task = cte_client->AsyncTemporalSearch(
+          tag_re, blob_re,
+          time_begin, time_end,
+          static_cast<chi::u32>(max_results),
+          chi::PoolQuery::Broadcast());
+      task.Wait();
+      query_results.reserve(task->results_.size());
+      for (const auto& r : task->results_) {
+        query_results.emplace_back(r.tag_name_, r.blob_name_);
+      }
+    } else if (!prompt.empty()) {
+      // Mode 2: BM25 semantic search
+      chi::u32 k = max_results > 0 ? max_results : 10;
+      auto task = cte_client->AsyncSemanticSearch(
+          tag_re, blob_re, prompt, k, chi::PoolQuery::Broadcast());
+      task.Wait();
+      query_results.reserve(task->results_.size());
+      for (const auto& r : task->results_) {
+        query_results.emplace_back(r.tag_name_, r.blob_name_);
+      }
+    } else {
+      // Mode 3: regex-only via BlobQuery
+      auto query_task = cte_client->AsyncBlobQuery(
+          tag_re, blob_re, max_results, chi::PoolQuery::Broadcast());
+      query_task.Wait();
+      size_t result_count = std::min(query_task->tag_names_.size(),
+                                     query_task->blob_names_.size());
+      query_results.reserve(result_count);
+      for (size_t i = 0; i < result_count; ++i) {
+        query_results.emplace_back(query_task->tag_names_[i],
+                                   query_task->blob_names_[i]);
+      }
     }
 
     if (query_results.empty()) {

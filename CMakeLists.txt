@@ -145,12 +145,16 @@ option(CLIO_CTE_ENABLE_VFD "Enable HDF5 VFD adapter" OFF)
 option(CLIO_CTE_ENABLE_NVIDIA_GDS_ADAPTER "Enable NVIDIA GDS adapter" OFF)
 option(CLIO_CTE_ENABLE_ADIOS2_ADAPTER "Enable ADIOS2 adapter" OFF)
 option(CLIO_CTE_ENABLE_FUSE_ADAPTER "Enable FUSE3 adapter" OFF)
-option(CLIO_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 2.0)" OFF)
+option(CLIO_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 1.14)" OFF)
 
 #------------------------------------------------------------------------------
 # CAE (context-assimilation-engine) Options
 #------------------------------------------------------------------------------
 option(CAE_ENABLE_GLOBUS "Enable Globus transfer support in CAE" OFF)
+# LLM labeling/summary + semantic-search features and their integration tests
+# require a running Ollama service. OFF by default so default builds don't
+# build or run them without Ollama.
+option(CLIO_CAE_ENABLE_SUMMARY "Enable CAE LLM labeling/summary + semantic-search (requires a running Ollama service)" OFF)
 
 #------------------------------------------------------------------------------
 # External Examples and Applications
@@ -474,6 +478,47 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         endif()
     endif()
 
+    # nvcomp (NVIDIA GPU compression) - optional, requires CUDA.
+    # The redistributable ships nvcomp-config.cmake, so find_package works and
+    # exposes the imported target nvcomp::nvcomp (which pulls in CUDA::cudart).
+    set(CLIO_CTP_ENABLE_NVCOMP OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_package(nvcomp QUIET)
+        if(nvcomp_FOUND)
+            message(STATUS "found nvcomp ${nvcomp_VERSION} (GPU compression) - target nvcomp::nvcomp")
+            set(CLIO_CTP_ENABLE_NVCOMP ON)
+        else()
+            message(STATUS "nvcomp not found - GPU compression (nvcomp) will be disabled")
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - GPU compression (nvcomp) disabled")
+    endif()
+
+    # zfp-SYCL (Intel-XPU GPU compression) - optional. A SYCL-enabled libzfp
+    # (built with icpx from the zfp SYCL port) installed to a dedicated prefix
+    # (default /opt/zfp-sycl) so it does not shadow the stock CPU libzfp that
+    # ADIOS2/LibPressio link against. The SYCL kernels live inside that libzfp;
+    # the ctp::SyclZfp wrapper only calls zfp's C API, so no SYCL compiler is
+    # needed to build CTP -- we just link this libzfp and its headers.
+    # NOTE: this is DISTINCT from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch,
+    # controlled by CLIO_CORE_ENABLE_SYCL, which triggers <sycl/sycl.hpp> + -fsycl
+    # in macros.h). zfp-sycl needs neither, so it uses its own flag/define.
+    set(CLIO_CTP_ENABLE_ZFP_SYCL OFF)
+    set(CLIO_ZFP_SYCL_ROOT "/opt/zfp-sycl" CACHE PATH
+        "Install prefix of the SYCL-enabled libzfp (for zfp-sycl compressor)")
+    find_library(ZFP_SYCL_LIBRARY NAMES zfp
+        HINTS ${CLIO_ZFP_SYCL_ROOT}/lib ${CLIO_ZFP_SYCL_ROOT}/lib64
+        NO_DEFAULT_PATH)
+    find_path(ZFP_SYCL_INCLUDE_DIR NAMES zfp.h
+        HINTS ${CLIO_ZFP_SYCL_ROOT}/include
+        NO_DEFAULT_PATH)
+    if(ZFP_SYCL_LIBRARY AND ZFP_SYCL_INCLUDE_DIR)
+        message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY} (zfp-sycl GPU compression)")
+        set(CLIO_CTP_ENABLE_ZFP_SYCL ON)
+    else()
+        message(STATUS "SYCL libzfp not found under ${CLIO_ZFP_SYCL_ROOT} - zfp-sycl compression disabled")
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -514,8 +559,24 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_LIB_DIRS ${libpressio_LIBRARY_DIRS})
     endif()
 
+    # Only add nvcomp if found (imported target carries its own includes)
+    if(CLIO_CTP_ENABLE_NVCOMP)
+        list(APPEND COMPRESS_LIBS nvcomp::nvcomp)
+    endif()
+
+    # Only add the SYCL libzfp if found
+    if(CLIO_CTP_ENABLE_ZFP_SYCL)
+        list(APPEND COMPRESS_LIBS ${ZFP_SYCL_LIBRARY})
+        list(APPEND COMPRESS_INCLUDES ${ZFP_SYCL_INCLUDE_DIR})
+    endif()
+
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
+    # Make CTP_ENABLE_NVCOMP available to subdirectories (CTP)
+    set(CLIO_CTP_ENABLE_NVCOMP ${CLIO_CTP_ENABLE_NVCOMP} CACHE BOOL "Enable nvcomp GPU compression (auto-detected)" FORCE)
+    # Make CLIO_CTP_ENABLE_ZFP_SYCL available to subdirectories (CTP). Distinct
+    # from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch) -- do not conflate.
+    set(CLIO_CTP_ENABLE_ZFP_SYCL ${CLIO_CTP_ENABLE_ZFP_SYCL} CACHE BOOL "Enable zfp-sycl GPU compression (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)
@@ -601,20 +662,39 @@ if(CLIO_CTE_ENABLE_HDF5_VOL)
         find_package(HDF5 COMPONENTS C QUIET)
     endif()
     if(HDF5_FOUND)
-        message(STATUS "found HDF5 at ${HDF5_INCLUDE_DIRS}")
-
         # Ensure HDF5_LIBRARIES is set for both CONFIG and MODULE mode
         if(NOT HDF5_LIBRARIES)
-            # CONFIG mode creates targets but may not set HDF5_LIBRARIES
-            # Prefer shared libraries over static for better compatibility
+            # CONFIG mode creates targets but may not set HDF5_LIBRARIES.
+            # HDF5's own hdf5-config.cmake (used by vcpkg and HDF Group
+            # binary installs) only exports namespaced hdf5::hdf5-{shared,
+            # static} targets, so check those too (issue #518: the VOL
+            # connector DLL linked without hdf5.lib on Windows/vcpkg).
+            # Prefer shared libraries over static for better compatibility.
             if(TARGET HDF5::HDF5)
                 set(HDF5_LIBRARIES HDF5::HDF5)
+            elseif(TARGET hdf5::hdf5-shared)
+                set(HDF5_LIBRARIES hdf5::hdf5-shared)
             elseif(TARGET hdf5-shared)
                 set(HDF5_LIBRARIES hdf5-shared)
+            elseif(TARGET hdf5::hdf5-static)
+                set(HDF5_LIBRARIES hdf5::hdf5-static)
             elseif(TARGET hdf5-static)
                 set(HDF5_LIBRARIES hdf5-static)
             endif()
         endif()
+        if(NOT HDF5_LIBRARIES)
+            message(FATAL_ERROR "HDF5 found but no linkable HDF5 target/"
+                                "library was identified (HDF5_DIR=${HDF5_DIR})")
+        endif()
+
+        # hdf5-config.cmake sets HDF5_INCLUDE_DIR (singular); consumers in
+        # this project use HDF5_INCLUDE_DIRS.
+        if(NOT HDF5_INCLUDE_DIRS AND HDF5_INCLUDE_DIR)
+            set(HDF5_INCLUDE_DIRS ${HDF5_INCLUDE_DIR})
+        endif()
+
+        message(STATUS "found HDF5 ${HDF5_VERSION} at '${HDF5_INCLUDE_DIRS}' "
+                       "(libraries: ${HDF5_LIBRARIES})")
 
         # libhdf5.so (system package) depends on libcurl internally;
         # the linker needs it listed explicitly due to --as-needed.
@@ -632,6 +712,16 @@ endif()
 # Poco and nlohmann_json (optional - for CAE Globus support)
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
 find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(nlohmann_json
+      GIT_REPOSITORY https://github.com/nlohmann/json.git
+      GIT_TAG        v3.11.3
+      GIT_SHALLOW    ON
+  )
+  FetchContent_MakeAvailable(nlohmann_json)
+  set(nlohmann_json_FOUND TRUE)
+endif()
 
 if (CLIO_CTE_ENABLE_ADIOS2_ADAPTER OR CLIO_CORE_ENABLE_GRAY_SCOTT)
     # Find ADIOS2
@@ -844,11 +934,24 @@ if(NOT MSVC)
     endif()
 else()
     # MSVC compiler flags
-    # /FS enables synchronized PDB writes to avoid C1041 errors with parallel builds
-    add_compile_options(/FS)
+    # /FS enables synchronized PDB writes to avoid C1041 errors with parallel
+    # builds. Scope it per-language: passed directly for C/CXX, but routed
+    # through -Xcompiler for CUDA — nvcc treats a bare "/FS" as a second input
+    # file ("nvcc fatal : A single input file is required ...").
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/FS>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/FS>)
+    # CUDA 13.x CCCL headers (cuda/std/*) require MSVC's conformant
+    # preprocessor and #error out on the traditional one. Enable it for the
+    # CUDA host compile only, so the existing CXX build is unaffected.
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
     # Prevent windows.h from defining min/max macros that conflict with
     # std::numeric_limits<>::max() and similar standard library usage.
     add_compile_definitions(NOMINMAX)
+    # In the CUDA build, nvcc force-includes cuda_runtime.h (which pulls in
+    # windows.h, and thus the legacy winsock.h) before the socket sources can
+    # include winsock2.h, causing 'sockaddr' redefinition (C2011). Keep the
+    # legacy winsock out of windows.h for the CUDA host compile.
+    add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:WIN32_LEAN_AND_MEAN>)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Zi /Od /DDEBUG")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
 endif()
