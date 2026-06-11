@@ -67,23 +67,52 @@
 // Global pointer variable definition for IPC manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(chi::IpcManager, g_ipc_manager);
 
-#include <clio_runtime/device_memcpy.h>
-
 namespace clio::run {
 
-// Definitions of the device-aware memcpy + IsDevicePointer hooks
-// declared in chimaera/device_memcpy.h. ServerInitGpuQueuesSycl (or
-// its CUDA/ROCm equivalent) installs function pointers here at
-// server-init time so the bdev runtime — built without -fsycl — can
-// route memcpys involving device USM through the GPU runtime, and
-// stage through host buffers only when the data is actually on the
-// device.
-CLIO_RUN_API std::atomic<DeviceAwareMemcpyFn> g_device_aware_memcpy{nullptr};
-CLIO_RUN_API std::atomic<IsDevicePointerFn> g_is_device_pointer{nullptr};
+// ChiServerBootstrap{Hip,Sycl}Gpu are defined in the GPU companion lib
+// (clio_run_cxx_gpu) and called from ServerInit below. Declare them at
+// namespace scope (not block scope) so MSVC mangles the references as
+// clio::run::ChiServerBootstrap*Gpu to match the GPU lib's exports — a
+// block-scope `extern` declaration binds to the global namespace on MSVC
+// (it binds to the enclosing namespace on GCC, which is why it worked there).
+CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(IpcManager *self,
+                                               u32 queue_depth,
+                                               size_t backend_bytes);
+CLIO_RUN_GPU_API bool ChiServerBootstrapSyclGpu(IpcManager *self,
+                                                u32 queue_depth,
+                                                size_t backend_bytes);
 
-}  // namespace clio::run
+namespace {
 
-namespace clio::run {
+// Issue #482: libzmq's TCP-loopback engine on macOS fails to route ROUTER
+// replies back to a connected DEALER (zmq_send -> EHOSTUNREACH) even though the
+// ZMTP handshake succeeds, which blocks every same-host client that reaches the
+// runtime over the local client ROUTER (the port+3 endpoint). libzmq's ipc://
+// (unix-domain) transport carries the identical ROUTER/DEALER identity routing
+// but over a different engine that is not affected. So run the LOCAL
+// client<->runtime ROUTER/DEALER over ipc:// there. The cross-node ROUTER (the
+// main port) is untouched, so multi-node TCP is unaffected; on Linux/Windows
+// nothing changes. Override the platform default with CLIO_ZMQ_LOCAL_IPC=0/1.
+inline bool UseLocalZmqIpc() {
+  if (const char *env = chi::env::GetCompat("ZMQ_LOCAL_IPC")) {
+    return *env != '\0' && std::strcmp(env, "0") != 0;
+  }
+#ifdef __APPLE__
+  return true;
+#else
+  return false;
+#endif
+}
+
+// Unix-domain socket path for the local ZMQ ROUTER/DEALER. Distinct from the
+// non-ZMQ SocketTransport endpoint (chimaera_<port>.ipc) so the two local
+// servers never collide.
+inline std::string LocalZmqIpcPath(u32 port) {
+  return ctp::SystemInfo::GetMemfdPath(
+      "chimaera_zmq_" + std::to_string(port + 3) + ".ipc");
+}
+
+}  // namespace
 
 // Host struct methods
 
@@ -159,6 +188,24 @@ bool IpcManager::ClientInit() {
       } catch (const std::exception &e) {
         HLOG(kError,
              "IpcManager::ClientInit: Failed to create IPC transport: {}",
+             e.what());
+        return false;
+      }
+    } else if (UseLocalZmqIpc()) {
+      // macOS (issue #482): keep the ZMQ DEALER but carry it over a local
+      // ipc:// unix socket instead of TCP loopback, which libzmq cannot route
+      // replies over on macOS. Identity routing is unchanged.
+      try {
+        ctp::SystemInfo::EnsureMemfdDir();
+        std::string zmq_ipc = LocalZmqIpcPath(port);
+        zmq_transport_ = ctp::lbm::TransportFactory::Get(
+            zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+            ctp::lbm::TransportMode::kClient, "ipc", 0);
+        HLOG(kInfo, "IpcManager: DEALER transport connected over ipc {}",
+             zmq_ipc);
+      } catch (const std::exception &e) {
+        HLOG(kError,
+             "IpcManager::ClientInit: Failed to create ipc DEALER transport: {}",
              e.what());
         return false;
       }
@@ -311,15 +358,13 @@ bool IpcManager::ServerInit() {
   // CUDA / ROCm slim path: GPU is a pure task producer that pushes onto
   // gpu2cpu_queue. The bootstrap mirrors the SYCL one — pinned host
   // gpu2cpu_queue + gpu2cpu_copy_backend, on-device GpuTaskQueue
-  // construction, then install the chi::DeviceAwareMemcpy /
-  // IsDevicePointer hooks. Source lives in src/gpu/gpu2cpu_init_hip.cc
-  // and is compiled by nvcc/hipcc so the kernel launch syntax resolves.
+  // construction. Source lives in src/gpu/gpu2cpu_init_hip.cc and is
+  // compiled by nvcc/hipcc so the kernel launch syntax resolves.
+  // (Device-aware memcpy is now ctp::DeviceAwareMemcpy in gpu_api.h.)
   {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();
     constexpr size_t kHipClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
-    extern bool ChiServerBootstrapHipGpu(IpcManager *self, u32 queue_depth,
-                                          size_t backend_bytes);
     if (!ChiServerBootstrapHipGpu(this, queue_depth,
                                    kHipClientBackendBytes)) {
       return false;
@@ -335,8 +380,6 @@ bool IpcManager::ServerInit() {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();
     constexpr size_t kSyclClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
-    extern bool ChiServerBootstrapSyclGpu(IpcManager *self, u32 queue_depth,
-                                           size_t backend_bytes);
     if (!ChiServerBootstrapSyclGpu(this, queue_depth,
                                     kSyclClientBackendBytes)) {
       return false;
@@ -377,18 +420,34 @@ bool IpcManager::ServerInit() {
       if (const char *env = chi::env::GetCompat("BIND_ADDR")) {
         if (*env) router_bind = env;
       }
-      client_tcp_transport_ = ctp::lbm::TransportFactory::Get(
-          router_bind, ctp::lbm::TransportType::kZeroMq,
-          ctp::lbm::TransportMode::kServer, "tcp", port + 3);
-      HLOG(kInfo, "IpcManager: TCP ROUTER transport bound on {}:{}",
-           router_bind, port + 3);
+      if (UseLocalZmqIpc()) {
+        // macOS (issue #482): bind the local client ROUTER on an ipc:// unix
+        // socket so replies route reliably; same-host clients connect their
+        // DEALER to the matching path. Cross-node clients are served by the
+        // main net ROUTER, which is unaffected.
+        ctp::SystemInfo::EnsureMemfdDir();
+        std::string zmq_ipc = LocalZmqIpcPath(port);
+        client_tcp_transport_ = ctp::lbm::TransportFactory::Get(
+            zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+            ctp::lbm::TransportMode::kServer, "ipc", 0);
+        HLOG(kInfo, "IpcManager: client ZMQ ROUTER bound on ipc {}", zmq_ipc);
+      } else {
+        client_tcp_transport_ = ctp::lbm::TransportFactory::Get(
+            router_bind, ctp::lbm::TransportType::kZeroMq,
+            ctp::lbm::TransportMode::kServer, "tcp", port + 3);
+        HLOG(kInfo, "IpcManager: TCP ROUTER transport bound on {}:{}",
+             router_bind, port + 3);
+      }
     } catch (const std::exception &e) {
       HLOG(kError, "IpcManager::ServerInit: Failed to bind TCP server: {}",
            e.what());
     }
 
     try {
-      // IPC server on Unix domain socket
+      // IPC server on Unix domain socket. Ensure the per-user bookkeeping
+      // directory exists first -- on Windows it lives under %TEMP% and is
+      // not created by default, so binding the socket would otherwise fail.
+      ctp::SystemInfo::EnsureMemfdDir();
       std::string ipc_path =
           ctp::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc");
       client_ipc_transport_ = ctp::lbm::TransportFactory::Get(
@@ -437,7 +496,35 @@ void IpcManager::ClientFinalize() {
   // Clients should not destroy shared resources
 }
 
+void IpcManager::RegisterTransportShutdownHook(std::function<void()> hook) {
+  std::lock_guard<std::mutex> lock(transport_shutdown_hooks_mutex_);
+  transport_shutdown_hooks_.push_back(std::move(hook));
+}
+
 void IpcManager::ClearTransports() {
+  // Stop any module-owned threads that hold a raw transport pointer BEFORE we
+  // free the transports below. Hooks run once; move them out under the lock so
+  // a hook that re-enters (or a second ClearTransports call from
+  // ServerFinalize) sees an empty list.
+  std::vector<std::function<void()>> hooks;
+  {
+    std::lock_guard<std::mutex> lock(transport_shutdown_hooks_mutex_);
+    hooks.swap(transport_shutdown_hooks_);
+  }
+  for (auto &hook : hooks) {
+    if (hook) hook();
+  }
+
+  // Close the persistent outbound DEALER sockets (run-to-run peer clients)
+  // BEFORE destroying the owned server contexts below. On Windows, destroying
+  // the last owned ZMQ context tears Winsock down (WSACleanup); a DEALER
+  // closed afterwards trips libzmq's signaler assertion ("Successful WSASTARTUP
+  // not yet performed", signaler.cpp) -> abort() -> the process wedges until
+  // the ctest timeout. This first ClearTransports() runs while the owned
+  // contexts (and thus Winsock) are still alive, so the DEALERs close cleanly;
+  // the later ClearClientPool() in ServerFinalize is then a harmless no-op.
+  ClearClientPool();
+
   local_transport_.reset();
   main_transport_.reset();
   client_tcp_transport_.reset();
@@ -824,9 +911,19 @@ retry_attempt:
         pending_response_archives_.clear();
       }
       try {
-        zmq_transport_ = ctp::lbm::TransportFactory::Get(
-            config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
-            ctp::lbm::TransportMode::kClient, "tcp", port + 3);
+        if (UseLocalZmqIpc()) {
+          // Mirror ClientInit: recreate the DEALER over the local ipc://
+          // endpoint on macOS (issue #482).
+          ctp::SystemInfo::EnsureMemfdDir();
+          std::string zmq_ipc = LocalZmqIpcPath(port);
+          zmq_transport_ = ctp::lbm::TransportFactory::Get(
+              zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+              ctp::lbm::TransportMode::kClient, "ipc", 0);
+        } else {
+          zmq_transport_ = ctp::lbm::TransportFactory::Get(
+              config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
+              ctp::lbm::TransportMode::kClient, "tcp", port + 3);
+        }
       } catch (const std::exception &e) {
         HLOG(kError, "WaitForLocalServer: DEALER recreate failed: {}",
              e.what());
@@ -856,9 +953,30 @@ retry_attempt:
     return true;
   }
 
-  HLOG(kError, "Runtime responded with error code: {}", task->response_);
-  // Task cleanup is handled by ~Future() since Wait() marked it consumed.
-  return false;
+  // A response arrived but carries a non-zero code. The server's
+  // ClientConnect handler ALWAYS sets response_ = 0 (admin_runtime.cc), so a
+  // non-zero value here is not an intentional rejection — it is a transient
+  // artifact (e.g. a stale/mismatched correlation while the daemon is reaping
+  // an abruptly-dead client that left an in-flight response on the wire, the
+  // cr_client_retry_client_death_* reconnect race, issue #486). Treat it like
+  // a timed-out attempt: retry within the remaining wait budget instead of
+  // hard-failing, so the reconnect is deterministic rather than flaky.
+  {
+    float elapsed = std::chrono::duration<float>(
+        std::chrono::steady_clock::now() - attempt_start).count();
+    if (total_timeout > 0 && elapsed >= total_timeout) {
+      HLOG(kError,
+           "Runtime responded with error code {} on every attempt within {}s "
+           "({} attempts)",
+           task->response_, wait_server_timeout_, attempt_idx);
+      // Task cleanup is handled by ~Future() since Wait() marked it consumed.
+      return false;
+    }
+    HLOG(kWarning,
+         "Attempt {} got transient non-zero response {}; retrying connect",
+         attempt_idx, task->response_);
+    goto retry_attempt;
+  }
 }
 
 bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
