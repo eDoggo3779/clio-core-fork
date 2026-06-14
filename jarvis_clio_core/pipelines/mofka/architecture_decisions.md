@@ -231,6 +231,46 @@ blob/IO size. Align comparisons on payload size (`mofka_bench.data_size` vs the
 CTE `io_size`) and on aggregate vs per-node throughput (Mofka multi-node sums
 client throughput; account for the single-server ceiling).
 
+## 2026-06-14 — RDMA single-node sweep (`ofi+verbs`): config-only twin of TCP
+
+**Decision.** Add a single-node RDMA sweep as a **twin** of the TCP one:
+`microbench_mofka_ares_rdma.yaml` (+ `_smoke`) and `run_ares_mofka_rdma*.sbatch`
+are byte-for-byte copies of their TCP counterparts except `protocol: "tcp"` →
+`"ofi+verbs"`, a separate `output:` dir (`mofka_bench_ares_rdma{,_smoke}_results`),
+and job/log names. Identical sweep shape (5×3×3) → row-for-row TCP-vs-RDMA
+comparison. **No package/C++ changes**: `mofka_server` already passes the
+protocol straight to `bedrock <protocol>` and already asserts the bound address
+contains `verbs` (catching a silent TCP fallback). Multi-node RDMA is out of
+scope this round.
+
+**Why config-only is sufficient.** Transport selection in Mofka is entirely a
+Mercury/libfabric concern driven by the `bedrock <protocol>` CLI argument; the
+bedrock provider topology (`config.json`) and the producer/consumer scripts are
+transport-agnostic. The archived `claude/mofka-rdma` branch already proved this
+end-to-end on Ares (45/45 over `ofi+verbs;ofi_rxm`).
+
+**The one real prerequisite — `verbs;ofi_rxm` in libfabric.** Mercury 2.4.1
+derives the provider `verbs;ofi_rxm` from the `verbs` protocol string. If the
+spack libfabric was built without the rxm composition layer, bedrock cannot
+bind and the run fails (or, worse, silently falls back to TCP — which the
+`mofka_server` bound-address assertion now turns into a loud `RuntimeError`).
+The ported preflight (`rdma_preflight.sh` + `run_preflight.sh`) gates this:
+its Check 6 launches `bedrock ofi+verbs` and asserts the bound address contains
+`verbs`. **Remediation if Check 6 fails:** rebuild the spack libfabric with the
+rxm provider (`fabrics` including `verbs` + `rxm`) and re-run preflight.
+
+**Expected result (logical but "unexpected").** On a single node, RDMA over the
+loopback NIC is typically **slower** than kernel TCP loopback (the archived run
+saw RDMA 7–34% slower) because it pays PCIe/verbs traversal that TCP loopback
+avoids. That delta is the positive signal that RDMA actually engaged rather than
+falling back to TCP — it is the expected single-node outcome, and the place RDMA
+would win (cross-node wire bandwidth) is precisely the multi-node case left out
+of scope here.
+
+**Walltime.** RDMA full sweep uses a **4 h** ceiling (matching the *validated*
+TCP full sbatch), not the archived branch's optimistic 2 h: each iteration
+restarts bedrock (~5 min/run), so 45 runs ≈ 3.75 h.
+
 ---
 
 ## Retained fallback — Pattern A (only if `dev` proves unusable on Ares)

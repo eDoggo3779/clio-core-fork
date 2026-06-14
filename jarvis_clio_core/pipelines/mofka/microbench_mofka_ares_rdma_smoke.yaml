@@ -1,0 +1,64 @@
+# Mofka Benchmark — Ares Single-Node SMOKE, RDMA (ofi+verbs)
+#
+# Purpose: cheap end-to-end validation of the ofi+verbs path on a single Ares
+# compute node before the full 45-run RDMA sweep. 2 iterations, ~1 min total.
+# Paired twin of microbench_mofka_ares_smoke.yaml.
+#
+# Specifically validates:
+#   - conda + spack env activation in the sbatch
+#   - bedrock startup over ofi+verbs, mofka.json creation
+#   - the bedrock-bound-address log line contains 'verbs' (mofka_server asserts
+#     this and raises on a silent TCP fallback)
+#   - producer/consumer connect over RDMA, stdout parses into results.csv
+#
+# Why Pattern A (no jarvis `scheduler:` block): jarvis dev runs a scheduler-block
+# sweep as ONE Slurm job PER ITERATION — PipelineTest._run_single does
+# `sbatch --wait` per combination against a node-local /tmp temp YAML. On Ares
+# that fails twice over (compute nodes can't submit jobs; the /tmp YAML isn't
+# visible across nodes). So we allocate ONCE via a .sbatch and run the whole
+# sweep in-process with `jarvis ppl run yaml`. See
+# pipelines/mofka/architecture_decisions.md.
+#
+# Submit with:  sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_rdma_smoke.sbatch
+# Monitor with: squeue -u $USER     Output: mofka_rdma_smoke_<jobid>.log
+
+config:
+  name: mofka_bench_ares_rdma_smoke
+  pkgs:
+    - pkg_type: jarvis_clio_core.mofka_server
+      pkg_name: mofka_srv
+      protocol: "ofi+verbs"
+      # /mnt/nvme/$USER is the per-node 250G scratch already used by CTE.
+      # $USER is expanded server-side in mofka_server._configure() — do NOT
+      # pre-expand here. Node-local is fine single-node (server + client
+      # share the one node).
+      workdir: "/mnt/nvme/$USER/mofka-bench"
+      topic: "benchmark_topic"
+      partition_type: "memory"
+
+    - pkg_type: jarvis_clio_core.mofka_bench
+      pkg_name: mofka_bench
+      mode: "both"
+      num_events: 1000
+      data_size: 1024
+      metadata_size: 64
+      batch_size: 16
+      num_threads: 1
+      data_selectivity: 1.0
+      use_progress_thread: true
+      # Single-node: 1 host allocation → mofka_bench runs producer/consumer
+      # locally (see _is_multinode). nprocs/ppn are the multi-node knobs.
+      nprocs: 1
+      ppn: 1
+
+vars:
+  mofka_bench.data_size: [1024, 16384]
+  mofka_bench.num_threads: [1]
+
+loop:
+  - [mofka_bench.data_size]
+  - [mofka_bench.num_threads]
+
+repeat: 1
+
+output: "${HOME}/mofka_bench_ares_rdma_smoke_results"

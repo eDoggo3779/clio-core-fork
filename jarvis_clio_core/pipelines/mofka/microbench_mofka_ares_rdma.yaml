@@ -1,0 +1,58 @@
+# Mofka Benchmark — Ares Single-Node FULL SWEEP, RDMA (ofi+verbs)
+#
+# 45-run producer/consumer sweep on one Ares compute node, ofi+verbs transport
+# over the Mellanox 40Gbps RoCE NIC, memory partition. Paired twin of the TCP
+# sweep (microbench_mofka_ares.yaml): identical sweep shape, so row-for-row
+# TCP-vs-RDMA comparison is meaningful. Run the smoke variant first to confirm
+# bedrock binds ofi+verbs (not a silent TCP fallback).
+#
+# Expected (and logical) result: single-node RDMA is typically SLOWER than TCP
+# here — loopback over the NIC pays PCIe/verbs traversal that kernel TCP
+# loopback skips. That delta is the signal that RDMA actually engaged.
+#
+# Sweep: 5 data sizes x 3 thread counts x 3 repeats = 45 runs.
+#
+# Pattern A: one allocation, sweep runs in-process via `jarvis ppl run yaml`
+# (no jarvis scheduler block — that would submit one job per iteration, which
+# fails on Ares). See pipelines/mofka/architecture_decisions.md.
+#
+# Submit with:  sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_rdma.sbatch
+# Monitor with: squeue -u $USER     Output: mofka_bench_rdma_<jobid>.log
+#
+# Time budget: 45 runs x ~5 min/run (per-iteration bedrock restart) ≈ 3.75 h.
+# 4 h ceiling leaves slack for verbs init latency and outliers.
+
+config:
+  name: mofka_bench_ares_rdma
+  pkgs:
+    - pkg_type: jarvis_clio_core.mofka_server
+      pkg_name: mofka_srv
+      protocol: "ofi+verbs"
+      workdir: "/mnt/nvme/$USER/mofka-bench"
+      topic: "benchmark_topic"
+      partition_type: "memory"
+
+    - pkg_type: jarvis_clio_core.mofka_bench
+      pkg_name: mofka_bench
+      mode: "both"
+      num_events: 1000
+      data_size: 1024
+      metadata_size: 64
+      batch_size: 16
+      num_threads: 1
+      data_selectivity: 1.0
+      use_progress_thread: true
+      nprocs: 1
+      ppn: 1
+
+vars:
+  mofka_bench.data_size: [256, 1024, 4096, 16384, 65536]
+  mofka_bench.num_threads: [1, 2, 4]
+
+loop:
+  - [mofka_bench.data_size]
+  - [mofka_bench.num_threads]
+
+repeat: 3
+
+output: "${HOME}/mofka_bench_ares_rdma_results"
