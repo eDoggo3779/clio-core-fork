@@ -14,6 +14,18 @@ elseif(CLIO_CORE_ENABLE_ROCM)
   list(APPEND BDEV_GPU_LIBS ctp::rocm_cxx)
 endif()
 
+# Collect optional S3 backend dependency (kS3 bdev type, prototype).
+# Hand-rolled S3 client: libcurl for HTTP + OpenSSL for SigV4 signing.
+set(BDEV_S3_LIBS "")
+set(BDEV_RUNTIME_EXTRA_SOURCES "")
+if(CLIO_CORE_ENABLE_S3)
+  find_package(CURL REQUIRED)
+  find_package(OpenSSL REQUIRED)
+  list(APPEND BDEV_S3_LIBS CURL::libcurl OpenSSL::Crypto)
+  list(APPEND BDEV_RUNTIME_EXTRA_SOURCES src/s3_client.cc)
+  message(STATUS "bdev: S3 backend enabled (libcurl + OpenSSL SigV4)")
+endif()
+
 # Client library — ctp::aio provides async I/O headers via its INTERFACE includes.
 # LIB_NAME pins the library to `clio_bdev_client` (the new brand-aligned
 # name); ALIAS keeps `chimaera_bdev_client` working as a CMake target for
@@ -35,13 +47,22 @@ add_clio_module_runtime(
   SOURCES
     src/bdev_runtime.cc
     src/autogen/bdev_lib_exec.cc
+    ${BDEV_RUNTIME_EXTRA_SOURCES}
   LINK_LIBRARIES
     clio_admin_runtime
     ctp::aio
     ${BDEV_OPTIONAL_LIBS}
     ${BDEV_GPU_LIBS}
+    ${BDEV_S3_LIBS}
 )
 add_library(chimaera_bdev_runtime ALIAS clio_bdev_runtime)
+
+# Compile the kS3 backend (and its conditional Runtime members) into the
+# runtime target only when S3 is enabled. PRIVATE keeps the macro/ABI scoped
+# to the runtime library's translation units (bdev_runtime.cc + autogen).
+if(CLIO_CORE_ENABLE_S3 AND TARGET clio_bdev_runtime)
+  target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_BDEV_S3_ENABLED=1)
+endif()
 
 # SYCL HBM bdev support: a separate task. Adding -fsycl to
 # clio_bdev_runtime conflicts with the runtime's precompiled

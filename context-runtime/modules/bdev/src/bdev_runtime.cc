@@ -528,6 +528,43 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   // are kFile / kRam / kNoop. PutBlob/GetBlob with HBM-resident
   // ShmPtr data buffers route through kRam (or kFile) and the bdev
   // staging path uses ctp::DeviceAwareMemcpy / IsDevicePointer.
+  } else if (bdev_type_ == BdevType::kS3) {
+#if defined(CLIO_BDEV_S3_ENABLED)
+    // S3 object-store backend. capacity is required (the object store has no
+    // intrinsic device size to stat, and the heap allocator needs a bound).
+    if (params.total_size_ == 0) {
+      HLOG(kError, "S3 bdev '{}' requires a non-zero capacity", pool_name);
+      task->return_code_ = 4;
+      CLIO_CO_RETURN;
+    }
+    s3_config_ = S3Config::FromEnvAndPoolName(pool_name);
+    if (!s3_config_.valid) {
+      task->return_code_ = 5;
+      CLIO_CO_RETURN;
+    }
+    // Create the bucket up front with a temporary (synchronous) client so the
+    // first write doesn't race bucket creation.
+    {
+      S3Client setup_client(s3_config_);
+      if (!setup_client.IsValid() || !setup_client.EnsureBucket()) {
+        HLOG(kError, "Failed to initialize S3 bucket for '{}'", pool_name);
+        task->return_code_ = 6;
+        CLIO_CO_RETURN;
+      }
+    }
+    // Per-worker clients are created lazily on first I/O (one CURLM each).
+    chi::WorkOrchestrator *wo = CLIO_WORK_ORCHESTRATOR;
+    size_t num_workers = wo ? wo->GetWorkerCount() : 16;
+    worker_s3_clients_.resize(num_workers);
+    file_size_ = params.total_size_;
+    HLOG(kInfo,
+         "S3 bdev ready: bucket='{}' prefix='{}' endpoint='{}' capacity={}",
+         s3_config_.bucket, s3_config_.prefix, s3_config_.endpoint, file_size_);
+#else
+    HLOG(kError, "S3 bdev requested but built without CLIO_CORE_ENABLE_S3");
+    task->return_code_ = 7;
+    CLIO_CO_RETURN;
+#endif
   } else if (bdev_type_ == BdevType::kNoop) {
     // Noop backend: no storage buffer, just track allocatable size
     if (params.total_size_ == 0) {
@@ -737,6 +774,14 @@ chi::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task,
       task->return_code_ = 0;
       task->bytes_written_ = task->length_;
       break;
+    case BdevType::kS3:
+#if defined(CLIO_BDEV_S3_ENABLED)
+      CLIO_CO_AWAIT(WriteToS3(task, rctx));
+#else
+      task->return_code_ = 1;
+      task->bytes_written_ = 0;
+#endif
+      break;
     default:
       task->return_code_ = 1;
       task->bytes_written_ = 0;
@@ -766,6 +811,14 @@ chi::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task,
     case BdevType::kNoop:
       task->return_code_ = 0;
       task->bytes_read_ = task->length_;
+      break;
+    case BdevType::kS3:
+#if defined(CLIO_BDEV_S3_ENABLED)
+      CLIO_CO_AWAIT(ReadFromS3(task, rctx));
+#else
+      task->return_code_ = 1;
+      task->bytes_read_ = 0;
+#endif
       break;
     default:
       task->return_code_ = 1;
@@ -937,6 +990,187 @@ chi::TaskResume Runtime::ReadFromFile(ctp::ipc::FullPtr<ReadTask> task,
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
+
+#if defined(CLIO_BDEV_S3_ENABLED)
+S3Client *Runtime::GetWorkerS3Client(size_t worker_id) {
+  if (worker_id >= worker_s3_clients_.size()) {
+    HLOG(kWarning, "S3 worker ID {} exceeds pre-allocated size {}", worker_id,
+         worker_s3_clients_.size());
+    return nullptr;
+  }
+  auto &slot = worker_s3_clients_[worker_id];
+  if (!slot) {
+    // Lazy per-worker init: each client owns its own curl multi handle.
+    slot = std::make_unique<S3Client>(s3_config_);
+    if (!slot->IsValid()) {
+      HLOG(kError, "Failed to initialize S3 client for worker {}", worker_id);
+      slot.reset();
+      return nullptr;
+    }
+  }
+  return slot.get();
+}
+
+chi::TaskResume Runtime::WriteToS3(ctp::ipc::FullPtr<WriteTask> task,
+                                   chi::RunContext &ctx) {
+  chi::RunContext &rctx = ctx;
+  CLIO_TASK_BODY_BEGIN
+  size_t worker_id = GetWorkerID(rctx);
+  S3Client *s3 = GetWorkerS3Client(worker_id);
+
+  auto *ipc_mgr = CLIO_IPC;
+  ctp::ipc::FullPtr<char> data_ptr =
+      ipc_mgr->ToFullPtr(task->data_).Cast<char>();
+
+  // Stage device-USM data through a host buffer (libcurl reads host memory).
+  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
+  std::vector<char> staging;
+  if (data_on_device) {
+    staging.resize(task->length_);
+    ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
+  }
+
+  chi::u64 total_bytes_written = 0;
+  chi::u64 data_offset = 0;
+
+  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+    const Block &block = task->blocks_[i];
+    chi::u64 remaining = task->length_ - total_bytes_written;
+    if (remaining == 0) break;
+    chi::u64 block_write_size = std::min(remaining, block.size_);
+
+    void *block_data = data_on_device
+                           ? static_cast<void *>(staging.data() + data_offset)
+                           : static_cast<void *>(data_ptr.ptr_ + data_offset);
+
+    if (s3 == nullptr) {
+      HLOG(kError, "WriteToS3 called with invalid S3 client");
+      task->return_code_ = 1;
+      task->bytes_written_ = total_bytes_written;
+      CLIO_CO_RETURN;
+    }
+
+    // Mapping A: one object per block, keyed by byte offset.
+    std::string key = s3->KeyForOffset(block.offset_);
+    void *token = s3->PutAsync(key, block_data,
+                               static_cast<size_t>(block_write_size));
+    if (token == nullptr) {
+      HLOG(kError, "Failed to submit S3 PUT: key={}, size={}", key,
+           block_write_size);
+      task->return_code_ = 2;
+      task->bytes_written_ = total_bytes_written;
+      CLIO_CO_RETURN;
+    }
+
+    // Yield while the (high-latency) PUT is in flight.
+    S3Result result;
+    while (!s3->IsComplete(token, result)) {
+      CLIO_CO_AWAIT(chi::yield(100.0));
+    }
+    if (!result.ok) {
+      HLOG(kError, "S3 PUT failed: key={}, http={}", key, result.http_status);
+      task->return_code_ = 4;
+      task->bytes_written_ = total_bytes_written;
+      CLIO_CO_RETURN;
+    }
+
+    chi::u64 actual_bytes =
+        std::min(static_cast<chi::u64>(result.bytes), block_write_size);
+    total_bytes_written += actual_bytes;
+    data_offset += actual_bytes;
+  }
+
+  task->return_code_ = 0;
+  task->bytes_written_ = total_bytes_written;
+  total_writes_.fetch_add(1);
+  total_bytes_written_.fetch_add(task->bytes_written_);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::ReadFromS3(ctp::ipc::FullPtr<ReadTask> task,
+                                    chi::RunContext &ctx) {
+  chi::RunContext &rctx = ctx;
+  CLIO_TASK_BODY_BEGIN
+  size_t worker_id = GetWorkerID(rctx);
+  S3Client *s3 = GetWorkerS3Client(worker_id);
+
+  auto *ipc_mgr = CLIO_IPC;
+  ctp::ipc::FullPtr<char> data_ptr =
+      ipc_mgr->ToFullPtr(task->data_).Cast<char>();
+
+  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
+  std::vector<char> staging;
+  if (data_on_device) {
+    staging.resize(task->length_);
+  }
+
+  chi::u64 total_bytes_read = 0;
+  chi::u64 data_offset = 0;
+
+  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+    const Block &block = task->blocks_[i];
+    chi::u64 remaining = task->length_ - total_bytes_read;
+    if (remaining == 0) break;
+    chi::u64 block_read_size = std::min(remaining, block.size_);
+
+    void *block_data = data_on_device
+                           ? static_cast<void *>(staging.data() + data_offset)
+                           : static_cast<void *>(data_ptr.ptr_ + data_offset);
+
+    if (s3 == nullptr) {
+      HLOG(kError, "ReadFromS3 called with invalid S3 client");
+      task->return_code_ = 1;
+      task->bytes_read_ = total_bytes_read;
+      CLIO_CO_RETURN;
+    }
+
+    std::string key = s3->KeyForOffset(block.offset_);
+    void *token = s3->GetAsync(key, block_data,
+                               static_cast<size_t>(block_read_size));
+    if (token == nullptr) {
+      HLOG(kError, "Failed to submit S3 GET: key={}, size={}", key,
+           block_read_size);
+      task->return_code_ = 2;
+      task->bytes_read_ = total_bytes_read;
+      CLIO_CO_RETURN;
+    }
+
+    S3Result result;
+    while (!s3->IsComplete(token, result)) {
+      CLIO_CO_AWAIT(chi::yield(100.0));
+    }
+
+    chi::u64 actual_bytes = 0;
+    if (result.not_found) {
+      // Never-written block reads as zeros (sparse semantics, s3backer model).
+      std::memset(block_data, 0, static_cast<size_t>(block_read_size));
+      actual_bytes = block_read_size;
+    } else if (!result.ok) {
+      HLOG(kError, "S3 GET failed: key={}, http={}", key, result.http_status);
+      task->return_code_ = 4;
+      task->bytes_read_ = total_bytes_read;
+      CLIO_CO_RETURN;
+    } else {
+      actual_bytes =
+          std::min(static_cast<chi::u64>(result.bytes), block_read_size);
+    }
+    total_bytes_read += actual_bytes;
+    data_offset += actual_bytes;
+  }
+
+  if (data_on_device && total_bytes_read > 0) {
+    ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
+  }
+
+  task->return_code_ = 0;
+  task->bytes_read_ = total_bytes_read;
+  total_reads_.fetch_add(1);
+  total_bytes_read_.fetch_add(total_bytes_read);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+#endif  // CLIO_BDEV_S3_ENABLED
 
 chi::TaskResume Runtime::Update(ctp::ipc::FullPtr<UpdateTask> task,
                                 chi::RunContext &ctx) {

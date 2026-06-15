@@ -83,7 +83,8 @@ enum class BdevType : chi::u32 {
   kRam = 1,     // RAM-based block device
   kHbm = 2,     // GPU High-Bandwidth Memory via cudaMalloc (device memory)
   kPinned = 3,  // Pinned host memory via cudaMallocHost
-  kNoop = 4     // No-op backend for latency testing (no actual I/O)
+  kNoop = 4,    // No-op backend for latency testing (no actual I/O)
+  kS3 = 5       // S3 object-store backend (prototype; libcurl + SigV4)
 };
 
 /**
@@ -256,6 +257,12 @@ struct CreateParams {
         bdev_type_ = BdevType::kPinned;
       } else if (type_str == "noop") {
         bdev_type_ = BdevType::kNoop;
+      } else if (type_str == "s3") {
+        // S3 object-store backend. Bucket/prefix come from pool_name
+        // (s3://bucket/prefix); endpoint/region/credentials are read from
+        // the S3_ENDPOINT / AWS_REGION / AWS_ACCESS_KEY_ID /
+        // AWS_SECRET_ACCESS_KEY environment variables at Create time.
+        bdev_type_ = BdevType::kS3;
       }
     }
 

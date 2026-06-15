@@ -46,6 +46,10 @@
 #include <memory>
 #include <mutex>
 
+#if defined(CLIO_BDEV_S3_ENABLED)
+#include "s3_client.h"
+#endif
+
 /**
  * Runtime container for bdev ChiMod
  *
@@ -402,6 +406,15 @@ class Runtime : public chi::Container {
 
   // kHbm / kPinned removed — see WriteToRam comment above.
 
+#if defined(CLIO_BDEV_S3_ENABLED)
+  // S3 object-store storage (kS3). Each allocator block maps to one S3 object
+  // keyed by its byte offset (s3backer model). Endpoint/bucket/credentials are
+  // resolved once at Create; one S3Client is owned per worker because a curl
+  // multi handle is not safe to share across threads.
+  S3Config s3_config_;
+  std::vector<std::unique_ptr<S3Client>> worker_s3_clients_;
+#endif
+
   // New allocator components
   GlobalBlockMap global_block_map_;              // Global block cache with per-worker locking
   Heap heap_;                                     // Heap allocator for new blocks
@@ -491,6 +504,24 @@ class Runtime : public chi::Container {
    */
   void WriteToRam(ctp::ipc::FullPtr<WriteTask> task);
   void ReadFromRam(ctp::ipc::FullPtr<ReadTask> task);
+
+#if defined(CLIO_BDEV_S3_ENABLED)
+  /**
+   * Backend-specific S3 operations (coroutines that yield while the async
+   * PUT/GET is in flight, mirroring WriteToFile/ReadFromFile).
+   */
+  chi::TaskResume WriteToS3(ctp::ipc::FullPtr<WriteTask> task,
+                            chi::RunContext &ctx);
+  chi::TaskResume ReadFromS3(ctp::ipc::FullPtr<ReadTask> task,
+                             chi::RunContext &ctx);
+
+  /**
+   * Get (lazily creating) the S3 client for the given worker.
+   * @param worker_id Worker ID.
+   * @return Pointer to the worker's S3 client, or nullptr on failure.
+   */
+  S3Client *GetWorkerS3Client(size_t worker_id);
+#endif
 
   // BdevType::kHbm / BdevType::kPinned tiers were removed. PutBlob /
   // GetBlob with HBM-resident ShmPtr data buffers route through kRam

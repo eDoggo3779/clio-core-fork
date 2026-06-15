@@ -75,8 +75,26 @@ compose:
   #   pool_name: "/mnt/nvme/chi_bdev"
   #   pool_query: local
   #   pool_id: "302.0"
-  #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop
+  #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop, s3
   #   capacity: "100GB"
+
+  # === Block Device (S3 object store) — prototype ===
+  # Requires building with -DCLIO_CORE_ENABLE_S3=ON (libcurl + OpenSSL SigV4).
+  # pool_name encodes the bucket + key prefix: s3://<bucket>/<prefix>.
+  # The endpoint, region, and credentials come from the environment (NOT this
+  # file, so no secrets are serialized): S3_ENDPOINT (or AWS_ENDPOINT_URL),
+  # AWS_REGION (default us-east-1), AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+  # Each allocator block maps to one object keyed by byte offset (s3backer
+  # model); capacity is required (the object store has no device size to stat).
+  # Example against a local MinIO:
+  #   export S3_ENDPOINT=http://127.0.0.1:9000
+  #   export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
+  # - mod_name: clio_bdev
+  #   pool_name: "s3://clio-bdev/pool0"
+  #   pool_query: local
+  #   pool_id: "303.0"
+  #   bdev_type: s3                      # Options: file, ram, hbm, pinned, noop, s3
+  #   capacity: "10GB"
 
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0

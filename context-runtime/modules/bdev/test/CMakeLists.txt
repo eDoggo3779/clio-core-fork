@@ -166,6 +166,43 @@ add_custom_target(test_bdev_error
   COMMENT "Running Chimaera bdev error handling tests"
 )
 
+# S3 backend roundtrip test (prototype) — built only when S3 is enabled.
+# Self-skips at runtime unless S3_ENDPOINT is set, so it is safe in CI.
+if(CLIO_CORE_ENABLE_S3)
+  set(BDEV_S3_TEST_TARGET chimaera_bdev_s3_tests)
+  add_executable(${BDEV_S3_TEST_TARGET} test_bdev_s3.cc)
+  target_include_directories(${BDEV_S3_TEST_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+    ${CLIO_RUN_ROOT}/modules/admin/include
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(${BDEV_S3_TEST_TARGET}
+    clio_admin_runtime
+    clio_admin_client
+    clio_bdev_runtime
+    clio_bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(${BDEV_S3_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_bdev_s3_tests
+    COMMAND ${BDEV_S3_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_s3_tests PROPERTIES
+    TIMEOUT 300
+    LABELS "msan_skip"
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+  )
+  install(TARGETS ${BDEV_S3_TEST_TARGET} RUNTIME DESTINATION bin)
+endif()
+
 # Install test executable
 install(TARGETS ${BDEV_TEST_TARGET}
   RUNTIME DESTINATION bin
