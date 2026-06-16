@@ -50,6 +50,18 @@
 #include "s3_client.h"
 #endif
 
+#if defined(CLIO_BDEV_GCS_ENABLED)
+#include "gcs_client.h"
+#endif
+
+#if defined(CLIO_BDEV_AZURE_ENABLED)
+#include "azure_blob_client.h"
+#endif
+
+#if defined(CLIO_BDEV_OSS_ENABLED)
+#include "oss_client.h"
+#endif
+
 /**
  * Runtime container for bdev ChiMod
  *
@@ -415,6 +427,36 @@ class Runtime : public chi::Container {
   std::vector<std::unique_ptr<S3Client>> worker_s3_clients_;
 #endif
 
+#if defined(CLIO_BDEV_GCS_ENABLED)
+  // Google Cloud Storage (kGcs). Same s3backer block->object mapping as kS3,
+  // but over the GCS JSON API with a single OAuth2 bearer token resolved once
+  // at Create. One GcsClient per worker (curl multi handles aren't shareable).
+  GcsConfig gcs_config_;
+  std::vector<std::unique_ptr<GcsClient>> worker_gcs_clients_;
+#endif
+
+#if defined(CLIO_BDEV_AZURE_ENABLED)
+  // Azure Blob storage (kAzure / kAzurePage). kAzure uses the same s3backer
+  // block->object mapping as kS3 over Block Blobs; kAzurePage maps the whole
+  // device onto ONE Page Blob (azure_device_key_) written in-place at byte
+  // offsets via Put Page. One AzureBlobClient per worker (curl multi handles
+  // aren't shareable).
+  AzureConfig azure_config_;
+  bool azure_is_page_ = false;       // kAzurePage vs kAzure (Block Blob)
+  std::string azure_device_key_;     // Page-blob device key (kAzurePage only)
+  std::vector<std::unique_ptr<AzureBlobClient>> worker_azure_clients_;
+#endif
+
+#if defined(CLIO_BDEV_OSS_ENABLED)
+  // Alibaba Cloud OSS storage (kOss). Each allocator block maps to one OSS
+  // object keyed by its byte offset (s3backer model). The native OSS V1
+  // (HMAC-SHA1) signer is the default; S3-compat (SigV4) is selectable via
+  // env for emulator/endpoint validation. One OssClient per worker because a
+  // curl multi handle is not safe to share across threads.
+  OssConfig oss_config_;
+  std::vector<std::unique_ptr<OssClient>> worker_oss_clients_;
+#endif
+
   // New allocator components
   GlobalBlockMap global_block_map_;              // Global block cache with per-worker locking
   Heap heap_;                                     // Heap allocator for new blocks
@@ -521,6 +563,62 @@ class Runtime : public chi::Container {
    * @return Pointer to the worker's S3 client, or nullptr on failure.
    */
   S3Client *GetWorkerS3Client(size_t worker_id);
+#endif
+
+#if defined(CLIO_BDEV_GCS_ENABLED)
+  /**
+   * Backend-specific GCS operations (coroutines that yield while the async
+   * upload/download is in flight, mirroring WriteToS3/ReadFromS3).
+   */
+  chi::TaskResume WriteToGcs(ctp::ipc::FullPtr<WriteTask> task,
+                             chi::RunContext &ctx);
+  chi::TaskResume ReadFromGcs(ctp::ipc::FullPtr<ReadTask> task,
+                              chi::RunContext &ctx);
+
+  /**
+   * Get (lazily creating) the GCS client for the given worker.
+   * @param worker_id Worker ID.
+   * @return Pointer to the worker's GCS client, or nullptr on failure.
+   */
+  GcsClient *GetWorkerGcsClient(size_t worker_id);
+#endif
+
+#if defined(CLIO_BDEV_AZURE_ENABLED)
+  /**
+   * Backend-specific Azure Blob operations (coroutines that yield while the
+   * async PUT/GET is in flight, mirroring WriteToS3/ReadFromS3). Each branches
+   * internally on azure_is_page_: Block Blob (object-per-block, whole-object
+   * PUT) vs Page Blob (single device blob, in-place Put Page / ranged GET).
+   */
+  chi::TaskResume WriteToAzure(ctp::ipc::FullPtr<WriteTask> task,
+                               chi::RunContext &ctx);
+  chi::TaskResume ReadFromAzure(ctp::ipc::FullPtr<ReadTask> task,
+                                chi::RunContext &ctx);
+
+  /**
+   * Get (lazily creating) the Azure Blob client for the given worker.
+   * @param worker_id Worker ID.
+   * @return Pointer to the worker's Azure client, or nullptr on failure.
+   */
+  AzureBlobClient *GetWorkerAzureClient(size_t worker_id);
+#endif
+
+#if defined(CLIO_BDEV_OSS_ENABLED)
+  /**
+   * Backend-specific OSS operations (coroutines that yield while the async
+   * PUT/GET is in flight, mirroring WriteToS3/ReadFromS3).
+   */
+  chi::TaskResume WriteToOss(ctp::ipc::FullPtr<WriteTask> task,
+                             chi::RunContext &ctx);
+  chi::TaskResume ReadFromOss(ctp::ipc::FullPtr<ReadTask> task,
+                              chi::RunContext &ctx);
+
+  /**
+   * Get (lazily creating) the OSS client for the given worker.
+   * @param worker_id Worker ID.
+   * @return Pointer to the worker's OSS client, or nullptr on failure.
+   */
+  OssClient *GetWorkerOssClient(size_t worker_id);
 #endif
 
   // BdevType::kHbm / BdevType::kPinned tiers were removed. PutBlob /

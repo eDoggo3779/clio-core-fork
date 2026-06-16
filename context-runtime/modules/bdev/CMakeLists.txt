@@ -26,6 +26,37 @@ if(CLIO_CORE_ENABLE_S3)
   message(STATUS "bdev: S3 backend enabled (libcurl + OpenSSL SigV4)")
 endif()
 
+# Hand-rolled GCS client (kGcs bdev type, prototype): libcurl for the GCS JSON
+# API + OpenSSL for the OAuth2 service-account JWT (RSA-SHA256) auth path.
+if(CLIO_CORE_ENABLE_GCS)
+  find_package(CURL REQUIRED)
+  find_package(OpenSSL REQUIRED)
+  list(APPEND BDEV_S3_LIBS CURL::libcurl OpenSSL::Crypto)
+  list(APPEND BDEV_RUNTIME_EXTRA_SOURCES src/gcs_client.cc)
+  message(STATUS "bdev: GCS backend enabled (libcurl + OpenSSL OAuth2/JWT)")
+endif()
+
+# Hand-rolled Azure Blob client (kAzure / kAzurePage bdev types, prototype):
+# libcurl for HTTP + OpenSSL for the Shared Key signer (HMAC-SHA256, base64).
+if(CLIO_CORE_ENABLE_AZURE)
+  find_package(CURL REQUIRED)
+  find_package(OpenSSL REQUIRED)
+  list(APPEND BDEV_S3_LIBS CURL::libcurl OpenSSL::Crypto)
+  list(APPEND BDEV_RUNTIME_EXTRA_SOURCES src/azure_blob_client.cc)
+  message(STATUS "bdev: Azure Blob backend enabled (libcurl + OpenSSL Shared Key)")
+endif()
+
+# Hand-rolled Alibaba Cloud OSS client (kOss bdev type, prototype): libcurl for
+# HTTP + OpenSSL for the native OSS V1 signer (HMAC-SHA1, base64) plus a SigV4
+# path (HMAC-SHA256) for OSS's S3-compatible endpoint / local emulators.
+if(CLIO_CORE_ENABLE_OSS)
+  find_package(CURL REQUIRED)
+  find_package(OpenSSL REQUIRED)
+  list(APPEND BDEV_S3_LIBS CURL::libcurl OpenSSL::Crypto)
+  list(APPEND BDEV_RUNTIME_EXTRA_SOURCES src/oss_client.cc)
+  message(STATUS "bdev: OSS backend enabled (libcurl + OpenSSL OSS V1 HMAC-SHA1)")
+endif()
+
 # Client library — ctp::aio provides async I/O headers via its INTERFACE includes.
 # LIB_NAME pins the library to `clio_bdev_client` (the new brand-aligned
 # name); ALIAS keeps `chimaera_bdev_client` working as a CMake target for
@@ -62,6 +93,15 @@ add_library(chimaera_bdev_runtime ALIAS clio_bdev_runtime)
 # to the runtime library's translation units (bdev_runtime.cc + autogen).
 if(CLIO_CORE_ENABLE_S3 AND TARGET clio_bdev_runtime)
   target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_BDEV_S3_ENABLED=1)
+endif()
+if(CLIO_CORE_ENABLE_GCS AND TARGET clio_bdev_runtime)
+  target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_BDEV_GCS_ENABLED=1)
+endif()
+if(CLIO_CORE_ENABLE_AZURE AND TARGET clio_bdev_runtime)
+  target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_BDEV_AZURE_ENABLED=1)
+endif()
+if(CLIO_CORE_ENABLE_OSS AND TARGET clio_bdev_runtime)
+  target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_BDEV_OSS_ENABLED=1)
 endif()
 
 # SYCL HBM bdev support: a separate task. Adding -fsycl to

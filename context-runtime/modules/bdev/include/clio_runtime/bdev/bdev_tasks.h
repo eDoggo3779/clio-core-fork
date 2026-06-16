@@ -84,7 +84,11 @@ enum class BdevType : chi::u32 {
   kHbm = 2,     // GPU High-Bandwidth Memory via cudaMalloc (device memory)
   kPinned = 3,  // Pinned host memory via cudaMallocHost
   kNoop = 4,    // No-op backend for latency testing (no actual I/O)
-  kS3 = 5       // S3 object-store backend (prototype; libcurl + SigV4)
+  kS3 = 5,      // S3 object-store backend (prototype; libcurl + SigV4)
+  kGcs = 6,     // Google Cloud Storage backend (prototype; JSON API + OAuth2)
+  kAzure = 7,   // Azure Block Blob backend (prototype; libcurl + Shared Key)
+  kAzurePage = 8,  // Azure Page Blob backend (prototype; in-place 512B writes)
+  kOss = 9        // Alibaba Cloud OSS backend (prototype; libcurl + OSS V1 HMAC-SHA1)
 };
 
 /**
@@ -263,6 +267,34 @@ struct CreateParams {
         // the S3_ENDPOINT / AWS_REGION / AWS_ACCESS_KEY_ID /
         // AWS_SECRET_ACCESS_KEY environment variables at Create time.
         bdev_type_ = BdevType::kS3;
+      } else if (type_str == "gcs") {
+        // Google Cloud Storage backend. Bucket/prefix come from pool_name
+        // (gcs://bucket/prefix); endpoint/project/credentials are read from
+        // the GCS_ENDPOINT / GCS_PROJECT_ID / GOOGLE_APPLICATION_CREDENTIALS
+        // (or GCS_ACCESS_TOKEN) environment variables at Create time.
+        bdev_type_ = BdevType::kGcs;
+      } else if (type_str == "azure") {
+        // Azure Block Blob backend. Container/prefix come from pool_name
+        // (azure://container/prefix); endpoint/account/credentials are read
+        // from the AZURE_BLOB_ENDPOINT / AZURE_STORAGE_ACCOUNT /
+        // AZURE_STORAGE_KEY environment variables at Create time. Each
+        // allocator block maps to one block blob keyed by byte offset
+        // (s3backer model; whole-object PUT/GET).
+        bdev_type_ = BdevType::kAzure;
+      } else if (type_str == "azure_page") {
+        // Azure Page Blob backend. Same pool_name/env contract as "azure",
+        // but the whole device maps to ONE page blob that supports 512-byte
+        // aligned in-place writes (Put Page) at byte offsets — the cloud
+        // primitive matching the bdev's flat-device, in-place-offset model.
+        bdev_type_ = BdevType::kAzurePage;
+      } else if (type_str == "oss") {
+        // Alibaba Cloud OSS backend. Bucket/prefix come from pool_name
+        // (oss://bucket/prefix); endpoint/region/credentials are read from
+        // the OSS_ENDPOINT / OSS_REGION / OSS_ACCESS_KEY_ID /
+        // OSS_ACCESS_KEY_SECRET environment variables at Create time. The
+        // native OSS V1 (HMAC-SHA1) signer is the default; OSS_SIGNATURE=s3
+        // selects AWS SigV4 for OSS's S3-compatible endpoint / emulators.
+        bdev_type_ = BdevType::kOss;
       }
     }
 
