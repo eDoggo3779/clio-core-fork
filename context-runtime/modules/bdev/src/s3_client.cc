@@ -33,114 +33,20 @@
 
 #include <clio_runtime/bdev/s3_client.h>
 
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-
-#include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <string>
 #include <vector>
 
 #include "clio_ctp/util/logging.h"
+#include "clio_runtime/bdev/cloud_crypto.h"
 
 namespace clio::run::bdev {
-
-/** SHA-256 of empty content — the payload hash for body-less requests. */
-static const char *kEmptyPayloadSha256 =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-//===========================================================================
-// Crypto + encoding helpers (OpenSSL)
-//===========================================================================
-
-/**
- * Hex-encode raw bytes in lowercase.
- * @param data Input bytes.
- * @param len Number of input bytes.
- * @return Lowercase hex string of length 2*len.
- */
-static std::string HexEncode(const unsigned char *data, size_t len) {
-  static const char *hex = "0123456789abcdef";
-  std::string out;
-  out.resize(len * 2);
-  for (size_t i = 0; i < len; ++i) {
-    out[2 * i] = hex[(data[i] >> 4) & 0xF];
-    out[2 * i + 1] = hex[data[i] & 0xF];
-  }
-  return out;
-}
-
-/**
- * Compute the lowercase hex SHA-256 of a buffer.
- * @param data Input bytes (may be null when len==0).
- * @param len Number of input bytes.
- * @return 64-character lowercase hex digest.
- */
-static std::string Sha256Hex(const void *data, size_t len) {
-  unsigned char digest[SHA256_DIGEST_LENGTH];
-  SHA256(reinterpret_cast<const unsigned char *>(data), len, digest);
-  return HexEncode(digest, SHA256_DIGEST_LENGTH);
-}
-
-/**
- * Compute a raw HMAC-SHA256.
- * @param key HMAC key bytes.
- * @param key_len Key length.
- * @param data Message bytes.
- * @param data_len Message length.
- * @return Raw 32-byte MAC.
- */
-static std::vector<unsigned char> HmacSha256(const unsigned char *key,
-                                             size_t key_len, const void *data,
-                                             size_t data_len) {
-  unsigned char out[EVP_MAX_MD_SIZE];
-  unsigned int out_len = 0;
-  HMAC(EVP_sha256(), key, static_cast<int>(key_len),
-       reinterpret_cast<const unsigned char *>(data), data_len, out, &out_len);
-  return std::vector<unsigned char>(out, out + out_len);
-}
-
-/**
- * RFC 3986 URI-encode per AWS rules (unreserved chars pass through).
- * @param value String to encode.
- * @param encode_slash When false, '/' is left literal (used for object paths).
- * @return The percent-encoded string.
- */
-static std::string AwsUriEncode(const std::string &value, bool encode_slash) {
-  static const char *hex = "0123456789ABCDEF";
-  std::string out;
-  out.reserve(value.size() * 3);
-  for (unsigned char c : value) {
-    bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                      (c >= '0' && c <= '9') || c == '-' || c == '_' ||
-                      c == '.' || c == '~';
-    if (unreserved || (c == '/' && !encode_slash)) {
-      out.push_back(static_cast<char>(c));
-    } else {
-      out.push_back('%');
-      out.push_back(hex[(c >> 4) & 0xF]);
-      out.push_back(hex[c & 0xF]);
-    }
-  }
-  return out;
-}
 
 //===========================================================================
 // S3Config
 //===========================================================================
-
-/**
- * Read an environment variable, returning a default when unset/empty.
- * @param name Variable name.
- * @param def Fallback value.
- * @return The value or `def`.
- */
-static std::string EnvOr(const char *name, const std::string &def) {
-  const char *v = std::getenv(name);
-  return (v && *v) ? std::string(v) : def;
-}
 
 S3Config S3Config::FromEnvAndPoolName(const std::string &pool_name) {
   S3Config cfg;
@@ -161,10 +67,10 @@ S3Config S3Config::FromEnvAndPoolName(const std::string &pool_name) {
     return cfg;
   }
 
-  cfg.endpoint = EnvOr("S3_ENDPOINT", EnvOr("AWS_ENDPOINT_URL", ""));
-  cfg.region = EnvOr("AWS_REGION", "us-east-1");
-  cfg.access_key = EnvOr("AWS_ACCESS_KEY_ID", "");
-  cfg.secret_key = EnvOr("AWS_SECRET_ACCESS_KEY", "");
+  cfg.endpoint = cloud::EnvOr("S3_ENDPOINT", cloud::EnvOr("AWS_ENDPOINT_URL", ""));
+  cfg.region = cloud::EnvOr("AWS_REGION", "us-east-1");
+  cfg.access_key = cloud::EnvOr("AWS_ACCESS_KEY_ID", "");
+  cfg.secret_key = cloud::EnvOr("AWS_SECRET_ACCESS_KEY", "");
   if (cfg.endpoint.empty() || cfg.access_key.empty() ||
       cfg.secret_key.empty()) {
     HLOG(kError,
@@ -190,77 +96,10 @@ S3Config S3Config::FromEnvAndPoolName(const std::string &pool_name) {
 }
 
 //===========================================================================
-// S3Op + libcurl callbacks
-//===========================================================================
-
-/** Per-request state for one in-flight async operation. */
-struct S3Client::S3Op {
-  CURL *easy = nullptr;             /**< Owning curl easy handle */
-  curl_slist *headers = nullptr;    /**< Signed request headers (owned) */
-  bool is_get = false;             /**< true for GET, false for PUT */
-  bool finished = false;           /**< Set when the transfer completes */
-  CURLcode curl_code = CURLE_OK;   /**< Transport-level result */
-  std::string key;                 /**< Object key (for logging) */
-  // PUT source
-  const char *src = nullptr;
-  size_t len = 0;
-  size_t sent = 0;
-  // GET destination
-  char *dst = nullptr;
-  size_t cap = 0;
-  size_t written = 0;
-  std::chrono::high_resolution_clock::time_point start;
-};
-
-/** libcurl read callback: stream the PUT body out of op->src. */
-static size_t S3ReadCb(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  auto *op = static_cast<S3Client::S3Op *>(userdata);
-  size_t want = size * nmemb;
-  size_t remaining = op->len - op->sent;
-  size_t n = std::min(want, remaining);
-  if (n > 0) {
-    std::memcpy(ptr, op->src + op->sent, n);
-    op->sent += n;
-  }
-  return n;
-}
-
-/** libcurl write callback: capture the GET body into op->dst (bounded). */
-static size_t S3WriteCb(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  auto *op = static_cast<S3Client::S3Op *>(userdata);
-  size_t n = size * nmemb;
-  size_t space = (op->written < op->cap) ? (op->cap - op->written) : 0;
-  size_t c = std::min(n, space);
-  if (c > 0) {
-    std::memcpy(op->dst + op->written, ptr, c);
-    op->written += c;
-  }
-  return n;  // Always consume everything so curl doesn't abort on overflow.
-}
-
-//===========================================================================
 // S3Client lifecycle
 //===========================================================================
 
-S3Client::S3Client(const S3Config &config) : config_(config) {
-  if (!config_.valid) return;
-  multi_ = curl_multi_init();
-  if (multi_ == nullptr) {
-    HLOG(kError, "Failed to create curl multi handle for S3 client");
-  }
-}
-
-S3Client::~S3Client() {
-  for (auto &kv : inflight_) {
-    S3Op *op = kv.second;
-    if (multi_ && op->easy) curl_multi_remove_handle(multi_, op->easy);
-    if (op->easy) curl_easy_cleanup(op->easy);
-    if (op->headers) curl_slist_free_all(op->headers);
-    delete op;
-  }
-  inflight_.clear();
-  if (multi_) curl_multi_cleanup(multi_);
-}
+S3Client::S3Client(const S3Config &config) : config_(config) {}
 
 std::string S3Client::KeyForOffset(uint64_t offset) const {
   std::string key = "blk_" + std::to_string(offset);
@@ -296,23 +135,23 @@ curl_slist *S3Client::BuildSignedHeaders(const std::string &method,
                       "aws4_request";
   std::string string_to_sign =
       std::string("AWS4-HMAC-SHA256\n") + amzdate + "\n" + scope + "\n" +
-      Sha256Hex(canonical_request.data(), canonical_request.size());
+      cloud::Sha256Hex(canonical_request.data(), canonical_request.size());
 
   // Derive the signing key, then sign the string-to-sign.
   std::string k0 = "AWS4" + config_.secret_key;
-  std::vector<unsigned char> k_date = HmacSha256(
+  std::vector<unsigned char> k_date = cloud::HmacSha256(
       reinterpret_cast<const unsigned char *>(k0.data()), k0.size(), datestamp,
       std::strlen(datestamp));
-  std::vector<unsigned char> k_region = HmacSha256(
+  std::vector<unsigned char> k_region = cloud::HmacSha256(
       k_date.data(), k_date.size(), config_.region.data(), config_.region.size());
   std::vector<unsigned char> k_service =
-      HmacSha256(k_region.data(), k_region.size(), "s3", 2);
+      cloud::HmacSha256(k_region.data(), k_region.size(), "s3", 2);
   std::vector<unsigned char> k_signing =
-      HmacSha256(k_service.data(), k_service.size(), "aws4_request", 12);
-  std::vector<unsigned char> sig = HmacSha256(
+      cloud::HmacSha256(k_service.data(), k_service.size(), "aws4_request", 12);
+  std::vector<unsigned char> sig = cloud::HmacSha256(
       k_signing.data(), k_signing.size(), string_to_sign.data(),
       string_to_sign.size());
-  std::string signature = HexEncode(sig.data(), sig.size());
+  std::string signature = cloud::HexEncode(sig.data(), sig.size());
 
   std::string authorization =
       "AWS4-HMAC-SHA256 Credential=" + config_.access_key + "/" + scope +
@@ -328,11 +167,11 @@ curl_slist *S3Client::BuildSignedHeaders(const std::string &method,
   return headers;
 }
 
-bool S3Client::NewSignedHandle(S3Op *op, const std::string &method,
+bool S3Client::NewSignedHandle(Op *op, const std::string &method,
                                const std::string &payload_hash) {
   op->easy = curl_easy_init();
   if (op->easy == nullptr) return false;
-  std::string enc_key = AwsUriEncode(op->key, /*encode_slash=*/false);
+  std::string enc_key = cloud::AwsUriEncode(op->key, /*encode_slash=*/false);
   std::string canonical_uri = "/" + config_.bucket + "/" + enc_key;
   std::string url = config_.scheme + "://" + config_.host + canonical_uri;
   op->headers = BuildSignedHeaders(method, canonical_uri, payload_hash);
@@ -345,6 +184,8 @@ bool S3Client::NewSignedHandle(S3Op *op, const std::string &method,
 // Bucket creation (synchronous)
 //===========================================================================
 
+bool S3Client::Bootstrap(uint64_t /*capacity*/) { return EnsureBucket(); }
+
 bool S3Client::EnsureBucket() {
   if (!IsValid()) return false;
   CURL *easy = curl_easy_init();
@@ -352,7 +193,7 @@ bool S3Client::EnsureBucket() {
   std::string canonical_uri = "/" + config_.bucket;
   std::string url = config_.scheme + "://" + config_.host + canonical_uri;
   curl_slist *headers =
-      BuildSignedHeaders("PUT", canonical_uri, kEmptyPayloadSha256);
+      BuildSignedHeaders("PUT", canonical_uri, cloud::kEmptyPayloadSha256);
   curl_easy_setopt(easy, CURLOPT_URL, url.c_str());
   curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, "PUT");
@@ -376,97 +217,48 @@ bool S3Client::EnsureBucket() {
 }
 
 //===========================================================================
-// Async submit + poll
+// Async submit (offset-oriented; poll via the shared base IsComplete)
 //===========================================================================
 
-void *S3Client::PutAsync(const std::string &key, const void *buf, size_t len) {
+void *S3Client::WriteAsync(uint64_t offset, const void *buf, size_t len) {
   if (!IsValid()) return nullptr;
-  auto *op = new S3Op();
+  auto *op = new Op();
   op->is_get = false;
-  op->key = key;
+  op->op_label = "PUT";
+  op->key = KeyForOffset(offset);
   op->src = static_cast<const char *>(buf);
   op->len = len;
   op->start = std::chrono::high_resolution_clock::now();
-  std::string payload_hash = Sha256Hex(buf, len);
+  std::string payload_hash = cloud::Sha256Hex(buf, len);
   if (!NewSignedHandle(op, "PUT", payload_hash)) {
     delete op;
     return nullptr;
   }
   curl_easy_setopt(op->easy, CURLOPT_UPLOAD, 1L);
-  curl_easy_setopt(op->easy, CURLOPT_READFUNCTION, S3ReadCb);
+  curl_easy_setopt(op->easy, CURLOPT_READFUNCTION, &HttpObjectStoreClient::ReadCb);
   curl_easy_setopt(op->easy, CURLOPT_READDATA, op);
   curl_easy_setopt(op->easy, CURLOPT_INFILESIZE_LARGE,
                    static_cast<curl_off_t>(len));
-  curl_multi_add_handle(multi_, op->easy);
-  inflight_[op->easy] = op;
-  return op;
+  return Submit(op);
 }
 
-void *S3Client::GetAsync(const std::string &key, void *buf, size_t cap) {
+void *S3Client::ReadAsync(uint64_t offset, void *buf, size_t len) {
   if (!IsValid()) return nullptr;
-  auto *op = new S3Op();
+  auto *op = new Op();
   op->is_get = true;
-  op->key = key;
+  op->op_label = "GET";
+  op->key = KeyForOffset(offset);
   op->dst = static_cast<char *>(buf);
-  op->cap = cap;
+  op->cap = len;
   op->start = std::chrono::high_resolution_clock::now();
-  if (!NewSignedHandle(op, "GET", kEmptyPayloadSha256)) {
+  if (!NewSignedHandle(op, "GET", cloud::kEmptyPayloadSha256)) {
     delete op;
     return nullptr;
   }
   curl_easy_setopt(op->easy, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION, S3WriteCb);
+  curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION, &HttpObjectStoreClient::WriteCb);
   curl_easy_setopt(op->easy, CURLOPT_WRITEDATA, op);
-  curl_multi_add_handle(multi_, op->easy);
-  inflight_[op->easy] = op;
-  return op;
-}
-
-bool S3Client::IsComplete(void *token, S3Result &out) {
-  auto *target = static_cast<S3Op *>(token);
-  if (target == nullptr || multi_ == nullptr) return true;
-
-  int running = 0;
-  curl_multi_perform(multi_, &running);
-
-  // Drain completion messages and mark the matching ops finished.
-  CURLMsg *msg = nullptr;
-  int in_queue = 0;
-  while ((msg = curl_multi_info_read(multi_, &in_queue)) != nullptr) {
-    if (msg->msg != CURLMSG_DONE) continue;
-    auto it = inflight_.find(msg->easy_handle);
-    if (it != inflight_.end()) {
-      it->second->finished = true;
-      it->second->curl_code = msg->data.result;
-    }
-  }
-
-  if (!target->finished) return false;
-
-  long status = 0;
-  curl_easy_getinfo(target->easy, CURLINFO_RESPONSE_CODE, &status);
-  double ms = std::chrono::duration<double, std::milli>(
-                  std::chrono::high_resolution_clock::now() - target->start)
-                  .count();
-  out.http_status = status;
-  out.not_found = (status == 404);
-  out.bytes = target->is_get ? target->written : target->sent;
-  out.ok = (target->curl_code == CURLE_OK) && (status >= 200 && status < 300);
-
-  HLOG(kInfo, "S3 op={} key={} bytes={} http={} latency_ms={}",
-       target->is_get ? "GET" : "PUT", target->key, out.bytes, status, ms);
-  if (target->curl_code != CURLE_OK) {
-    HLOG(kError, "S3 op={} key={} transport error curl={}",
-         target->is_get ? "GET" : "PUT", target->key,
-         static_cast<int>(target->curl_code));
-  }
-
-  curl_multi_remove_handle(multi_, target->easy);
-  curl_easy_cleanup(target->easy);
-  if (target->headers) curl_slist_free_all(target->headers);
-  inflight_.erase(target->easy);
-  delete target;
-  return true;
+  return Submit(op);
 }
 
 }  // namespace clio::run::bdev

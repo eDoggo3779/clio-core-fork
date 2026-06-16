@@ -39,9 +39,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "http_object_store_client.h"
 
 namespace clio::run::bdev {
 
@@ -88,13 +89,8 @@ struct OssConfig {
   static OssConfig FromEnvAndPoolName(const std::string &pool_name);
 };
 
-/** Outcome of a completed async OSS operation. */
-struct OssResult {
-  long http_status = 0;    /**< HTTP status code (0 if the transport failed) */
-  size_t bytes = 0;        /**< Bytes transferred (PUT body or GET payload) */
-  bool not_found = false;  /**< True when a GET returned HTTP 404 */
-  bool ok = false;         /**< True on a 2xx response with no transport error */
-};
+/** Backward-compatible alias for the unified result type. */
+using OssResult = ObjectStoreResult;
 
 /**
  * Minimal async Alibaba Cloud OSS client built on libcurl's multi interface.
@@ -104,54 +100,41 @@ struct OssResult {
  * structurally different from AWS SigV4 (SHA-1 not SHA-256, an RFC-1123 Date
  * header instead of a credential scope, and `x-oss-*` canonical headers). A
  * SigV4 path is also provided for OSS's S3-compatible endpoint and for local
- * emulators. One instance is owned per bdev worker because a CURLM handle is
- * not safe to share across threads. The submit/poll surface mirrors
- * ctp::AsyncIO so the bdev coroutines yield-while-polling exactly as the file
- * backend does.
+ * emulators. The libcurl-multi transport and poll loop live in the
+ * HttpObjectStoreClient base; this subclass adds only OSS's request
+ * construction and the two signers. One instance is owned per bdev worker
+ * because a CURLM handle is not safe to share across threads.
  *
  * Object mapping is the s3backer model: each allocator block maps to one
  * object keyed by its byte offset (see KeyForOffset).
  */
-class OssClient {
+class OssClient : public HttpObjectStoreClient {
  public:
   /**
    * @param config Resolved endpoint/bucket/credentials for this client.
    */
   explicit OssClient(const OssConfig &config);
-  ~OssClient();
-  OssClient(const OssClient &) = delete;
-  OssClient &operator=(const OssClient &) = delete;
 
   /** @return true when the config is valid and the curl multi handle exists. */
-  bool IsValid() const { return config_.valid && multi_ != nullptr; }
+  bool IsValid() const override { return config_.valid && MultiOk(); }
+
+  /** Create the target bucket (idempotent). @param capacity Unused. */
+  bool Bootstrap(uint64_t capacity) override;
+
+  /** Submit an async whole-object PUT for the block at `offset`. */
+  void *WriteAsync(uint64_t offset, const void *buf, size_t len) override;
+
+  /** Submit an async whole-object GET for the block at `offset`. */
+  void *ReadAsync(uint64_t offset, void *buf, size_t len) override;
+
+  /** OSS objects are immutable/whole-object; never-written blocks 404. */
+  ReadFill GetReadFill() const override { return ReadFill::kSparse404; }
 
   /**
    * Synchronously create the target bucket (idempotent).
    * @return true on a created/already-exists response.
    */
   bool EnsureBucket();
-
-  /**
-   * Submit an async PUT of `len` bytes from `buf` to object `key`.
-   * The caller must keep `buf` alive until IsComplete() returns true.
-   * @return Opaque op token to poll with IsComplete(), or nullptr on failure.
-   */
-  void *PutAsync(const std::string &key, const void *buf, size_t len);
-
-  /**
-   * Submit an async GET of object `key` into `buf` (capacity `cap` bytes).
-   * @return Opaque op token to poll with IsComplete(), or nullptr on failure.
-   */
-  void *GetAsync(const std::string &key, void *buf, size_t cap);
-
-  /**
-   * Drive in-flight transfers and report whether `token`'s op has finished.
-   * On a true return, `out` is populated and the op is freed (token invalid).
-   * @param token An op token from PutAsync/GetAsync.
-   * @param out Filled with the result when the op completes.
-   * @return true if the op completed this call; false if still in flight.
-   */
-  bool IsComplete(void *token, OssResult &out);
 
   /**
    * Map a block byte offset to a stable object key (prefix + "blk_<offset>").
@@ -184,9 +167,8 @@ class OssClient {
       const std::vector<std::pair<std::string, std::string>> &oss_headers,
       const std::string &canonical_resource);
 
-  /** Per-request op state (defined in the .cc; public so the libcurl
-   *  read/write trampolines can reach its fields). Treat as opaque. */
-  struct OssOp;
+ protected:
+  const char *LogTag() const override { return "OSS"; }
 
  private:
   /**
@@ -217,12 +199,10 @@ class OssClient {
    * @param payload_hash Lowercase hex SHA-256 of the body (S3 mode only).
    * @return true on success.
    */
-  bool NewSignedHandle(OssOp *op, const std::string &method,
+  bool NewSignedHandle(Op *op, const std::string &method,
                        const std::string &payload_hash);
 
   OssConfig config_;
-  CURLM *multi_ = nullptr;
-  std::unordered_map<CURL *, OssOp *> inflight_;  /**< easy handle -> op */
 };
 
 }  // namespace clio::run::bdev

@@ -39,9 +39,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "http_object_store_client.h"
 
 namespace clio::run::bdev {
 
@@ -85,39 +86,59 @@ struct AzureConfig {
   static AzureConfig FromEnvAndPoolName(const std::string &pool_name);
 };
 
-/** Outcome of a completed async Azure Blob operation. */
-struct AzureResult {
-  long http_status = 0;    /**< HTTP status code (0 if the transport failed) */
-  size_t bytes = 0;        /**< Bytes transferred (PUT body or GET payload) */
-  bool not_found = false;  /**< True when a GET/op returned HTTP 404 */
-  bool ok = false;         /**< True on a 2xx response with no transport error */
-};
+/** Backward-compatible alias for the unified result type. */
+using AzureResult = ObjectStoreResult;
 
 /**
  * Minimal async Azure Blob client over libcurl's multi interface + a Shared Key
- * signer (OpenSSL HMAC-SHA256 over a base64-decoded account key). One instance
- * is owned per bdev worker because a CURLM handle is not safe to share across
- * threads. The submit/poll surface mirrors ctp::AsyncIO (and the S3 client) so
- * the bdev coroutines yield-while-polling exactly as the file backend does.
+ * signer (OpenSSL HMAC-SHA256 over a base64-decoded account key). The
+ * libcurl-multi transport and poll loop live in the HttpObjectStoreClient base;
+ * this subclass adds Azure's request construction, Shared Key signing, and the
+ * Block-Blob-vs-Page-Blob offset mapping. One instance is owned per bdev worker
+ * because a CURLM handle is not safe to share across threads.
  *
- * Two object mappings are supported:
+ * Two object mappings are supported (selected by the `is_page` ctor argument):
  *  - Block Blob: each allocator block maps to one immutable blob keyed by its
  *    byte offset (s3backer model; see KeyForOffset). Sub-block writes would RMW.
  *  - Page Blob: the whole device maps to ONE page blob (see DeviceKey) that
  *    supports 512-byte-aligned in-place writes at arbitrary offsets (Put Page).
+ * The offset->mapping decision lives entirely here, so the bdev runtime drives
+ * both modes through the common WriteAsync/ReadAsync interface.
  */
-class AzureBlobClient {
+class AzureBlobClient : public HttpObjectStoreClient {
  public:
   /**
    * @param config Resolved endpoint/account/container/credentials.
+   * @param is_page True for the Page Blob mapping (kAzurePage), false for the
+   *               Block Blob mapping (kAzure).
    */
-  explicit AzureBlobClient(const AzureConfig &config);
-  ~AzureBlobClient();
-  AzureBlobClient(const AzureBlobClient &) = delete;
-  AzureBlobClient &operator=(const AzureBlobClient &) = delete;
+  explicit AzureBlobClient(const AzureConfig &config, bool is_page = false);
 
   /** @return true when the config is valid and the curl multi handle exists. */
-  bool IsValid() const { return config_.valid && multi_ != nullptr; }
+  bool IsValid() const override { return config_.valid && MultiOk(); }
+
+  /**
+   * Prepare the container and, for Page Blob, the device blob of `capacity`.
+   * @param capacity Logical device capacity in bytes (used by Page Blob only).
+   * @return true on success.
+   */
+  bool Bootstrap(uint64_t capacity) override;
+
+  /**
+   * Submit an async write of the block at `offset`. Block Blob: a whole-object
+   * PUT keyed by offset. Page Blob: an in-place 512-aligned Put Page into the
+   * device blob (a sub-512 tail is zero-padded).
+   */
+  void *WriteAsync(uint64_t offset, const void *buf, size_t len) override;
+
+  /**
+   * Submit an async read of the block at `offset`. Block Blob: a whole-object
+   * GET. Page Blob: a ranged GET from the device blob.
+   */
+  void *ReadAsync(uint64_t offset, void *buf, size_t len) override;
+
+  /** Both mappings client-zero-fill short reads (page blobs pre-exist). */
+  ReadFill GetReadFill() const override { return ReadFill::kZeroFilled; }
 
   /**
    * Synchronously create the target container (idempotent).
@@ -161,15 +182,6 @@ class AzureBlobClient {
                  size_t range_len, bool use_range);
 
   /**
-   * Drive in-flight transfers and report whether `token`'s op has finished.
-   * On a true return, `out` is populated and the op is freed (token invalid).
-   * @param token An op token from a *Async method.
-   * @param out Filled with the result when the op completes.
-   * @return true if the op completed this call; false if still in flight.
-   */
-  bool IsComplete(void *token, AzureResult &out);
-
-  /**
    * Map a block byte offset to a stable block-blob key (prefix + "blk_<off>").
    * @param offset Block offset within the logical device.
    * @return The full blob key for that block.
@@ -182,9 +194,8 @@ class AzureBlobClient {
    */
   std::string DeviceKey() const;
 
-  /** Per-request op state (defined in the .cc; public so the libcurl
-   *  read/write trampolines can reach its fields). Treat as opaque. */
-  struct AzureOp;
+ protected:
+  const char *LogTag() const override { return "Azure"; }
 
  private:
   /** A canonicalized query parameter (lowercase name, value). */
@@ -219,8 +230,11 @@ class AzureBlobClient {
                        const std::vector<QueryParam> &query) const;
 
   AzureConfig config_;
-  CURLM *multi_ = nullptr;
-  std::unordered_map<CURL *, AzureOp *> inflight_;  /**< easy handle -> op */
+  bool is_page_ = false;     /**< Page Blob mapping (kAzurePage) vs Block Blob */
+  // Scratch buffer reused to zero-pad a sub-512 page-write tail. Safe to reuse
+  // per call because the bdev drives one op to completion per worker before the
+  // next block (single in-flight per worker); it must outlive the async op.
+  std::vector<char> pad_;
 };
 
 }  // namespace clio::run::bdev

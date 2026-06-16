@@ -39,7 +39,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
+
+#include "http_object_store_client.h"
 
 namespace clio::run::bdev {
 
@@ -82,38 +83,42 @@ struct GcsConfig {
   static GcsConfig FromEnvAndPoolName(const std::string &pool_name);
 };
 
-/** Outcome of a completed async GCS operation. */
-struct GcsResult {
-  long http_status = 0;    /**< HTTP status code (0 if the transport failed) */
-  size_t bytes = 0;        /**< Bytes transferred (upload body or download payload) */
-  bool not_found = false;  /**< True when a download returned HTTP 404 */
-  bool ok = false;         /**< True on a 2xx response with no transport error */
-};
+/** Backward-compatible alias for the unified result type. */
+using GcsResult = ObjectStoreResult;
 
 /**
  * Minimal async Google Cloud Storage client over libcurl's multi interface,
- * speaking the GCS JSON API. One instance is owned per bdev worker because a
- * CURLM handle is not safe to share across threads. The submit/poll surface
- * mirrors ctp::AsyncIO (and S3Client) so the bdev coroutines yield-while-poll
- * exactly as the file backend does.
+ * speaking the GCS JSON API. The libcurl-multi transport and poll loop live in
+ * the HttpObjectStoreClient base; this subclass adds only GCS's request
+ * construction and OAuth2 bearer auth. One instance is owned per bdev worker
+ * because a CURLM handle is not safe to share across threads.
  *
  * Object mapping is the s3backer model (same as kS3): each allocator block
  * maps to one object keyed by its byte offset (see KeyForOffset). Writes use a
  * simple media upload (POST .../o?uploadType=media&name=KEY); reads use
  * GET .../o/KEY?alt=media; a 404 read is treated as a zero (sparse) block.
  */
-class GcsClient {
+class GcsClient : public HttpObjectStoreClient {
  public:
   /**
    * @param config Resolved endpoint/bucket/token for this client.
    */
   explicit GcsClient(const GcsConfig &config);
-  ~GcsClient();
-  GcsClient(const GcsClient &) = delete;
-  GcsClient &operator=(const GcsClient &) = delete;
 
   /** @return true when the config is valid and the curl multi handle exists. */
-  bool IsValid() const { return config_.valid && multi_ != nullptr; }
+  bool IsValid() const override { return config_.valid && MultiOk(); }
+
+  /** Create the target bucket (idempotent). @param capacity Unused. */
+  bool Bootstrap(uint64_t capacity) override;
+
+  /** Submit an async media upload for the block at `offset`. */
+  void *WriteAsync(uint64_t offset, const void *buf, size_t len) override;
+
+  /** Submit an async media download for the block at `offset`. */
+  void *ReadAsync(uint64_t offset, void *buf, size_t len) override;
+
+  /** GCS objects are immutable/whole-object; never-written blocks 404. */
+  ReadFill GetReadFill() const override { return ReadFill::kSparse404; }
 
   /**
    * Synchronously create the target bucket (idempotent).
@@ -122,37 +127,14 @@ class GcsClient {
   bool EnsureBucket();
 
   /**
-   * Submit an async media upload of `len` bytes from `buf` to object `key`.
-   * The caller must keep `buf` alive until IsComplete() returns true.
-   * @return Opaque op token to poll with IsComplete(), or nullptr on failure.
-   */
-  void *PutAsync(const std::string &key, const void *buf, size_t len);
-
-  /**
-   * Submit an async download of object `key` into `buf` (capacity `cap` bytes).
-   * @return Opaque op token to poll with IsComplete(), or nullptr on failure.
-   */
-  void *GetAsync(const std::string &key, void *buf, size_t cap);
-
-  /**
-   * Drive in-flight transfers and report whether `token`'s op has finished.
-   * On a true return, `out` is populated and the op is freed (token invalid).
-   * @param token An op token from PutAsync/GetAsync.
-   * @param out Filled with the result when the op completes.
-   * @return true if the op completed this call; false if still in flight.
-   */
-  bool IsComplete(void *token, GcsResult &out);
-
-  /**
    * Map a block byte offset to a stable object name (prefix + "blk_<offset>").
    * @param offset Block offset within the logical device.
    * @return The full (unencoded) object name for that block.
    */
   std::string KeyForOffset(uint64_t offset) const;
 
-  /** Per-request op state (defined in the .cc; public so the libcurl
-   *  read/write trampolines can reach its fields). Treat as opaque. */
-  struct GcsOp;
+ protected:
+  const char *LogTag() const override { return "Gcs"; }
 
  private:
   /**
@@ -163,8 +145,6 @@ class GcsClient {
   curl_slist *BuildHeaders(const std::string &content_type) const;
 
   GcsConfig config_;
-  CURLM *multi_ = nullptr;
-  std::unordered_map<CURL *, GcsOp *> inflight_;  /**< easy handle -> op */
 };
 
 }  // namespace clio::run::bdev

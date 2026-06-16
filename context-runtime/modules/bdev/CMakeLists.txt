@@ -57,6 +57,21 @@ if(CLIO_CORE_ENABLE_OSS)
   message(STATUS "bdev: OSS backend enabled (libcurl + OpenSSL OSS V1 HMAC-SHA1)")
 endif()
 
+# Shared cloud seam (compiled whenever ANY cloud provider is enabled): the
+# provider-agnostic ObjectStoreClient factory, the curl-multi transport base,
+# and the de-duplicated crypto helpers. These unify the four provider clients
+# behind one interface (the C++ factory-pattern prototype).
+set(BDEV_ANY_CLOUD OFF)
+if(CLIO_CORE_ENABLE_S3 OR CLIO_CORE_ENABLE_GCS OR CLIO_CORE_ENABLE_AZURE OR
+   CLIO_CORE_ENABLE_OSS)
+  set(BDEV_ANY_CLOUD ON)
+  list(APPEND BDEV_RUNTIME_EXTRA_SOURCES
+    src/cloud_crypto.cc
+    src/http_object_store_client.cc
+    src/object_store_factory.cc)
+  message(STATUS "bdev: cloud object-store seam enabled (factory + shared transport)")
+endif()
+
 # Client library — ctp::aio provides async I/O headers via its INTERFACE includes.
 # LIB_NAME pins the library to `clio_bdev_client` (the new brand-aligned
 # name); ALIAS keeps `chimaera_bdev_client` working as a CMake target for
@@ -102,6 +117,11 @@ if(CLIO_CORE_ENABLE_AZURE AND TARGET clio_bdev_runtime)
 endif()
 if(CLIO_CORE_ENABLE_OSS AND TARGET clio_bdev_runtime)
   target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_BDEV_OSS_ENABLED=1)
+endif()
+# Aggregate guard: the runtime + factory + shared transport are provider-
+# agnostic and only need to know that SOME cloud backend is compiled in.
+if(BDEV_ANY_CLOUD AND TARGET clio_bdev_runtime)
+  target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_BDEV_ANY_CLOUD_ENABLED=1)
 endif()
 
 # SYCL HBM bdev support: a separate task. Adding -fsycl to

@@ -528,169 +528,46 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   // are kFile / kRam / kNoop. PutBlob/GetBlob with HBM-resident
   // ShmPtr data buffers route through kRam (or kFile) and the bdev
   // staging path uses ctp::DeviceAwareMemcpy / IsDevicePointer.
-  } else if (bdev_type_ == BdevType::kS3) {
-#if defined(CLIO_BDEV_S3_ENABLED)
-    // S3 object-store backend. capacity is required (the object store has no
-    // intrinsic device size to stat, and the heap allocator needs a bound).
+  } else if (bdev_type_ == BdevType::kS3 || bdev_type_ == BdevType::kGcs ||
+             bdev_type_ == BdevType::kAzure ||
+             bdev_type_ == BdevType::kAzurePage ||
+             bdev_type_ == BdevType::kOss) {
+#if defined(CLIO_BDEV_ANY_CLOUD_ENABLED)
+    // Cloud object-store backend (S3/GCS/Azure Block+Page/OSS). capacity is
+    // required (the object store has no intrinsic device size to stat, and the
+    // heap allocator needs a bound). The factory resolves the provider client
+    // from the pool name + environment; Bootstrap creates the bucket/container
+    // (and, for an Azure page blob, the device blob) up front with a temporary
+    // synchronous client so the first I/O doesn't race.
     if (params.total_size_ == 0) {
-      HLOG(kError, "S3 bdev '{}' requires a non-zero capacity", pool_name);
+      HLOG(kError, "Cloud bdev '{}' requires a non-zero capacity", pool_name);
       task->return_code_ = 4;
       CLIO_CO_RETURN;
     }
-    s3_config_ = S3Config::FromEnvAndPoolName(pool_name);
-    if (!s3_config_.valid) {
-      task->return_code_ = 5;
-      CLIO_CO_RETURN;
-    }
-    // Create the bucket up front with a temporary (synchronous) client so the
-    // first write doesn't race bucket creation.
     {
-      S3Client setup_client(s3_config_);
-      if (!setup_client.IsValid() || !setup_client.EnsureBucket()) {
-        HLOG(kError, "Failed to initialize S3 bucket for '{}'", pool_name);
+      auto setup_client = MakeObjectStoreClient(bdev_type_, pool_name);
+      if (!setup_client || !setup_client->IsValid()) {
+        task->return_code_ = 5;
+        CLIO_CO_RETURN;
+      }
+      if (!setup_client->Bootstrap(params.total_size_)) {
+        HLOG(kError, "Failed to initialize cloud store for '{}'", pool_name);
         task->return_code_ = 6;
         CLIO_CO_RETURN;
       }
     }
-    // Per-worker clients are created lazily on first I/O (one CURLM each).
+    // Per-worker clients are created lazily on first I/O (one CURLM each); the
+    // captured pool name lets the factory reconstruct them.
+    cloud_pool_name_ = pool_name;
     chi::WorkOrchestrator *wo = CLIO_WORK_ORCHESTRATOR;
     size_t num_workers = wo ? wo->GetWorkerCount() : 16;
-    worker_s3_clients_.resize(num_workers);
+    worker_cloud_clients_.resize(num_workers);
     file_size_ = params.total_size_;
-    HLOG(kInfo,
-         "S3 bdev ready: bucket='{}' prefix='{}' endpoint='{}' capacity={}",
-         s3_config_.bucket, s3_config_.prefix, s3_config_.endpoint, file_size_);
-#else
-    HLOG(kError, "S3 bdev requested but built without CLIO_CORE_ENABLE_S3");
-    task->return_code_ = 7;
-    CLIO_CO_RETURN;
-#endif
-  } else if (bdev_type_ == BdevType::kGcs) {
-#if defined(CLIO_BDEV_GCS_ENABLED)
-    // Google Cloud Storage backend. capacity is required (the object store has
-    // no intrinsic device size, and the heap allocator needs a bound).
-    if (params.total_size_ == 0) {
-      HLOG(kError, "GCS bdev '{}' requires a non-zero capacity", pool_name);
-      task->return_code_ = 4;
-      CLIO_CO_RETURN;
-    }
-    gcs_config_ = GcsConfig::FromEnvAndPoolName(pool_name);
-    if (!gcs_config_.valid) {
-      task->return_code_ = 5;
-      CLIO_CO_RETURN;
-    }
-    // Create the bucket up front with a temporary (synchronous) client so the
-    // first write doesn't race bucket creation.
-    {
-      GcsClient setup_client(gcs_config_);
-      if (!setup_client.IsValid() || !setup_client.EnsureBucket()) {
-        HLOG(kError, "Failed to initialize GCS bucket for '{}'", pool_name);
-        task->return_code_ = 6;
-        CLIO_CO_RETURN;
-      }
-    }
-    // Per-worker clients are created lazily on first I/O (one CURLM each).
-    chi::WorkOrchestrator *wo = CLIO_WORK_ORCHESTRATOR;
-    size_t num_workers = wo ? wo->GetWorkerCount() : 16;
-    worker_gcs_clients_.resize(num_workers);
-    file_size_ = params.total_size_;
-    HLOG(kInfo,
-         "GCS bdev ready: bucket='{}' prefix='{}' endpoint='{}' capacity={}",
-         gcs_config_.bucket, gcs_config_.prefix, gcs_config_.endpoint,
+    HLOG(kInfo, "Cloud bdev ready: pool='{}' capacity={}", pool_name,
          file_size_);
 #else
-    HLOG(kError, "GCS bdev requested but built without CLIO_CORE_ENABLE_GCS");
-    task->return_code_ = 7;
-    CLIO_CO_RETURN;
-#endif
-  } else if (bdev_type_ == BdevType::kAzure ||
-             bdev_type_ == BdevType::kAzurePage) {
-#if defined(CLIO_BDEV_AZURE_ENABLED)
-    // Azure Blob backend. capacity is required (the object store has no
-    // intrinsic device size, and the heap allocator needs a bound).
-    if (params.total_size_ == 0) {
-      HLOG(kError, "Azure bdev '{}' requires a non-zero capacity", pool_name);
-      task->return_code_ = 4;
-      CLIO_CO_RETURN;
-    }
-    azure_is_page_ = (bdev_type_ == BdevType::kAzurePage);
-    azure_config_ = AzureConfig::FromEnvAndPoolName(pool_name);
-    if (!azure_config_.valid) {
-      task->return_code_ = 5;
-      CLIO_CO_RETURN;
-    }
-    // Create the container (and, for Page Blob, the single device blob) up
-    // front with a temporary synchronous client so the first I/O doesn't race.
-    {
-      AzureBlobClient setup_client(azure_config_);
-      if (!setup_client.IsValid() || !setup_client.EnsureContainer()) {
-        HLOG(kError, "Failed to initialize Azure container for '{}'",
-             pool_name);
-        task->return_code_ = 6;
-        CLIO_CO_RETURN;
-      }
-      if (azure_is_page_) {
-        azure_device_key_ = setup_client.DeviceKey();
-        if (!setup_client.CreatePageBlob(azure_device_key_,
-                                         params.total_size_)) {
-          HLOG(kError, "Failed to create Azure page blob for '{}'", pool_name);
-          task->return_code_ = 6;
-          CLIO_CO_RETURN;
-        }
-      }
-    }
-    // Per-worker clients are created lazily on first I/O (one CURLM each).
-    chi::WorkOrchestrator *wo = CLIO_WORK_ORCHESTRATOR;
-    size_t num_workers = wo ? wo->GetWorkerCount() : 16;
-    worker_azure_clients_.resize(num_workers);
-    file_size_ = params.total_size_;
-    HLOG(kInfo,
-         "Azure bdev ready: type={} container='{}' prefix='{}' endpoint='{}' "
-         "capacity={}",
-         azure_is_page_ ? "page" : "block", azure_config_.container,
-         azure_config_.prefix, azure_config_.endpoint, file_size_);
-#else
-    HLOG(kError, "Azure bdev requested but built without CLIO_CORE_ENABLE_AZURE");
-    task->return_code_ = 7;
-    CLIO_CO_RETURN;
-#endif
-  } else if (bdev_type_ == BdevType::kOss) {
-#if defined(CLIO_BDEV_OSS_ENABLED)
-    // Alibaba Cloud OSS backend. capacity is required (the object store has no
-    // intrinsic device size to stat, and the heap allocator needs a bound).
-    if (params.total_size_ == 0) {
-      HLOG(kError, "OSS bdev '{}' requires a non-zero capacity", pool_name);
-      task->return_code_ = 4;
-      CLIO_CO_RETURN;
-    }
-    oss_config_ = OssConfig::FromEnvAndPoolName(pool_name);
-    if (!oss_config_.valid) {
-      task->return_code_ = 5;
-      CLIO_CO_RETURN;
-    }
-    // Create the bucket up front with a temporary (synchronous) client so the
-    // first write doesn't race bucket creation.
-    {
-      OssClient setup_client(oss_config_);
-      if (!setup_client.IsValid() || !setup_client.EnsureBucket()) {
-        HLOG(kError, "Failed to initialize OSS bucket for '{}'", pool_name);
-        task->return_code_ = 6;
-        CLIO_CO_RETURN;
-      }
-    }
-    // Per-worker clients are created lazily on first I/O (one CURLM each).
-    chi::WorkOrchestrator *wo = CLIO_WORK_ORCHESTRATOR;
-    size_t num_workers = wo ? wo->GetWorkerCount() : 16;
-    worker_oss_clients_.resize(num_workers);
-    file_size_ = params.total_size_;
-    HLOG(kInfo,
-         "OSS bdev ready: bucket='{}' prefix='{}' endpoint='{}' sig={} "
-         "capacity={}",
-         oss_config_.bucket, oss_config_.prefix, oss_config_.endpoint,
-         (oss_config_.signature == OssSignatureVersion::kS3) ? "s3" : "v1",
-         file_size_);
-#else
-    HLOG(kError, "OSS bdev requested but built without CLIO_CORE_ENABLE_OSS");
+    HLOG(kError, "Cloud bdev '{}' requested but built without cloud support",
+         pool_name);
     task->return_code_ = 7;
     CLIO_CO_RETURN;
 #endif
@@ -904,33 +781,12 @@ chi::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task,
       task->bytes_written_ = task->length_;
       break;
     case BdevType::kS3:
-#if defined(CLIO_BDEV_S3_ENABLED)
-      CLIO_CO_AWAIT(WriteToS3(task, rctx));
-#else
-      task->return_code_ = 1;
-      task->bytes_written_ = 0;
-#endif
-      break;
     case BdevType::kGcs:
-#if defined(CLIO_BDEV_GCS_ENABLED)
-      CLIO_CO_AWAIT(WriteToGcs(task, rctx));
-#else
-      task->return_code_ = 1;
-      task->bytes_written_ = 0;
-#endif
-      break;
     case BdevType::kAzure:
     case BdevType::kAzurePage:
-#if defined(CLIO_BDEV_AZURE_ENABLED)
-      CLIO_CO_AWAIT(WriteToAzure(task, rctx));
-#else
-      task->return_code_ = 1;
-      task->bytes_written_ = 0;
-#endif
-      break;
     case BdevType::kOss:
-#if defined(CLIO_BDEV_OSS_ENABLED)
-      CLIO_CO_AWAIT(WriteToOss(task, rctx));
+#if defined(CLIO_BDEV_ANY_CLOUD_ENABLED)
+      CLIO_CO_AWAIT(WriteToCloud(task, rctx));
 #else
       task->return_code_ = 1;
       task->bytes_written_ = 0;
@@ -967,33 +823,12 @@ chi::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task,
       task->bytes_read_ = task->length_;
       break;
     case BdevType::kS3:
-#if defined(CLIO_BDEV_S3_ENABLED)
-      CLIO_CO_AWAIT(ReadFromS3(task, rctx));
-#else
-      task->return_code_ = 1;
-      task->bytes_read_ = 0;
-#endif
-      break;
     case BdevType::kGcs:
-#if defined(CLIO_BDEV_GCS_ENABLED)
-      CLIO_CO_AWAIT(ReadFromGcs(task, rctx));
-#else
-      task->return_code_ = 1;
-      task->bytes_read_ = 0;
-#endif
-      break;
     case BdevType::kAzure:
     case BdevType::kAzurePage:
-#if defined(CLIO_BDEV_AZURE_ENABLED)
-      CLIO_CO_AWAIT(ReadFromAzure(task, rctx));
-#else
-      task->return_code_ = 1;
-      task->bytes_read_ = 0;
-#endif
-      break;
     case BdevType::kOss:
-#if defined(CLIO_BDEV_OSS_ENABLED)
-      CLIO_CO_AWAIT(ReadFromOss(task, rctx));
+#if defined(CLIO_BDEV_ANY_CLOUD_ENABLED)
+      CLIO_CO_AWAIT(ReadFromCloud(task, rctx));
 #else
       task->return_code_ = 1;
       task->bytes_read_ = 0;
@@ -1170,383 +1005,20 @@ chi::TaskResume Runtime::ReadFromFile(ctp::ipc::FullPtr<ReadTask> task,
   CLIO_TASK_BODY_END
 }
 
-#if defined(CLIO_BDEV_S3_ENABLED)
-S3Client *Runtime::GetWorkerS3Client(size_t worker_id) {
-  if (worker_id >= worker_s3_clients_.size()) {
-    HLOG(kWarning, "S3 worker ID {} exceeds pre-allocated size {}", worker_id,
-         worker_s3_clients_.size());
+#if defined(CLIO_BDEV_ANY_CLOUD_ENABLED)
+ObjectStoreClient *Runtime::GetWorkerCloudClient(size_t worker_id) {
+  if (worker_id >= worker_cloud_clients_.size()) {
+    HLOG(kWarning, "Cloud worker ID {} exceeds pre-allocated size {}",
+         worker_id, worker_cloud_clients_.size());
     return nullptr;
   }
-  auto &slot = worker_s3_clients_[worker_id];
+  auto &slot = worker_cloud_clients_[worker_id];
   if (!slot) {
-    // Lazy per-worker init: each client owns its own curl multi handle.
-    slot = std::make_unique<S3Client>(s3_config_);
-    if (!slot->IsValid()) {
-      HLOG(kError, "Failed to initialize S3 client for worker {}", worker_id);
-      slot.reset();
-      return nullptr;
-    }
-  }
-  return slot.get();
-}
-
-chi::TaskResume Runtime::WriteToS3(ctp::ipc::FullPtr<WriteTask> task,
-                                   chi::RunContext &ctx) {
-  chi::RunContext &rctx = ctx;
-  CLIO_TASK_BODY_BEGIN
-  size_t worker_id = GetWorkerID(rctx);
-  S3Client *s3 = GetWorkerS3Client(worker_id);
-
-  auto *ipc_mgr = CLIO_IPC;
-  ctp::ipc::FullPtr<char> data_ptr =
-      ipc_mgr->ToFullPtr(task->data_).Cast<char>();
-
-  // Stage device-USM data through a host buffer (libcurl reads host memory).
-  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
-  if (data_on_device) {
-    staging.resize(task->length_);
-    ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
-  }
-
-  chi::u64 total_bytes_written = 0;
-  chi::u64 data_offset = 0;
-
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
-    const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_written;
-    if (remaining == 0) break;
-    chi::u64 block_write_size = std::min(remaining, block.size_);
-
-    void *block_data = data_on_device
-                           ? static_cast<void *>(staging.data() + data_offset)
-                           : static_cast<void *>(data_ptr.ptr_ + data_offset);
-
-    if (s3 == nullptr) {
-      HLOG(kError, "WriteToS3 called with invalid S3 client");
-      task->return_code_ = 1;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    // Mapping A: one object per block, keyed by byte offset.
-    std::string key = s3->KeyForOffset(block.offset_);
-    void *token = s3->PutAsync(key, block_data,
-                               static_cast<size_t>(block_write_size));
-    if (token == nullptr) {
-      HLOG(kError, "Failed to submit S3 PUT: key={}, size={}", key,
-           block_write_size);
-      task->return_code_ = 2;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    // Yield while the (high-latency) PUT is in flight.
-    S3Result result;
-    while (!s3->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(chi::yield(100.0));
-    }
-    if (!result.ok) {
-      HLOG(kError, "S3 PUT failed: key={}, http={}", key, result.http_status);
-      task->return_code_ = 4;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    chi::u64 actual_bytes =
-        std::min(static_cast<chi::u64>(result.bytes), block_write_size);
-    total_bytes_written += actual_bytes;
-    data_offset += actual_bytes;
-  }
-
-  task->return_code_ = 0;
-  task->bytes_written_ = total_bytes_written;
-  total_writes_.fetch_add(1);
-  total_bytes_written_.fetch_add(task->bytes_written_);
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-
-chi::TaskResume Runtime::ReadFromS3(ctp::ipc::FullPtr<ReadTask> task,
-                                    chi::RunContext &ctx) {
-  chi::RunContext &rctx = ctx;
-  CLIO_TASK_BODY_BEGIN
-  size_t worker_id = GetWorkerID(rctx);
-  S3Client *s3 = GetWorkerS3Client(worker_id);
-
-  auto *ipc_mgr = CLIO_IPC;
-  ctp::ipc::FullPtr<char> data_ptr =
-      ipc_mgr->ToFullPtr(task->data_).Cast<char>();
-
-  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
-  if (data_on_device) {
-    staging.resize(task->length_);
-  }
-
-  chi::u64 total_bytes_read = 0;
-  chi::u64 data_offset = 0;
-
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
-    const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_read;
-    if (remaining == 0) break;
-    chi::u64 block_read_size = std::min(remaining, block.size_);
-
-    void *block_data = data_on_device
-                           ? static_cast<void *>(staging.data() + data_offset)
-                           : static_cast<void *>(data_ptr.ptr_ + data_offset);
-
-    if (s3 == nullptr) {
-      HLOG(kError, "ReadFromS3 called with invalid S3 client");
-      task->return_code_ = 1;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    }
-
-    std::string key = s3->KeyForOffset(block.offset_);
-    void *token = s3->GetAsync(key, block_data,
-                               static_cast<size_t>(block_read_size));
-    if (token == nullptr) {
-      HLOG(kError, "Failed to submit S3 GET: key={}, size={}", key,
-           block_read_size);
-      task->return_code_ = 2;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    }
-
-    S3Result result;
-    while (!s3->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(chi::yield(100.0));
-    }
-
-    chi::u64 actual_bytes = 0;
-    if (result.not_found) {
-      // Never-written block reads as zeros (sparse semantics, s3backer model).
-      std::memset(block_data, 0, static_cast<size_t>(block_read_size));
-      actual_bytes = block_read_size;
-    } else if (!result.ok) {
-      HLOG(kError, "S3 GET failed: key={}, http={}", key, result.http_status);
-      task->return_code_ = 4;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    } else {
-      actual_bytes =
-          std::min(static_cast<chi::u64>(result.bytes), block_read_size);
-    }
-    total_bytes_read += actual_bytes;
-    data_offset += actual_bytes;
-  }
-
-  if (data_on_device && total_bytes_read > 0) {
-    ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
-  }
-
-  task->return_code_ = 0;
-  task->bytes_read_ = total_bytes_read;
-  total_reads_.fetch_add(1);
-  total_bytes_read_.fetch_add(total_bytes_read);
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-#endif  // CLIO_BDEV_S3_ENABLED
-
-#if defined(CLIO_BDEV_GCS_ENABLED)
-GcsClient *Runtime::GetWorkerGcsClient(size_t worker_id) {
-  if (worker_id >= worker_gcs_clients_.size()) {
-    HLOG(kWarning, "GCS worker ID {} exceeds pre-allocated size {}", worker_id,
-         worker_gcs_clients_.size());
-    return nullptr;
-  }
-  auto &slot = worker_gcs_clients_[worker_id];
-  if (!slot) {
-    // Lazy per-worker init: each client owns its own curl multi handle.
-    slot = std::make_unique<GcsClient>(gcs_config_);
-    if (!slot->IsValid()) {
-      HLOG(kError, "Failed to initialize GCS client for worker {}", worker_id);
-      slot.reset();
-      return nullptr;
-    }
-  }
-  return slot.get();
-}
-
-chi::TaskResume Runtime::WriteToGcs(ctp::ipc::FullPtr<WriteTask> task,
-                                    chi::RunContext &ctx) {
-  chi::RunContext &rctx = ctx;
-  CLIO_TASK_BODY_BEGIN
-  size_t worker_id = GetWorkerID(rctx);
-  GcsClient *gcs = GetWorkerGcsClient(worker_id);
-
-  auto *ipc_mgr = CLIO_IPC;
-  ctp::ipc::FullPtr<char> data_ptr =
-      ipc_mgr->ToFullPtr(task->data_).Cast<char>();
-
-  // Stage device-USM data through a host buffer (libcurl reads host memory).
-  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
-  if (data_on_device) {
-    staging.resize(task->length_);
-    ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
-  }
-
-  chi::u64 total_bytes_written = 0;
-  chi::u64 data_offset = 0;
-
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
-    const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_written;
-    if (remaining == 0) break;
-    chi::u64 block_write_size = std::min(remaining, block.size_);
-
-    void *block_data = data_on_device
-                           ? static_cast<void *>(staging.data() + data_offset)
-                           : static_cast<void *>(data_ptr.ptr_ + data_offset);
-
-    if (gcs == nullptr) {
-      HLOG(kError, "WriteToGcs called with invalid GCS client");
-      task->return_code_ = 1;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    // Mapping A: one object per block, keyed by byte offset.
-    std::string key = gcs->KeyForOffset(block.offset_);
-    void *token = gcs->PutAsync(key, block_data,
-                                static_cast<size_t>(block_write_size));
-    if (token == nullptr) {
-      HLOG(kError, "Failed to submit GCS upload: key={}, size={}", key,
-           block_write_size);
-      task->return_code_ = 2;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    // Yield while the (high-latency) upload is in flight.
-    GcsResult result;
-    while (!gcs->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(chi::yield(100.0));
-    }
-    if (!result.ok) {
-      HLOG(kError, "GCS upload failed: key={}, http={}", key,
-           result.http_status);
-      task->return_code_ = 4;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    chi::u64 actual_bytes =
-        std::min(static_cast<chi::u64>(result.bytes), block_write_size);
-    total_bytes_written += actual_bytes;
-    data_offset += actual_bytes;
-  }
-
-  task->return_code_ = 0;
-  task->bytes_written_ = total_bytes_written;
-  total_writes_.fetch_add(1);
-  total_bytes_written_.fetch_add(task->bytes_written_);
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-
-chi::TaskResume Runtime::ReadFromGcs(ctp::ipc::FullPtr<ReadTask> task,
-                                     chi::RunContext &ctx) {
-  chi::RunContext &rctx = ctx;
-  CLIO_TASK_BODY_BEGIN
-  size_t worker_id = GetWorkerID(rctx);
-  GcsClient *gcs = GetWorkerGcsClient(worker_id);
-
-  auto *ipc_mgr = CLIO_IPC;
-  ctp::ipc::FullPtr<char> data_ptr =
-      ipc_mgr->ToFullPtr(task->data_).Cast<char>();
-
-  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
-  if (data_on_device) {
-    staging.resize(task->length_);
-  }
-
-  chi::u64 total_bytes_read = 0;
-  chi::u64 data_offset = 0;
-
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
-    const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_read;
-    if (remaining == 0) break;
-    chi::u64 block_read_size = std::min(remaining, block.size_);
-
-    void *block_data = data_on_device
-                           ? static_cast<void *>(staging.data() + data_offset)
-                           : static_cast<void *>(data_ptr.ptr_ + data_offset);
-
-    if (gcs == nullptr) {
-      HLOG(kError, "ReadFromGcs called with invalid GCS client");
-      task->return_code_ = 1;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    }
-
-    std::string key = gcs->KeyForOffset(block.offset_);
-    void *token = gcs->GetAsync(key, block_data,
-                                static_cast<size_t>(block_read_size));
-    if (token == nullptr) {
-      HLOG(kError, "Failed to submit GCS download: key={}, size={}", key,
-           block_read_size);
-      task->return_code_ = 2;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    }
-
-    GcsResult result;
-    while (!gcs->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(chi::yield(100.0));
-    }
-
-    chi::u64 actual_bytes = 0;
-    if (result.not_found) {
-      // Never-written block reads as zeros (sparse semantics, s3backer model).
-      std::memset(block_data, 0, static_cast<size_t>(block_read_size));
-      actual_bytes = block_read_size;
-    } else if (!result.ok) {
-      HLOG(kError, "GCS download failed: key={}, http={}", key,
-           result.http_status);
-      task->return_code_ = 4;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    } else {
-      actual_bytes =
-          std::min(static_cast<chi::u64>(result.bytes), block_read_size);
-    }
-    total_bytes_read += actual_bytes;
-    data_offset += actual_bytes;
-  }
-
-  if (data_on_device && total_bytes_read > 0) {
-    ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
-  }
-
-  task->return_code_ = 0;
-  task->bytes_read_ = total_bytes_read;
-  total_reads_.fetch_add(1);
-  total_bytes_read_.fetch_add(total_bytes_read);
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-#endif  // CLIO_BDEV_GCS_ENABLED
-
-#if defined(CLIO_BDEV_AZURE_ENABLED)
-AzureBlobClient *Runtime::GetWorkerAzureClient(size_t worker_id) {
-  if (worker_id >= worker_azure_clients_.size()) {
-    HLOG(kWarning, "Azure worker ID {} exceeds pre-allocated size {}",
-         worker_id, worker_azure_clients_.size());
-    return nullptr;
-  }
-  auto &slot = worker_azure_clients_[worker_id];
-  if (!slot) {
-    // Lazy per-worker init: each client owns its own curl multi handle.
-    slot = std::make_unique<AzureBlobClient>(azure_config_);
-    if (!slot->IsValid()) {
-      HLOG(kError, "Failed to initialize Azure client for worker {}",
+    // Lazy per-worker init: the factory rebuilds the provider client from the
+    // pool name captured at Create. Each client owns its own curl multi handle.
+    slot = MakeObjectStoreClient(bdev_type_, cloud_pool_name_);
+    if (!slot || !slot->IsValid()) {
+      HLOG(kError, "Failed to initialize cloud client for worker {}",
            worker_id);
       slot.reset();
       return nullptr;
@@ -1555,12 +1027,12 @@ AzureBlobClient *Runtime::GetWorkerAzureClient(size_t worker_id) {
   return slot.get();
 }
 
-chi::TaskResume Runtime::WriteToAzure(ctp::ipc::FullPtr<WriteTask> task,
+chi::TaskResume Runtime::WriteToCloud(ctp::ipc::FullPtr<WriteTask> task,
                                       chi::RunContext &ctx) {
   chi::RunContext &rctx = ctx;
   CLIO_TASK_BODY_BEGIN
   size_t worker_id = GetWorkerID(rctx);
-  AzureBlobClient *az = GetWorkerAzureClient(worker_id);
+  ObjectStoreClient *client = GetWorkerCloudClient(worker_id);
 
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr =
@@ -1587,39 +1059,19 @@ chi::TaskResume Runtime::WriteToAzure(ctp::ipc::FullPtr<WriteTask> task,
                            ? static_cast<void *>(staging.data() + data_offset)
                            : static_cast<void *>(data_ptr.ptr_ + data_offset);
 
-    if (az == nullptr) {
-      HLOG(kError, "WriteToAzure called with invalid Azure client");
+    if (client == nullptr) {
+      HLOG(kError, "WriteToCloud called with invalid cloud client");
       task->return_code_ = 1;
       task->bytes_written_ = total_bytes_written;
       CLIO_CO_RETURN;
     }
 
-    void *token = nullptr;
-    if (azure_is_page_) {
-      // Page Blob (Mapping D): in-place Put Page into the single device blob
-      // at the block's byte offset. Azure requires 512-aligned length, so a
-      // sub-512 tail is zero-padded through a temporary aligned buffer.
-      chi::u64 page_len =
-          (block_write_size + kAzurePageSize - 1) / kAzurePageSize *
-          kAzurePageSize;
-      std::vector<char> padded;
-      void *src = block_data;
-      if (page_len != block_write_size) {
-        padded.assign(static_cast<size_t>(page_len), 0);
-        std::memcpy(padded.data(), block_data,
-                    static_cast<size_t>(block_write_size));
-        src = padded.data();
-      }
-      token = az->PutPageAsync(azure_device_key_, block.offset_, src,
-                               static_cast<size_t>(page_len));
-    } else {
-      // Block Blob (Mapping A): one object per block, keyed by byte offset.
-      std::string key = az->KeyForOffset(block.offset_);
-      token = az->PutBlockBlobAsync(key, block_data,
-                                    static_cast<size_t>(block_write_size));
-    }
+    // Offset-oriented submit: the client maps the offset onto its own object
+    // model (block->object, or in-place page) internally.
+    void *token = client->WriteAsync(block.offset_, block_data,
+                                     static_cast<size_t>(block_write_size));
     if (token == nullptr) {
-      HLOG(kError, "Failed to submit Azure write: offset={}, size={}",
+      HLOG(kError, "Failed to submit cloud write: offset={}, size={}",
            block.offset_, block_write_size);
       task->return_code_ = 2;
       task->bytes_written_ = total_bytes_written;
@@ -1627,18 +1079,20 @@ chi::TaskResume Runtime::WriteToAzure(ctp::ipc::FullPtr<WriteTask> task,
     }
 
     // Yield while the (high-latency) write is in flight.
-    AzureResult result;
-    while (!az->IsComplete(token, result)) {
+    ObjectStoreResult result;
+    while (!client->IsComplete(token, result)) {
       CLIO_CO_AWAIT(chi::yield(100.0));
     }
     if (!result.ok) {
-      HLOG(kError, "Azure write failed: offset={}, http={}", block.offset_,
+      HLOG(kError, "Cloud write failed: offset={}, http={}", block.offset_,
            result.http_status);
       task->return_code_ = 4;
       task->bytes_written_ = total_bytes_written;
       CLIO_CO_RETURN;
     }
 
+    // A 2xx whole-object PUT (or Put Page) stores exactly block_write_size user
+    // bytes, so advance by that — byte-identical across all providers.
     total_bytes_written += block_write_size;
     data_offset += block_write_size;
   }
@@ -1651,12 +1105,12 @@ chi::TaskResume Runtime::WriteToAzure(ctp::ipc::FullPtr<WriteTask> task,
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::ReadFromAzure(ctp::ipc::FullPtr<ReadTask> task,
+chi::TaskResume Runtime::ReadFromCloud(ctp::ipc::FullPtr<ReadTask> task,
                                        chi::RunContext &ctx) {
   chi::RunContext &rctx = ctx;
   CLIO_TASK_BODY_BEGIN
   size_t worker_id = GetWorkerID(rctx);
-  AzureBlobClient *az = GetWorkerAzureClient(worker_id);
+  ObjectStoreClient *client = GetWorkerCloudClient(worker_id);
 
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr =
@@ -1681,236 +1135,54 @@ chi::TaskResume Runtime::ReadFromAzure(ctp::ipc::FullPtr<ReadTask> task,
                            ? static_cast<void *>(staging.data() + data_offset)
                            : static_cast<void *>(data_ptr.ptr_ + data_offset);
 
-    if (az == nullptr) {
-      HLOG(kError, "ReadFromAzure called with invalid Azure client");
+    if (client == nullptr) {
+      HLOG(kError, "ReadFromCloud called with invalid cloud client");
       task->return_code_ = 1;
       task->bytes_read_ = total_bytes_read;
       CLIO_CO_RETURN;
     }
 
-    void *token = nullptr;
-    if (azure_is_page_) {
-      // Page Blob: ranged GET from the device blob. Unwritten pages read back
-      // as zeros automatically (the blob exists), so no 404 path is needed.
-      token = az->GetAsync(azure_device_key_, block_data,
-                           static_cast<size_t>(block_read_size), block.offset_,
-                           static_cast<size_t>(block_read_size), true);
-    } else {
-      // Block Blob: whole-object GET; a never-written block 404s -> zeros.
-      std::string key = az->KeyForOffset(block.offset_);
-      token = az->GetAsync(key, block_data,
-                           static_cast<size_t>(block_read_size), 0, 0, false);
-    }
+    void *token = client->ReadAsync(block.offset_, block_data,
+                                    static_cast<size_t>(block_read_size));
     if (token == nullptr) {
-      HLOG(kError, "Failed to submit Azure GET: offset={}, size={}",
+      HLOG(kError, "Failed to submit cloud read: offset={}, size={}",
            block.offset_, block_read_size);
       task->return_code_ = 2;
       task->bytes_read_ = total_bytes_read;
       CLIO_CO_RETURN;
     }
 
-    AzureResult result;
-    while (!az->IsComplete(token, result)) {
+    ObjectStoreResult result;
+    while (!client->IsComplete(token, result)) {
       CLIO_CO_AWAIT(chi::yield(100.0));
     }
 
+    chi::u64 advance = 0;
     if (result.not_found) {
-      // Never-written block reads as zeros (sparse semantics).
+      // Never-written block reads as zeros (sparse semantics, s3backer model).
       std::memset(block_data, 0, static_cast<size_t>(block_read_size));
+      advance = block_read_size;
     } else if (!result.ok) {
-      HLOG(kError, "Azure GET failed: offset={}, http={}", block.offset_,
+      HLOG(kError, "Cloud read failed: offset={}, http={}", block.offset_,
            result.http_status);
       task->return_code_ = 4;
       task->bytes_read_ = total_bytes_read;
       CLIO_CO_RETURN;
-    } else if (result.bytes < block_read_size) {
-      // Short read (e.g. partially written block blob): zero-fill the tail.
-      std::memset(static_cast<char *>(block_data) + result.bytes, 0,
-                  static_cast<size_t>(block_read_size - result.bytes));
-    }
-    total_bytes_read += block_read_size;
-    data_offset += block_read_size;
-  }
-
-  if (data_on_device && total_bytes_read > 0) {
-    ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
-  }
-
-  task->return_code_ = 0;
-  task->bytes_read_ = total_bytes_read;
-  total_reads_.fetch_add(1);
-  total_bytes_read_.fetch_add(total_bytes_read);
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-#endif  // CLIO_BDEV_AZURE_ENABLED
-
-#if defined(CLIO_BDEV_OSS_ENABLED)
-OssClient *Runtime::GetWorkerOssClient(size_t worker_id) {
-  if (worker_id >= worker_oss_clients_.size()) {
-    HLOG(kWarning, "OSS worker ID {} exceeds pre-allocated size {}", worker_id,
-         worker_oss_clients_.size());
-    return nullptr;
-  }
-  auto &slot = worker_oss_clients_[worker_id];
-  if (!slot) {
-    // Lazy per-worker init: each client owns its own curl multi handle.
-    slot = std::make_unique<OssClient>(oss_config_);
-    if (!slot->IsValid()) {
-      HLOG(kError, "Failed to initialize OSS client for worker {}", worker_id);
-      slot.reset();
-      return nullptr;
-    }
-  }
-  return slot.get();
-}
-
-chi::TaskResume Runtime::WriteToOss(ctp::ipc::FullPtr<WriteTask> task,
-                                    chi::RunContext &ctx) {
-  chi::RunContext &rctx = ctx;
-  CLIO_TASK_BODY_BEGIN
-  size_t worker_id = GetWorkerID(rctx);
-  OssClient *oss = GetWorkerOssClient(worker_id);
-
-  auto *ipc_mgr = CLIO_IPC;
-  ctp::ipc::FullPtr<char> data_ptr =
-      ipc_mgr->ToFullPtr(task->data_).Cast<char>();
-
-  // Stage device-USM data through a host buffer (libcurl reads host memory).
-  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
-  if (data_on_device) {
-    staging.resize(task->length_);
-    ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
-  }
-
-  chi::u64 total_bytes_written = 0;
-  chi::u64 data_offset = 0;
-
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
-    const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_written;
-    if (remaining == 0) break;
-    chi::u64 block_write_size = std::min(remaining, block.size_);
-
-    void *block_data = data_on_device
-                           ? static_cast<void *>(staging.data() + data_offset)
-                           : static_cast<void *>(data_ptr.ptr_ + data_offset);
-
-    if (oss == nullptr) {
-      HLOG(kError, "WriteToOss called with invalid OSS client");
-      task->return_code_ = 1;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    // Mapping A: one object per block, keyed by byte offset.
-    std::string key = oss->KeyForOffset(block.offset_);
-    void *token = oss->PutAsync(key, block_data,
-                                static_cast<size_t>(block_write_size));
-    if (token == nullptr) {
-      HLOG(kError, "Failed to submit OSS PUT: key={}, size={}", key,
-           block_write_size);
-      task->return_code_ = 2;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    // Yield while the (high-latency) PUT is in flight.
-    OssResult result;
-    while (!oss->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(chi::yield(100.0));
-    }
-    if (!result.ok) {
-      HLOG(kError, "OSS PUT failed: key={}, http={}", key, result.http_status);
-      task->return_code_ = 4;
-      task->bytes_written_ = total_bytes_written;
-      CLIO_CO_RETURN;
-    }
-
-    chi::u64 actual_bytes =
-        std::min(static_cast<chi::u64>(result.bytes), block_write_size);
-    total_bytes_written += actual_bytes;
-    data_offset += actual_bytes;
-  }
-
-  task->return_code_ = 0;
-  task->bytes_written_ = total_bytes_written;
-  total_writes_.fetch_add(1);
-  total_bytes_written_.fetch_add(task->bytes_written_);
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-
-chi::TaskResume Runtime::ReadFromOss(ctp::ipc::FullPtr<ReadTask> task,
-                                     chi::RunContext &ctx) {
-  chi::RunContext &rctx = ctx;
-  CLIO_TASK_BODY_BEGIN
-  size_t worker_id = GetWorkerID(rctx);
-  OssClient *oss = GetWorkerOssClient(worker_id);
-
-  auto *ipc_mgr = CLIO_IPC;
-  ctp::ipc::FullPtr<char> data_ptr =
-      ipc_mgr->ToFullPtr(task->data_).Cast<char>();
-
-  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
-  if (data_on_device) {
-    staging.resize(task->length_);
-  }
-
-  chi::u64 total_bytes_read = 0;
-  chi::u64 data_offset = 0;
-
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
-    const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_read;
-    if (remaining == 0) break;
-    chi::u64 block_read_size = std::min(remaining, block.size_);
-
-    void *block_data = data_on_device
-                           ? static_cast<void *>(staging.data() + data_offset)
-                           : static_cast<void *>(data_ptr.ptr_ + data_offset);
-
-    if (oss == nullptr) {
-      HLOG(kError, "ReadFromOss called with invalid OSS client");
-      task->return_code_ = 1;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    }
-
-    std::string key = oss->KeyForOffset(block.offset_);
-    void *token = oss->GetAsync(key, block_data,
-                                static_cast<size_t>(block_read_size));
-    if (token == nullptr) {
-      HLOG(kError, "Failed to submit OSS GET: key={}, size={}", key,
-           block_read_size);
-      task->return_code_ = 2;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    }
-
-    OssResult result;
-    while (!oss->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(chi::yield(100.0));
-    }
-
-    chi::u64 actual_bytes = 0;
-    if (result.not_found) {
-      // Never-written block reads as zeros (sparse semantics, s3backer model).
-      std::memset(block_data, 0, static_cast<size_t>(block_read_size));
-      actual_bytes = block_read_size;
-    } else if (!result.ok) {
-      HLOG(kError, "OSS GET failed: key={}, http={}", key, result.http_status);
-      task->return_code_ = 4;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
+    } else if (client->GetReadFill() ==
+               ObjectStoreClient::ReadFill::kZeroFilled) {
+      // The backing object always exists (e.g. an Azure page blob): zero-fill
+      // any short-read tail and advance by the full block.
+      if (result.bytes < block_read_size) {
+        std::memset(static_cast<char *>(block_data) + result.bytes, 0,
+                    static_cast<size_t>(block_read_size - result.bytes));
+      }
+      advance = block_read_size;
     } else {
-      actual_bytes =
-          std::min(static_cast<chi::u64>(result.bytes), block_read_size);
+      // Whole-object backends: advance by the bytes actually returned.
+      advance = std::min(static_cast<chi::u64>(result.bytes), block_read_size);
     }
-    total_bytes_read += actual_bytes;
-    data_offset += actual_bytes;
+    total_bytes_read += advance;
+    data_offset += advance;
   }
 
   if (data_on_device && total_bytes_read > 0) {
@@ -1924,7 +1196,7 @@ chi::TaskResume Runtime::ReadFromOss(ctp::ipc::FullPtr<ReadTask> task,
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
-#endif  // CLIO_BDEV_OSS_ENABLED
+#endif  // CLIO_BDEV_ANY_CLOUD_ENABLED
 
 chi::TaskResume Runtime::Update(ctp::ipc::FullPtr<UpdateTask> task,
                                 chi::RunContext &ctx) {

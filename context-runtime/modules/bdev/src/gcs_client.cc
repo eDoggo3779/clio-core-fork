@@ -47,11 +47,12 @@
 #include <vector>
 
 #include "clio_ctp/util/logging.h"
+#include "clio_runtime/bdev/cloud_crypto.h"
 
 namespace clio::run::bdev {
 
 //===========================================================================
-// Encoding helpers
+// Encoding helpers (GCS-specific; shared crypto lives in cloud_crypto.h)
 //===========================================================================
 
 /**
@@ -107,17 +108,6 @@ static std::string Base64Url(const unsigned char *data, size_t len) {
 /** Convenience overload taking a std::string payload. */
 static std::string Base64Url(const std::string &s) {
   return Base64Url(reinterpret_cast<const unsigned char *>(s.data()), s.size());
-}
-
-/**
- * Read an environment variable, returning a default when unset/empty.
- * @param name Variable name.
- * @param def Fallback value.
- * @return The value or `def`.
- */
-static std::string EnvOr(const char *name, const std::string &def) {
-  const char *v = std::getenv(name);
-  return (v && *v) ? std::string(v) : def;
 }
 
 /** libcurl write callback that appends the response body to a std::string. */
@@ -271,12 +261,12 @@ static std::string FetchTokenViaJwt(const std::string &sa_json_path) {
  * @return The bearer token, or "" for anonymous access.
  */
 static std::string ResolveAccessToken() {
-  std::string explicit_tok = EnvOr("GCS_ACCESS_TOKEN", "");
+  std::string explicit_tok = cloud::EnvOr("GCS_ACCESS_TOKEN", "");
   if (!explicit_tok.empty()) {
     HLOG(kInfo, "GCS auth: using GCS_ACCESS_TOKEN from environment");
     return explicit_tok;
   }
-  std::string sa = EnvOr("GOOGLE_APPLICATION_CREDENTIALS", "");
+  std::string sa = cloud::EnvOr("GOOGLE_APPLICATION_CREDENTIALS", "");
   if (!sa.empty()) return FetchTokenViaJwt(sa);
   HLOG(kInfo, "GCS auth: no credentials set — using anonymous access");
   return "";
@@ -303,8 +293,8 @@ GcsConfig GcsConfig::FromEnvAndPoolName(const std::string &pool_name) {
     return cfg;
   }
 
-  cfg.endpoint = EnvOr("GCS_ENDPOINT", "https://storage.googleapis.com");
-  cfg.project_id = EnvOr("GCS_PROJECT_ID", "clio-prototype");
+  cfg.endpoint = cloud::EnvOr("GCS_ENDPOINT", "https://storage.googleapis.com");
+  cfg.project_id = cloud::EnvOr("GCS_PROJECT_ID", "clio-prototype");
   cfg.access_token = ResolveAccessToken();
 
   // Split endpoint into scheme + host[:port].
@@ -326,51 +316,6 @@ GcsConfig GcsConfig::FromEnvAndPoolName(const std::string &pool_name) {
 // GcsOp + libcurl callbacks
 //===========================================================================
 
-/** Per-request state for one in-flight async operation. */
-struct GcsClient::GcsOp {
-  CURL *easy = nullptr;            /**< Owning curl easy handle */
-  curl_slist *headers = nullptr;   /**< Request headers (owned) */
-  bool is_get = false;            /**< true for download, false for upload */
-  bool finished = false;          /**< Set when the transfer completes */
-  CURLcode curl_code = CURLE_OK;  /**< Transport-level result */
-  std::string key;                /**< Object name (for logging) */
-  // Upload source
-  const char *src = nullptr;
-  size_t len = 0;
-  size_t sent = 0;
-  // Download destination
-  char *dst = nullptr;
-  size_t cap = 0;
-  size_t written = 0;
-  std::chrono::high_resolution_clock::time_point start;
-};
-
-/** libcurl read callback: stream the upload body out of op->src. */
-static size_t GcsReadCb(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  auto *op = static_cast<GcsClient::GcsOp *>(userdata);
-  size_t want = size * nmemb;
-  size_t remaining = op->len - op->sent;
-  size_t n = std::min(want, remaining);
-  if (n > 0) {
-    std::memcpy(ptr, op->src + op->sent, n);
-    op->sent += n;
-  }
-  return n;
-}
-
-/** libcurl write callback: capture the download body into op->dst (bounded). */
-static size_t GcsWriteCb(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  auto *op = static_cast<GcsClient::GcsOp *>(userdata);
-  size_t n = size * nmemb;
-  size_t space = (op->written < op->cap) ? (op->cap - op->written) : 0;
-  size_t c = std::min(n, space);
-  if (c > 0) {
-    std::memcpy(op->dst + op->written, ptr, c);
-    op->written += c;
-  }
-  return n;  // Always consume so curl doesn't abort on overflow.
-}
-
 /** libcurl write callback that discards the body (upload JSON response). */
 static size_t GcsDiscardCb(char *, size_t size, size_t nmemb, void *) {
   return size * nmemb;
@@ -380,25 +325,7 @@ static size_t GcsDiscardCb(char *, size_t size, size_t nmemb, void *) {
 // GcsClient lifecycle
 //===========================================================================
 
-GcsClient::GcsClient(const GcsConfig &config) : config_(config) {
-  if (!config_.valid) return;
-  multi_ = curl_multi_init();
-  if (multi_ == nullptr) {
-    HLOG(kError, "Failed to create curl multi handle for GCS client");
-  }
-}
-
-GcsClient::~GcsClient() {
-  for (auto &kv : inflight_) {
-    GcsOp *op = kv.second;
-    if (multi_ && op->easy) curl_multi_remove_handle(multi_, op->easy);
-    if (op->easy) curl_easy_cleanup(op->easy);
-    if (op->headers) curl_slist_free_all(op->headers);
-    delete op;
-  }
-  inflight_.clear();
-  if (multi_) curl_multi_cleanup(multi_);
-}
+GcsClient::GcsClient(const GcsConfig &config) : config_(config) {}
 
 std::string GcsClient::KeyForOffset(uint64_t offset) const {
   std::string key = "blk_" + std::to_string(offset);
@@ -422,6 +349,8 @@ curl_slist *GcsClient::BuildHeaders(const std::string &content_type) const {
 //===========================================================================
 // Bucket creation (synchronous)
 //===========================================================================
+
+bool GcsClient::Bootstrap(uint64_t /*capacity*/) { return EnsureBucket(); }
 
 bool GcsClient::EnsureBucket() {
   if (!IsValid()) return false;
@@ -453,13 +382,15 @@ bool GcsClient::EnsureBucket() {
 }
 
 //===========================================================================
-// Async submit + poll
+// Async submit (offset-oriented; poll via the shared base IsComplete)
 //===========================================================================
 
-void *GcsClient::PutAsync(const std::string &key, const void *buf, size_t len) {
+void *GcsClient::WriteAsync(uint64_t offset, const void *buf, size_t len) {
   if (!IsValid()) return nullptr;
-  auto *op = new GcsOp();
+  std::string key = KeyForOffset(offset);
+  auto *op = new Op();
   op->is_get = false;
+  op->op_label = "PUT";
   op->key = key;
   op->src = static_cast<const char *>(buf);
   op->len = len;
@@ -478,21 +409,21 @@ void *GcsClient::PutAsync(const std::string &key, const void *buf, size_t len) {
   curl_easy_setopt(op->easy, CURLOPT_POST, 1L);
   curl_easy_setopt(op->easy, CURLOPT_POSTFIELDSIZE_LARGE,
                    static_cast<curl_off_t>(len));
-  curl_easy_setopt(op->easy, CURLOPT_READFUNCTION, GcsReadCb);
+  curl_easy_setopt(op->easy, CURLOPT_READFUNCTION, &HttpObjectStoreClient::ReadCb);
   curl_easy_setopt(op->easy, CURLOPT_READDATA, op);
   curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION, GcsDiscardCb);
-  curl_multi_add_handle(multi_, op->easy);
-  inflight_[op->easy] = op;
-  return op;
+  return Submit(op);
 }
 
-void *GcsClient::GetAsync(const std::string &key, void *buf, size_t cap) {
+void *GcsClient::ReadAsync(uint64_t offset, void *buf, size_t len) {
   if (!IsValid()) return nullptr;
-  auto *op = new GcsOp();
+  std::string key = KeyForOffset(offset);
+  auto *op = new Op();
   op->is_get = true;
+  op->op_label = "GET";
   op->key = key;
   op->dst = static_cast<char *>(buf);
-  op->cap = cap;
+  op->cap = len;
   op->start = std::chrono::high_resolution_clock::now();
   op->easy = curl_easy_init();
   if (op->easy == nullptr) {
@@ -506,57 +437,9 @@ void *GcsClient::GetAsync(const std::string &key, void *buf, size_t cap) {
   curl_easy_setopt(op->easy, CURLOPT_URL, url.c_str());
   curl_easy_setopt(op->easy, CURLOPT_HTTPHEADER, op->headers);
   curl_easy_setopt(op->easy, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION, GcsWriteCb);
+  curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION, &HttpObjectStoreClient::WriteCb);
   curl_easy_setopt(op->easy, CURLOPT_WRITEDATA, op);
-  curl_multi_add_handle(multi_, op->easy);
-  inflight_[op->easy] = op;
-  return op;
-}
-
-bool GcsClient::IsComplete(void *token, GcsResult &out) {
-  auto *target = static_cast<GcsOp *>(token);
-  if (target == nullptr || multi_ == nullptr) return true;
-
-  int running = 0;
-  curl_multi_perform(multi_, &running);
-
-  CURLMsg *msg = nullptr;
-  int in_queue = 0;
-  while ((msg = curl_multi_info_read(multi_, &in_queue)) != nullptr) {
-    if (msg->msg != CURLMSG_DONE) continue;
-    auto it = inflight_.find(msg->easy_handle);
-    if (it != inflight_.end()) {
-      it->second->finished = true;
-      it->second->curl_code = msg->data.result;
-    }
-  }
-
-  if (!target->finished) return false;
-
-  long status = 0;
-  curl_easy_getinfo(target->easy, CURLINFO_RESPONSE_CODE, &status);
-  double ms = std::chrono::duration<double, std::milli>(
-                  std::chrono::high_resolution_clock::now() - target->start)
-                  .count();
-  out.http_status = status;
-  out.not_found = (status == 404);
-  out.bytes = target->is_get ? target->written : target->sent;
-  out.ok = (target->curl_code == CURLE_OK) && (status >= 200 && status < 300);
-
-  HLOG(kInfo, "Gcs op={} key={} bytes={} http={} latency_ms={}",
-       target->is_get ? "GET" : "PUT", target->key, out.bytes, status, ms);
-  if (target->curl_code != CURLE_OK) {
-    HLOG(kError, "Gcs op={} key={} transport error curl={}",
-         target->is_get ? "GET" : "PUT", target->key,
-         static_cast<int>(target->curl_code));
-  }
-
-  curl_multi_remove_handle(multi_, target->easy);
-  curl_easy_cleanup(target->easy);
-  if (target->headers) curl_slist_free_all(target->headers);
-  inflight_.erase(target->easy);
-  delete target;
-  return true;
+  return Submit(op);
 }
 
 }  // namespace clio::run::bdev
