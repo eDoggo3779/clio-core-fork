@@ -5,9 +5,11 @@
 #
 # Pattern A: one allocation; the 45-run sweep runs in-process via
 # `jarvis ppl run yaml`. Each iteration restarts bedrock (start, wait for
-# mofka.json, create topic, run, teardown) at ~5 min/run, so 45 runs ~= 3.75 h;
-# 4 h ceiling. To resume a timed-out run, drop the `rm -f results.csv` line below
-# (jarvis skips already-completed rows) and resubmit.
+# mofka.json, create topic, run, teardown). Measured 2026-06-17: ~16s/run
+# (≈4s run + ~12s bedrock restart) → all 45 finish in ~12 min. The 4 h ceiling
+# below is deliberate over-provisioning (cold-env / verbs-init headroom), not the
+# expected runtime. To resume a timed-out run, drop the `rm -f results.csv` line
+# below (jarvis skips already-completed rows) and resubmit.
 #
 # No FI_* env exports are set here intentionally — keep the diff minimal and let
 # real failures surface. Add them only if a specific failure signature appears.

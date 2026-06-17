@@ -6,9 +6,12 @@
 # TCP-vs-RDMA comparison is meaningful. Run the smoke variant first to confirm
 # bedrock binds ofi+verbs (not a silent TCP fallback).
 #
-# Expected (and logical) result: single-node RDMA is typically SLOWER than TCP
-# here — loopback over the NIC pays PCIe/verbs traversal that kernel TCP
-# loopback skips. That delta is the signal that RDMA actually engaged.
+# Result (validated 2026-06-17 on ares-comp-14, ofi+verbs;ofi_rxm bound): on this
+# node single-node RDMA runs COMPARABLE to / slightly above TCP — not slower.
+# (The archived claude/mofka-rdma run saw RDMA 7-34% slower on a different node;
+# single-node loopback RDMA can pay NIC/PCIe traversal, so a slower result is
+# also plausible. Either way the numbers are logical — confirm the bound address
+# contains 'verbs' to know RDMA actually engaged vs a silent TCP fallback.)
 #
 # Sweep: 5 data sizes x 3 thread counts x 3 repeats = 45 runs.
 #
@@ -19,8 +22,9 @@
 # Submit with:  sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_rdma.sbatch
 # Monitor with: squeue -u $USER     Output: mofka_bench_rdma_<jobid>.log
 #
-# Time budget: 45 runs x ~5 min/run (per-iteration bedrock restart) ≈ 3.75 h.
-# 4 h ceiling leaves slack for verbs init latency and outliers.
+# Time budget: real per-run is ~16s (≈4s run + ~12s bedrock restart), so all 45
+# finish in ~12 min (measured 2026-06-17). The sbatch's 4 h ceiling is deliberate
+# over-provisioning (cold-env / verbs-init headroom), not the expected runtime.
 
 config:
   name: mofka_bench_ares_rdma
