@@ -1,0 +1,72 @@
+# Mofka Benchmark — Ares Multi-Node FULL SWEEP, 2 nodes, RDMA (ofi+verbs)
+#
+# RDMA twin of microbench_mofka_ares_multinode_2n.yaml (TCP): identical sweep
+# shape, so the CSV compares row-for-row against BOTH the TCP-2n sweep and the
+# single-node RDMA sweep (microbench_mofka_ares_rdma.yaml). The only deltas vs
+# the TCP-2n twin are protocol (tcp -> ofi+verbs), a distinct NFS workdir, and
+# the output dir.
+#
+# Topology: 1 bedrock server (batch/head node, LocalExecInfo) + 1 client node
+# (PSSH). The .sbatch sets the jarvis hostfile to both nodes; mofka_bench drops
+# the server host so producer/consumer run only on the client node. Per-host
+# stat fold (mofka_bench._fold_host_stats) SUMs throughput/events/data and MAXes
+# wall time across client hosts (degenerate single client here).
+#
+# Transport: this is the first config to put Mofka verbs ON THE WIRE. RDMA-1n
+# only dialed loopback; TCP-2n dialed cross-node but over sockets. Here the
+# client on node B reads the bedrock-bound ofi+verbs;ofi_rxm://<head>:<port>
+# address from the NFS mofka.json and connects over the RoCE fabric. Run the 2n
+# smoke FIRST — it is the real cross-node verbs proof (a fabric/QP misconfig
+# would hang as NA_TIMEOUT, distinct from the known 4n fan-in saturation).
+#
+# workdir MUST be on shared NFS ($HOME) so the client node can read mofka.json —
+# NOT /mnt/nvme (node-local, invisible to the client). Distinct -rdma- dir so a
+# concurrent TCP-2n run's bedrock rmtree can't delete this run's mofka.json.
+#
+# Sweep: 5 data sizes x 3 thread counts x 3 repeats = 45 runs.
+#
+# Pattern A: one 2-node allocation, sweep runs in-process via `jarvis ppl run
+# yaml` (no jarvis scheduler block). See pipelines/mofka/architecture_decisions.md.
+#
+# Submit with: sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_multinode_2n_rdma.sbatch
+# Output: mofka_bench_2n_rdma_<jobid>.log
+#
+# Time budget: per-iteration bedrock restart + PSSH dominate (~5 min/run), so 45
+# runs ~= 3.75 h; the sbatch's 6 h ceiling leaves slack (same as the TCP-2n twin,
+# NOT the RDMA-1n 4 h — the node-count axis sets runtime, not the transport).
+
+config:
+  name: mofka_bench_ares_multinode_2n_rdma
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+  pkgs:
+    - pkg_type: jarvis_clio_core.mofka_server
+      pkg_name: mofka_srv
+      protocol: "ofi+verbs"
+      workdir: "${HOME}/mofka-bench-rdma-tmp"
+      topic: "benchmark_topic"
+      partition_type: "memory"
+
+    - pkg_type: jarvis_clio_core.mofka_bench
+      pkg_name: mofka_bench
+      mode: "both"
+      num_events: 1000
+      data_size: 1024
+      metadata_size: 64
+      batch_size: 16
+      num_threads: 1
+      data_selectivity: 1.0
+      use_progress_thread: true
+      nprocs: 1
+      ppn: 1
+
+vars:
+  mofka_bench.data_size: [256, 1024, 4096, 16384, 65536]
+  mofka_bench.num_threads: [1, 2, 4]
+
+loop:
+  - [mofka_bench.data_size]
+  - [mofka_bench.num_threads]
+
+repeat: 3
+
+output: "${HOME}/mofka_bench_ares_multinode_2n_rdma_results"

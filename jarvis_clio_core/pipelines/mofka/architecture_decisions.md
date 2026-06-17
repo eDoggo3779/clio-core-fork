@@ -271,6 +271,73 @@ of scope here.
 TCP full sbatch), not the archived branch's optimistic 2 h: each iteration
 restarts bedrock (~5 min/run), so 45 runs ≈ 3.75 h.
 
+## 2026-06-17 — RDMA 2-node sweep (`ofi+verbs`): composition of the validated RDMA-1n and TCP-2n deltas
+
+**Decision.** Add a 2-node RDMA sweep as a **twin of the TCP-2n sweep** with
+`protocol: "tcp"` → `"ofi+verbs"`: `microbench_mofka_ares_multinode_2n_rdma.yaml`
+(+ `_smoke`) and `run_ares_mofka_multinode_2n_rdma*.sbatch`. Identical sweep
+shape (5×3×3) so the CSV compares row-for-row against **both** the TCP-2n sweep
+and the single-node RDMA sweep. **No package/C++ changes** — this is the
+orthogonal composition of two already-validated deltas: the TCP→RDMA transport
+flip (proven single-node) and the single→2-node topology (proven on TCP). The
+launch plane (PSSH over the IP network) and the data plane (verbs over RoCE) are
+fully decoupled, so the two deltas don't interact. Scope is **2-node only**; 4n
+stays out (see 2026-06-08 — the single-broker fan-in `NA_TIMEOUT`).
+
+**Twin the TCP-2n parent, not the RDMA-1n parent.** The RDMA-1n YAML carries
+`workdir: /mnt/nvme/$USER` (node-local) and no `ssh_cmd`; twinning from it would
+re-introduce a node-local workdir (fatal multi-node, below) and drop the PSSH
+ssh hop. So the base is the TCP-2n file and the *only* knob flipped is
+`protocol`.
+
+**The load-bearing correctness point — NFS workdir.** `workdir` MUST stay on
+shared NFS (`${HOME}/mofka-bench-rdma-tmp`), taken from the TCP-2n parent, NOT
+`/mnt/nvme` from the RDMA-1n parent: the client on node B reads `mofka.json`
+(the bedrock-bound address) off that path, and `/mnt/nvme` is node-local and
+invisible cross-node (`mofka_server` writes it at `_configure`; `producer.py`/
+`consumer.py` open it directly). The dir gets a distinct `-rdma-` infix because
+`mofka_server.start()` `rmtree`s the whole workdir on every bedrock start — a
+shared dir would let a concurrent TCP-2n run delete this run's live `mofka.json`.
+
+**Cross-node verbs is the one genuinely-new surface.** RDMA-1n only dialed
+loopback; TCP-2n dialed cross-node but over sockets. This is the first config to
+put a Mofka verbs QP **on the wire** (node B → node A over RoCE). The
+server-local `verbs` bound-address assertion proves node A *bound* verbs, not
+that node B can *reach* it — a fabric/QP misconfig (PFC/ECN, GID index, v1/v2,
+multi-NIC selection) passes single-node and hangs here as `NA_TIMEOUT`. **Gate:
+run the 2n RDMA smoke first — it is the real cross-node connect proof** — and
+only then the full sweep. A 2n-RDMA hang *looks* like the 4n `NA_TIMEOUT` but is
+a **different root cause** (fabric/QP with a single client, not single-server
+fan-in saturation) — do not conflate them. No `FI_*` env is set initially (keep
+the diff minimal); `FI_VERBS_IFACE`/`FI_PROVIDER` are the first remediation
+levers if the smoke fails to connect.
+
+**No NIC suffix.** Routing rides the `ofi+verbs` address bedrock writes into
+`mofka.json`; the hostfile stays suffix-free so the short-name head exclusion
+(`MOFKA_SERVER_HOST` vs `socket.gethostname()`) keeps working. Adding a `-40g`/
+RoCE suffix would break head exclusion (the head would also run a client) and
+cross out of "config-only".
+
+**Walltime 6 h, from the TCP-2n parent (not RDMA-1n's 4 h).** The node-count
+axis sets runtime — per-iteration bedrock restart + PSSH dispatch ≈ 5 min/run,
+so 45 runs ≈ 3.75 h. The transport doesn't shorten that; verbs init may lengthen
+it slightly. Smoke keeps the 30 min ceiling.
+
+**Expected result (the payoff).** Unlike single-node — where RDMA paid loopback
+NIC/PCIe traversal and ran comparable-to/slightly-slower than kernel TCP
+loopback — cross-node is where RDMA should **win**: the loopback penalty is gone
+and the 40 Gbps RoCE wire bandwidth becomes the relevant quantity. So RDMA-2n
+aggregate throughput **≥ TCP-2n** is the expected (logical) outcome; RDMA-2n
+*slower* than TCP-2n is a yellow flag (misrouted NIC / partial fallback), not a
+pass.
+
+**Mofka-vs-CTE note.** Still one central bedrock broker (one warabi data
+provider): 2n RDMA measures a single client pulling over RDMA, the cross-node
+data-path cost that single-node loopback couldn't isolate. The single-broker
+ceiling (and the unshipped 4n) remains the structural difference from CTE's
+symmetric every-node-serves-local model — RDMA changes the wire, not the
+topology.
+
 ---
 
 ## Retained fallback — Pattern A (only if `dev` proves unusable on Ares)

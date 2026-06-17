@@ -1,0 +1,68 @@
+# Mofka Benchmark — Ares Multi-Node SMOKE, 2 nodes, RDMA (ofi+verbs)
+#
+# RDMA twin of microbench_mofka_ares_multinode_2n_smoke.yaml. THE cross-node
+# verbs gate: the cheapest end-to-end test that a client on node B can reach the
+# bedrock-bound ofi+verbs address on node A over the RoCE fabric. Pass this
+# before submitting the full RDMA-2n sweep.
+#
+# Topology: 1 bedrock server (the batch/head node, LocalExecInfo) + 1 client
+# node (PSSH). The .sbatch sets the jarvis hostfile to BOTH allocated nodes;
+# mofka_bench drops the server host (MOFKA_SERVER_HOST) so producer/consumer run
+# only on the 1 client node. See pipelines/mofka/architecture_decisions.md.
+#
+# Validates:
+#   - jarvis hostfile (all nodes) + in-package head exclusion
+#   - mofka_bench._is_multinode() True (len(hosts) > 1 → PSSH branch)
+#   - bedrock binds ofi+verbs (mofka_server asserts 'verbs' in the bound addr
+#     and raises on a silent TCP fallback)
+#   - mofka.json on shared NFS reachable from the client node, AND the client
+#     connects to the bound verbs address ON THE WIRE (cross-node RoCE QP) —
+#     the path single-node loopback never exercised
+#   - per-host {role}_output.txt.<hostname> written, parsed, folded
+#
+# Submit with: sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_multinode_2n_rdma_smoke.sbatch
+# Output: mofka_smoke_2n_rdma_<jobid>.log
+
+config:
+  name: mofka_bench_ares_multinode_2n_rdma_smoke
+  # The conda libcrypto.so.3 (ABI 3.0.x) shadows the system libcrypto that
+  # /usr/bin/ssh links against; strip the conda LD_LIBRARY_PATH for the ssh
+  # hop only so PSSH can reach the client node.
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+  pkgs:
+    - pkg_type: jarvis_clio_core.mofka_server
+      pkg_name: mofka_srv
+      protocol: "ofi+verbs"
+      # Shared NFS ($HOME) so the client node can read mofka.json. Do NOT
+      # use /mnt/nvme here — that is node-local and invisible to the client.
+      # Distinct -rdma- dir so a concurrent TCP-2n run's bedrock rmtree can't
+      # delete this run's mofka.json.
+      workdir: "${HOME}/mofka-bench-rdma-tmp"
+      topic: "benchmark_topic"
+      partition_type: "memory"
+
+    - pkg_type: jarvis_clio_core.mofka_bench
+      pkg_name: mofka_bench
+      mode: "both"
+      num_events: 1000
+      data_size: 1024
+      metadata_size: 64
+      batch_size: 16
+      num_threads: 1
+      data_selectivity: 1.0
+      use_progress_thread: true
+      # 1 client node (N-1 = 1), 1 proc/node.
+      nprocs: 1
+      ppn: 1
+
+vars:
+  mofka_bench.data_size: [1024, 16384]
+  mofka_bench.num_threads: [1]
+
+loop:
+  - [mofka_bench.data_size]
+  - [mofka_bench.num_threads]
+
+repeat: 1
+
+output: "${HOME}/mofka_bench_ares_multinode_2n_rdma_smoke_results"
