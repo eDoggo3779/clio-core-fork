@@ -33,26 +33,21 @@
 
 #include <clio_runtime/bdev/gcs_client.h>
 
-#include <openssl/bio.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-
-#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <fstream>
-#include <sstream>
-#include <vector>
+#include <string>
 
 #include "clio_ctp/util/logging.h"
 #include "clio_runtime/bdev/cloud_crypto.h"
+#include "clio_runtime/bdev/gcs_credentials.h"
+#include "clio_runtime/bdev/gcs_retry.h"
 
 namespace clio::run::bdev {
 
 //===========================================================================
-// Encoding helpers (GCS-specific; shared crypto lives in cloud_crypto.h)
+// Encoding helpers (GCS-specific; shared crypto lives in cloud_crypto.h, and
+// the OAuth2/JWT auth path lives in gcs_credentials.h)
 //===========================================================================
 
 /**
@@ -81,195 +76,30 @@ static std::string UrlEncode(const std::string &value) {
   return out;
 }
 
-/**
- * Base64url-encode raw bytes (RFC 7515: '+'->'-', '/'->'_', no padding).
- * @param data Input bytes.
- * @param len Number of input bytes.
- * @return The base64url string without '=' padding.
- */
-static std::string Base64Url(const unsigned char *data, size_t len) {
-  static const char *tbl =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-  std::string out;
-  out.reserve((len + 2) / 3 * 4);
-  for (size_t i = 0; i < len; i += 3) {
-    unsigned v = data[i] << 16;
-    int n = 1;
-    if (i + 1 < len) { v |= data[i + 1] << 8; n = 2; }
-    if (i + 2 < len) { v |= data[i + 2]; n = 3; }
-    out.push_back(tbl[(v >> 18) & 0x3F]);
-    out.push_back(tbl[(v >> 12) & 0x3F]);
-    if (n >= 2) out.push_back(tbl[(v >> 6) & 0x3F]);
-    if (n >= 3) out.push_back(tbl[v & 0x3F]);
-  }
-  return out;
-}
-
-/** Convenience overload taking a std::string payload. */
-static std::string Base64Url(const std::string &s) {
-  return Base64Url(reinterpret_cast<const unsigned char *>(s.data()), s.size());
-}
-
-/** libcurl write callback that appends the response body to a std::string. */
-static size_t StringWriteCb(char *ptr, size_t size, size_t nmemb, void *ud) {
-  auto *s = static_cast<std::string *>(ud);
-  s->append(ptr, size * nmemb);
+/** libcurl write callback that discards the body (upload JSON response). */
+static size_t GcsDiscardCb(char *, size_t size, size_t nmemb, void *) {
   return size * nmemb;
 }
 
-//===========================================================================
-// OAuth2 service-account JWT exchange (real GCS auth path)
-//===========================================================================
-
-/**
- * Extract a top-level string field from a (well-formed) JSON object and
- * un-escape the common sequences (\n \" \\ \/). Prototype-grade scan tailored
- * to service-account key files and the token endpoint response — not a general
- * JSON parser.
- * @param json The JSON text.
- * @param key The field name to extract.
- * @return The un-escaped value, or "" if not found.
- */
-static std::string ExtractJsonString(const std::string &json,
-                                     const std::string &key) {
-  std::string needle = "\"" + key + "\"";
-  size_t k = json.find(needle);
-  if (k == std::string::npos) return "";
-  size_t colon = json.find(':', k + needle.size());
-  if (colon == std::string::npos) return "";
-  size_t q = json.find('"', colon + 1);
-  if (q == std::string::npos) return "";
-  std::string out;
-  for (size_t i = q + 1; i < json.size(); ++i) {
-    char c = json[i];
-    if (c == '\\' && i + 1 < json.size()) {
-      char n = json[++i];
-      if (n == 'n') out.push_back('\n');
-      else if (n == 't') out.push_back('\t');
-      else out.push_back(n);  // covers \" \\ \/
-    } else if (c == '"') {
-      break;
-    } else {
-      out.push_back(c);
+/** libcurl header callback that captures the `Location:` value (session URI). */
+static size_t CaptureLocationCb(char *ptr, size_t size, size_t nmemb,
+                                void *ud) {
+  size_t n = size * nmemb;
+  auto *out = static_cast<std::string *>(ud);
+  const std::string key = "location:";
+  if (n >= key.size()) {
+    std::string head(ptr, key.size());
+    for (char &c : head) c = static_cast<char>(std::tolower((unsigned char)c));
+    if (head == key) {
+      std::string val(ptr + key.size(), n - key.size());
+      size_t b = val.find_first_not_of(" \t");
+      size_t e = val.find_last_not_of("\r\n \t");
+      if (b != std::string::npos && e != std::string::npos && e >= b) {
+        *out = val.substr(b, e - b + 1);
+      }
     }
   }
-  return out;
-}
-
-/**
- * RSA-SHA256-sign a message with a PEM private key (RS256 for the JWT).
- * @param pem PEM-encoded RSA private key.
- * @param msg Message bytes to sign (the JWT signing input).
- * @return Raw signature bytes, or empty on failure.
- */
-static std::string RsaSignSha256(const std::string &pem,
-                                 const std::string &msg) {
-  std::string sig;
-  BIO *bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
-  if (bio == nullptr) return sig;
-  EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
-  BIO_free(bio);
-  if (pkey == nullptr) {
-    HLOG(kError, "GCS auth: failed to parse service-account private key");
-    return sig;
-  }
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  size_t slen = 0;
-  if (ctx != nullptr &&
-      EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, pkey) == 1 &&
-      EVP_DigestSign(ctx, nullptr, &slen, reinterpret_cast<const unsigned char *>(
-                                              msg.data()), msg.size()) == 1) {
-    std::vector<unsigned char> buf(slen);
-    if (EVP_DigestSign(ctx, buf.data(), &slen,
-                       reinterpret_cast<const unsigned char *>(msg.data()),
-                       msg.size()) == 1) {
-      sig.assign(reinterpret_cast<char *>(buf.data()), slen);
-    }
-  }
-  if (ctx != nullptr) EVP_MD_CTX_free(ctx);
-  EVP_PKEY_free(pkey);
-  return sig;
-}
-
-/**
- * Perform the service-account OAuth2 JWT-bearer flow to obtain an access token.
- *
- * Builds a signed RS256 JWT asserting the devstorage.read_write scope, POSTs it
- * to the token endpoint, and returns the access_token. This is the real GCS
- * auth path; the prototype validates anonymously, so this runs only when
- * GOOGLE_APPLICATION_CREDENTIALS points at a key file.
- *
- * @param sa_json_path Path to the service-account JSON key file.
- * @return The OAuth2 access token, or "" on any failure.
- */
-static std::string FetchTokenViaJwt(const std::string &sa_json_path) {
-  std::ifstream f(sa_json_path);
-  if (!f) {
-    HLOG(kError, "GCS auth: cannot open credentials file '{}'", sa_json_path);
-    return "";
-  }
-  std::stringstream ss;
-  ss << f.rdbuf();
-  std::string json = ss.str();
-  std::string client_email = ExtractJsonString(json, "client_email");
-  std::string private_key = ExtractJsonString(json, "private_key");
-  std::string token_uri = ExtractJsonString(json, "token_uri");
-  if (token_uri.empty()) token_uri = "https://oauth2.googleapis.com/token";
-  if (client_email.empty() || private_key.empty()) {
-    HLOG(kError, "GCS auth: credentials file missing client_email/private_key");
-    return "";
-  }
-
-  std::time_t now = std::time(nullptr);
-  std::string header = R"({"alg":"RS256","typ":"JWT"})";
-  std::ostringstream claims;
-  claims << "{\"iss\":\"" << client_email
-         << "\",\"scope\":\"https://www.googleapis.com/auth/devstorage.read_write"
-         << "\",\"aud\":\"" << token_uri << "\",\"iat\":" << now
-         << ",\"exp\":" << (now + 3600) << "}";
-  std::string signing_input = Base64Url(header) + "." + Base64Url(claims.str());
-  std::string sig = RsaSignSha256(private_key, signing_input);
-  if (sig.empty()) return "";
-  std::string assertion = signing_input + "." + Base64Url(sig);
-
-  std::string body = "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer"
-                     "&assertion=" + assertion;
-  CURL *easy = curl_easy_init();
-  if (easy == nullptr) return "";
-  std::string resp;
-  curl_easy_setopt(easy, CURLOPT_URL, token_uri.c_str());
-  curl_easy_setopt(easy, CURLOPT_POSTFIELDS, body.c_str());
-  curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, StringWriteCb);
-  curl_easy_setopt(easy, CURLOPT_WRITEDATA, &resp);
-  CURLcode rc = curl_easy_perform(easy);
-  long status = 0;
-  curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status);
-  curl_easy_cleanup(easy);
-  if (rc != CURLE_OK || status != 200) {
-    HLOG(kError, "GCS auth: token exchange failed (curl={} http={})",
-         static_cast<int>(rc), status);
-    return "";
-  }
-  std::string token = ExtractJsonString(resp, "access_token");
-  if (!token.empty()) HLOG(kInfo, "GCS auth: obtained OAuth2 access token");
-  return token;
-}
-
-/**
- * Resolve a bearer token by precedence: explicit env token, then a
- * service-account JWT exchange, then anonymous ("").
- * @return The bearer token, or "" for anonymous access.
- */
-static std::string ResolveAccessToken() {
-  std::string explicit_tok = cloud::EnvOr("GCS_ACCESS_TOKEN", "");
-  if (!explicit_tok.empty()) {
-    HLOG(kInfo, "GCS auth: using GCS_ACCESS_TOKEN from environment");
-    return explicit_tok;
-  }
-  std::string sa = cloud::EnvOr("GOOGLE_APPLICATION_CREDENTIALS", "");
-  if (!sa.empty()) return FetchTokenViaJwt(sa);
-  HLOG(kInfo, "GCS auth: no credentials set — using anonymous access");
-  return "";
+  return n;
 }
 
 //===========================================================================
@@ -295,7 +125,17 @@ GcsConfig GcsConfig::FromEnvAndPoolName(const std::string &pool_name) {
 
   cfg.endpoint = cloud::EnvOr("GCS_ENDPOINT", "https://storage.googleapis.com");
   cfg.project_id = cloud::EnvOr("GCS_PROJECT_ID", "clio-prototype");
-  cfg.access_token = ResolveAccessToken();
+  // Resolve the credential source once and bind the process-wide shared token
+  // provider for it (token state is shared across workers; see X8).
+  cfg.token_provider = GetSharedGcsTokenProvider(ResolveGcsCredentials());
+
+  // Transport + resumable knobs (resolved once at Create).
+  cfg.resumable_threshold = static_cast<size_t>(std::strtoull(
+      cloud::EnvOr("GCS_RESUMABLE_THRESHOLD", "8388608").c_str(), nullptr, 10));
+  cfg.connect_timeout_s = std::strtol(
+      cloud::EnvOr("GCS_CONNECT_TIMEOUT_S", "10").c_str(), nullptr, 10);
+  cfg.http2 = cloud::EnvOr("GCS_FORCE_HTTP11", "").empty();
+  cfg.ca_bundle = cloud::EnvOr("GCS_CA_BUNDLE", "");
 
   // Split endpoint into scheme + host[:port].
   size_t pos = cfg.endpoint.find("://");
@@ -313,19 +153,20 @@ GcsConfig GcsConfig::FromEnvAndPoolName(const std::string &pool_name) {
 }
 
 //===========================================================================
-// GcsOp + libcurl callbacks
-//===========================================================================
-
-/** libcurl write callback that discards the body (upload JSON response). */
-static size_t GcsDiscardCb(char *, size_t size, size_t nmemb, void *) {
-  return size * nmemb;
-}
-
-//===========================================================================
 // GcsClient lifecycle
 //===========================================================================
 
-GcsClient::GcsClient(const GcsConfig &config) : config_(config) {}
+GcsClient::GcsClient(const GcsConfig &config) : config_(config) {
+  // Opt into the transport base's transient-failure retry loop. The base
+  // default is a single attempt (no-op), so only GCS gets backoff retries.
+  retry_policy_ = RetryPolicy::FromEnv();
+}
+
+void GcsClient::OnAuthError() {
+  // A 401/403 means the bearer token expired or was revoked; drop it so the
+  // shared provider re-mints one for the retried request (theme X8).
+  if (config_.token_provider) config_.token_provider->Invalidate();
+}
 
 std::string GcsClient::KeyForOffset(uint64_t offset) const {
   std::string key = "blk_" + std::to_string(offset);
@@ -334,9 +175,12 @@ std::string GcsClient::KeyForOffset(uint64_t offset) const {
 
 curl_slist *GcsClient::BuildHeaders(const std::string &content_type) const {
   curl_slist *headers = nullptr;
-  if (!config_.access_token.empty()) {
-    headers = curl_slist_append(
-        headers, ("Authorization: Bearer " + config_.access_token).c_str());
+  if (config_.token_provider) {
+    std::string token = config_.token_provider->GetToken();
+    if (!token.empty()) {
+      headers = curl_slist_append(
+          headers, ("Authorization: Bearer " + token).c_str());
+    }
   }
   if (!content_type.empty()) {
     headers =
@@ -360,6 +204,7 @@ bool GcsClient::EnsureBucket() {
                     UrlEncode(config_.project_id);
   std::string body = "{\"name\":\"" + config_.bucket + "\"}";
   curl_slist *headers = BuildHeaders("application/json");
+  ApplyTransportOpts(easy);
   curl_easy_setopt(easy, CURLOPT_URL, url.c_str());
   curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(easy, CURLOPT_POSTFIELDS, body.c_str());
@@ -385,60 +230,156 @@ bool GcsClient::EnsureBucket() {
 // Async submit (offset-oriented; poll via the shared base IsComplete)
 //===========================================================================
 
-void *GcsClient::WriteAsync(uint64_t offset, const void *buf, size_t len) {
-  if (!IsValid()) return nullptr;
-  std::string key = KeyForOffset(offset);
-  auto *op = new Op();
-  op->is_get = false;
-  op->op_label = "PUT";
-  op->key = key;
-  op->src = static_cast<const char *>(buf);
-  op->len = len;
-  op->start = std::chrono::high_resolution_clock::now();
+void GcsClient::ApplyTransportOpts(CURL *easy) const {
+  // Prefer HTTP/2 over TLS (curl transparently falls back to 1.1 if the server
+  // declines); allow forcing 1.1 for misbehaving proxies.
+  curl_easy_setopt(easy, CURLOPT_HTTP_VERSION,
+                   config_.http2 ? CURL_HTTP_VERSION_2TLS
+                                 : CURL_HTTP_VERSION_1_1);
+  curl_easy_setopt(easy, CURLOPT_TCP_KEEPALIVE, 1L);
+  curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT, config_.connect_timeout_s);
+  // Stall guard: abort a transfer stuck below 1 B/s for 60 s (catches hangs
+  // without killing slow-but-progressing transfers).
+  curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT, 1L);
+  curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, 60L);
+  // TLS peer + host verification on (curl's default; set explicitly).
+  curl_easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 2L);
+  if (!config_.ca_bundle.empty()) {
+    curl_easy_setopt(easy, CURLOPT_CAINFO, config_.ca_bundle.c_str());
+  }
+}
+
+std::string GcsClient::InitiateResumable(const std::string &key,
+                                         size_t len) const {
+  CURL *easy = curl_easy_init();
+  if (easy == nullptr) return "";
+  std::string url = config_.endpoint + "/upload/storage/v1/b/" + config_.bucket +
+                    "/o?uploadType=resumable&name=" + UrlEncode(key);
+  curl_slist *headers = BuildHeaders("application/octet-stream");
+  headers = curl_slist_append(
+      headers, ("X-Upload-Content-Length: " + std::to_string(len)).c_str());
+  headers = curl_slist_append(headers,
+                              "X-Upload-Content-Type: application/octet-stream");
+  std::string location;
+  ApplyTransportOpts(easy);
+  curl_easy_setopt(easy, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(easy, CURLOPT_POST, 1L);
+  curl_easy_setopt(easy, CURLOPT_POSTFIELDS, "");
+  curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, 0L);
+  curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, CaptureLocationCb);
+  curl_easy_setopt(easy, CURLOPT_HEADERDATA, &location);
+  curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, GcsDiscardCb);
+  CURLcode rc = curl_easy_perform(easy);
+  long status = 0;
+  curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &status);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(easy);
+  if (rc != CURLE_OK || status != 200 || location.empty()) {
+    HLOG(kError, "GCS resumable initiate '{}' failed: curl={} http={}", key,
+         static_cast<int>(rc), status);
+    return "";
+  }
+  return location;
+}
+
+void GcsClient::ConfigureWriteEasy(Op *op) const {
   op->easy = curl_easy_init();
-  if (op->easy == nullptr) {
-    delete op;
-    return nullptr;
+  if (op->easy == nullptr) return;
+  // Large writes use a resumable session (one extra round-trip); small/block
+  // writes (the common bdev case) use a single simple media upload.
+  if (op->len >= config_.resumable_threshold) {
+    std::string uri = InitiateResumable(op->key, op->len);
+    if (!uri.empty()) {
+      op->op_label = "PUT-RESUMABLE";
+      op->headers = BuildHeaders("application/octet-stream");
+      std::string range = "Content-Range: bytes 0-" +
+                          std::to_string(op->len - 1) + "/" +
+                          std::to_string(op->len);
+      op->headers = curl_slist_append(op->headers, range.c_str());
+      ApplyTransportOpts(op->easy);
+      curl_easy_setopt(op->easy, CURLOPT_URL, uri.c_str());
+      curl_easy_setopt(op->easy, CURLOPT_HTTPHEADER, op->headers);
+      curl_easy_setopt(op->easy, CURLOPT_UPLOAD, 1L);
+      curl_easy_setopt(op->easy, CURLOPT_INFILESIZE_LARGE,
+                       static_cast<curl_off_t>(op->len));
+      curl_easy_setopt(op->easy, CURLOPT_READFUNCTION,
+                       &HttpObjectStoreClient::ReadCb);
+      curl_easy_setopt(op->easy, CURLOPT_READDATA, op);
+      curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION, GcsDiscardCb);
+      return;
+    }
+    HLOG(kWarning, "GCS resumable initiate failed for {}; using media upload",
+         op->key);
   }
   // Simple media upload: POST .../o?uploadType=media&name=<encoded key>.
+  op->op_label = "PUT";
   std::string url = config_.endpoint + "/upload/storage/v1/b/" + config_.bucket +
-                    "/o?uploadType=media&name=" + UrlEncode(key);
+                    "/o?uploadType=media&name=" + UrlEncode(op->key);
   op->headers = BuildHeaders("application/octet-stream");
+  ApplyTransportOpts(op->easy);
   curl_easy_setopt(op->easy, CURLOPT_URL, url.c_str());
   curl_easy_setopt(op->easy, CURLOPT_HTTPHEADER, op->headers);
   curl_easy_setopt(op->easy, CURLOPT_POST, 1L);
   curl_easy_setopt(op->easy, CURLOPT_POSTFIELDSIZE_LARGE,
-                   static_cast<curl_off_t>(len));
-  curl_easy_setopt(op->easy, CURLOPT_READFUNCTION, &HttpObjectStoreClient::ReadCb);
+                   static_cast<curl_off_t>(op->len));
+  curl_easy_setopt(op->easy, CURLOPT_READFUNCTION,
+                   &HttpObjectStoreClient::ReadCb);
   curl_easy_setopt(op->easy, CURLOPT_READDATA, op);
   curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION, GcsDiscardCb);
+}
+
+void GcsClient::ConfigureReadEasy(Op *op) const {
+  op->easy = curl_easy_init();
+  if (op->easy == nullptr) return;
+  // Media download: GET .../o/<encoded key>?alt=media.
+  std::string url = config_.endpoint + "/storage/v1/b/" + config_.bucket +
+                    "/o/" + UrlEncode(op->key) + "?alt=media";
+  op->headers = BuildHeaders("");
+  ApplyTransportOpts(op->easy);
+  curl_easy_setopt(op->easy, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(op->easy, CURLOPT_HTTPHEADER, op->headers);
+  curl_easy_setopt(op->easy, CURLOPT_HTTPGET, 1L);
+  curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION,
+                   &HttpObjectStoreClient::WriteCb);
+  curl_easy_setopt(op->easy, CURLOPT_WRITEDATA, op);
+}
+
+void *GcsClient::WriteAsync(uint64_t offset, const void *buf, size_t len) {
+  if (!IsValid()) return nullptr;
+  auto *op = new Op();
+  op->is_get = false;
+  op->op_label = "PUT";
+  op->key = KeyForOffset(offset);
+  op->src = static_cast<const char *>(buf);
+  op->len = len;
+  op->start = std::chrono::high_resolution_clock::now();
+  // Closure re-runs on every retry so a re-issued request gets a fresh token.
+  op->rebuild = [this](Op *o) { ConfigureWriteEasy(o); };
+  op->rebuild(op);
+  if (op->easy == nullptr) {
+    delete op;
+    return nullptr;
+  }
   return Submit(op);
 }
 
 void *GcsClient::ReadAsync(uint64_t offset, void *buf, size_t len) {
   if (!IsValid()) return nullptr;
-  std::string key = KeyForOffset(offset);
   auto *op = new Op();
   op->is_get = true;
   op->op_label = "GET";
-  op->key = key;
+  op->key = KeyForOffset(offset);
   op->dst = static_cast<char *>(buf);
   op->cap = len;
   op->start = std::chrono::high_resolution_clock::now();
-  op->easy = curl_easy_init();
+  op->rebuild = [this](Op *o) { ConfigureReadEasy(o); };
+  op->rebuild(op);
   if (op->easy == nullptr) {
     delete op;
     return nullptr;
   }
-  // Media download: GET .../o/<encoded key>?alt=media.
-  std::string url = config_.endpoint + "/storage/v1/b/" + config_.bucket +
-                    "/o/" + UrlEncode(key) + "?alt=media";
-  op->headers = BuildHeaders("");
-  curl_easy_setopt(op->easy, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(op->easy, CURLOPT_HTTPHEADER, op->headers);
-  curl_easy_setopt(op->easy, CURLOPT_HTTPGET, 1L);
-  curl_easy_setopt(op->easy, CURLOPT_WRITEFUNCTION, &HttpObjectStoreClient::WriteCb);
-  curl_easy_setopt(op->easy, CURLOPT_WRITEDATA, op);
   return Submit(op);
 }
 

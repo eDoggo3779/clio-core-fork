@@ -38,8 +38,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
+#include "gcs_credentials.h"
 #include "http_object_store_client.h"
 
 namespace clio::run::bdev {
@@ -49,14 +51,15 @@ namespace clio::run::bdev {
  *
  * Bucket and key prefix are parsed from the bdev pool name
  * (`gcs://bucket/prefix`). The endpoint and project come from the environment;
- * the OAuth2 bearer token is resolved once at Create time (see
- * FromEnvAndPoolName) so no secrets travel through serialized task fields.
+ * the credential *source* is resolved at Create time (see FromEnvAndPoolName)
+ * so no secrets travel through serialized task fields.
  *
  * Unlike S3's per-request SigV4 signing, GCS's JSON API authenticates with a
- * single `Authorization: Bearer <token>` header. The token is acquired
- * out-of-band (service-account JWT exchange, an injected token, or anonymous
- * for an emulator) and reused across every request — a fundamentally different
- * auth model that the bdev seam must accommodate alongside request-signing.
+ * single `Authorization: Bearer <token>` header. The token is supplied by a
+ * shared, TTL-aware GcsTokenProvider (see gcs_credentials.h): the curl
+ * transport stays per-worker, but the token cache is shared across workers and
+ * refreshed before expiry — a fundamentally different auth model that the bdev
+ * seam accommodates alongside request-signing.
  */
 struct GcsConfig {
   std::string endpoint;      /**< Base endpoint, e.g. "https://storage.googleapis.com" */
@@ -65,17 +68,22 @@ struct GcsConfig {
   std::string bucket;        /**< Target bucket name */
   std::string prefix;        /**< Optional key prefix (no leading/trailing '/') */
   std::string project_id;    /**< GCP project id (needed only to create buckets) */
-  std::string access_token;  /**< OAuth2 bearer token ("" => anonymous/emulator) */
+  /** Shared OAuth2 token provider (auth state is shared; transport per-worker). */
+  std::shared_ptr<GcsTokenProvider> token_provider;
+  size_t resumable_threshold = 8ull * 1024 * 1024; /**< Writes >= this go resumable */
+  long connect_timeout_s = 10;  /**< curl connect timeout in seconds */
+  bool http2 = true;            /**< Prefer HTTP/2 (false => force HTTP/1.1) */
+  std::string ca_bundle;        /**< Optional CA bundle path (else curl default) */
   bool valid = false;        /**< True when all required fields were resolved */
 
   /**
    * Build a config from a `gcs://bucket/prefix` pool name and the environment.
    *
-   * Reads GCS_ENDPOINT (default "https://storage.googleapis.com"),
-   * GCS_PROJECT_ID, and resolves a bearer token by precedence:
-   *   1. GCS_ACCESS_TOKEN (used verbatim),
-   *   2. GOOGLE_APPLICATION_CREDENTIALS (service-account JSON -> JWT exchange),
-   *   3. anonymous (empty token, for fake-gcs-server / public objects).
+   * Reads GCS_ENDPOINT (default "https://storage.googleapis.com") and
+   * GCS_PROJECT_ID, and binds a shared GcsTokenProvider for the credential
+   * source resolved by the ADC precedence chain (ResolveGcsCredentials():
+   * explicit token -> service-account JWT -> gcloud ADC -> GCE/GKE metadata ->
+   * anonymous). See gcs_credentials.h.
    *
    * @param pool_name The bdev pool name (expected form "gcs://bucket/prefix").
    * @return A populated GcsConfig (check `.valid`).
@@ -136,6 +144,9 @@ class GcsClient : public HttpObjectStoreClient {
  protected:
   const char *LogTag() const override { return "Gcs"; }
 
+  /** Invalidate the shared token so an auth-retry carries a fresh bearer. */
+  void OnAuthError() override;
+
  private:
   /**
    * Build the request header list (bearer auth + given content type).
@@ -143,6 +154,36 @@ class GcsClient : public HttpObjectStoreClient {
    * @return A curl_slist the caller owns and must free after the transfer.
    */
   curl_slist *BuildHeaders(const std::string &content_type) const;
+
+  /**
+   * Apply the common production transport options to an easy handle:
+   * HTTP/2 (or forced 1.1), TCP keep-alive, a connect timeout, a stall guard,
+   * and TLS peer/host verification (with an optional CA bundle override).
+   * @param easy The curl easy handle to configure.
+   */
+  void ApplyTransportOpts(CURL *easy) const;
+
+  /**
+   * Begin a resumable upload session and return its session URI (synchronous;
+   * one short round-trip, used only for writes >= resumable_threshold).
+   * @param key The object name.
+   * @param len Total bytes that will be uploaded.
+   * @return The session URI, or "" on failure (caller falls back to media).
+   */
+  std::string InitiateResumable(const std::string &key, size_t len) const;
+
+  /**
+   * (Re)build the curl easy handle + headers for a media-upload write. Used for
+   * the initial submit and for each retry re-arm, so a retried request always
+   * carries a freshly-minted bearer token. @param op The op to configure.
+   */
+  void ConfigureWriteEasy(Op *op) const;
+
+  /**
+   * (Re)build the curl easy handle + headers for an alt=media download. Used for
+   * the initial submit and for each retry re-arm. @param op The op to configure.
+   */
+  void ConfigureReadEasy(Op *op) const;
 
   GcsConfig config_;
 };

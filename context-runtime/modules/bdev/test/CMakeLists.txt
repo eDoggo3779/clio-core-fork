@@ -238,6 +238,44 @@ if(CLIO_CORE_ENABLE_GCS)
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
   )
   install(TARGETS ${BDEV_GCS_TEST_TARGET} RUNTIME DESTINATION bin)
+
+  # Offline GCS unit tests (JWT signer, JSON parsing, ADC precedence, retry
+  # policy). No network and no runtime init, so this ALWAYS runs (unlike the
+  # endpoint-gated trace test above) — it is the primary correctness proof for
+  # the auth/retry code real GCS exercises.
+  set(BDEV_GCS_UNIT_TARGET chimaera_bdev_gcs_unit_tests)
+  add_executable(${BDEV_GCS_UNIT_TARGET} test_gcs_unit.cc)
+  target_include_directories(${BDEV_GCS_UNIT_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+    ${CLIO_RUN_ROOT}/modules/admin/include
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(${BDEV_GCS_UNIT_TARGET}
+    clio_admin_runtime
+    clio_admin_client
+    clio_bdev_runtime
+    clio_bdev_client
+    ctp::cxx
+    CURL::libcurl
+    OpenSSL::Crypto
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(${BDEV_GCS_UNIT_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_bdev_gcs_unit_tests
+    COMMAND ${BDEV_GCS_UNIT_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_gcs_unit_tests PROPERTIES
+    TIMEOUT 120
+    LABELS "msan_skip"
+  )
+  install(TARGETS ${BDEV_GCS_UNIT_TARGET} RUNTIME DESTINATION bin)
 endif()
 
 # Azure Blob backend roundtrip test (prototype) — built only when Azure is

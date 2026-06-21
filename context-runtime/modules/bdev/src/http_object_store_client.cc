@@ -82,6 +82,13 @@ HttpObjectStoreClient::~HttpObjectStoreClient() {
     delete op;
   }
   inflight_.clear();
+  // Ops parked in a backoff window are not in inflight_ (their easy handle was
+  // already torn down); free them here so shutdown leaks nothing.
+  for (Op *op : parked_) {
+    if (op->headers) curl_slist_free_all(op->headers);
+    delete op;
+  }
+  parked_.clear();
   if (multi_) curl_multi_cleanup(multi_);
 }
 
@@ -89,6 +96,71 @@ void *HttpObjectStoreClient::Submit(Op *op) {
   curl_multi_add_handle(multi_, op->easy);
   inflight_[op->easy] = op;
   return op;
+}
+
+void HttpObjectStoreClient::ScheduleRetry(Op *op, bool immediate, long status) {
+  // Tear down the just-finished transfer but keep the op for another attempt.
+  CURL *old = op->easy;
+  if (old != nullptr) {
+    curl_multi_remove_handle(multi_, old);
+    inflight_.erase(old);
+    curl_easy_cleanup(old);
+  }
+  op->easy = nullptr;
+  if (op->headers != nullptr) {
+    curl_slist_free_all(op->headers);
+    op->headers = nullptr;
+  }
+  double delay_ms = immediate ? 0.0 : retry_policy_.NextDelayMs(op->attempt);
+  op->next_earliest = std::chrono::high_resolution_clock::now() +
+                      std::chrono::duration_cast<
+                          std::chrono::high_resolution_clock::duration>(
+                          std::chrono::duration<double, std::milli>(delay_ms));
+  op->pending_retry = true;
+  parked_.insert(op);
+  HLOG(kWarning, "{} op={} key={} http={} curl={} — retry {}/{} in {}ms",
+       LogTag(), op->op_label, op->key, status, static_cast<int>(op->curl_code),
+       op->attempt, retry_policy_.max_attempts - 1, delay_ms);
+}
+
+bool HttpObjectStoreClient::RearmOp(Op *op) {
+  parked_.erase(op);
+  op->sent = 0;
+  op->written = 0;
+  op->finished = false;
+  op->curl_code = CURLE_OK;
+  op->pending_retry = false;
+  if (op->rebuild) op->rebuild(op);  // builds a fresh easy + headers
+  if (op->easy == nullptr) return false;
+  curl_multi_add_handle(multi_, op->easy);
+  inflight_[op->easy] = op;
+  return true;
+}
+
+void HttpObjectStoreClient::FinalizeOp(Op *op, ObjectStoreResult &out,
+                                       long status) {
+  double ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::high_resolution_clock::now() - op->start)
+                  .count();
+  out.http_status = status;
+  out.not_found = (status == 404);
+  out.bytes = op->is_get ? op->written : op->sent;
+  out.ok = (op->curl_code == CURLE_OK) && (status >= 200 && status < 300);
+
+  HLOG(kInfo, "{} op={} key={} bytes={} http={} latency_ms={}", LogTag(),
+       op->op_label, op->key, out.bytes, status, ms);
+  if (op->curl_code != CURLE_OK) {
+    HLOG(kError, "{} op={} key={} transport error curl={}", LogTag(),
+         op->op_label, op->key, static_cast<int>(op->curl_code));
+  }
+
+  if (op->easy != nullptr) {
+    curl_multi_remove_handle(multi_, op->easy);
+    inflight_.erase(op->easy);  // erase while the pointer key is still valid
+    curl_easy_cleanup(op->easy);
+  }
+  if (op->headers != nullptr) curl_slist_free_all(op->headers);
+  delete op;
 }
 
 bool HttpObjectStoreClient::IsComplete(void *token, ObjectStoreResult &out) {
@@ -110,30 +182,43 @@ bool HttpObjectStoreClient::IsComplete(void *token, ObjectStoreResult &out) {
     }
   }
 
+  // Parked in a backoff window: re-arm once the delay elapses.
+  if (target->pending_retry) {
+    if (std::chrono::high_resolution_clock::now() < target->next_earliest) {
+      return false;
+    }
+    if (!RearmOp(target)) {
+      FinalizeOp(target, out, 0);  // rebuild failed -> terminal error
+      return true;
+    }
+    return false;
+  }
+
   if (!target->finished) return false;
 
   long status = 0;
   curl_easy_getinfo(target->easy, CURLINFO_RESPONSE_CODE, &status);
-  double ms = std::chrono::duration<double, std::milli>(
-                  std::chrono::high_resolution_clock::now() - target->start)
-                  .count();
-  out.http_status = status;
-  out.not_found = (status == 404);
-  out.bytes = target->is_get ? target->written : target->sent;
-  out.ok = (target->curl_code == CURLE_OK) && (status >= 200 && status < 300);
 
-  HLOG(kInfo, "{} op={} key={} bytes={} http={} latency_ms={}", LogTag(),
-       target->op_label, target->key, out.bytes, status, ms);
-  if (target->curl_code != CURLE_OK) {
-    HLOG(kError, "{} op={} key={} transport error curl={}", LogTag(),
-         target->op_label, target->key, static_cast<int>(target->curl_code));
+  // Auth failure: refresh the credential and retry once (opt-in).
+  bool is_auth = (status == 401 || status == 403);
+  if (is_auth && retry_policy_.retry_on_auth_err && !target->auth_retried &&
+      target->rebuild) {
+    OnAuthError();
+    target->auth_retried = true;
+    ScheduleRetry(target, /*immediate=*/true, status);
+    return false;
   }
 
-  curl_multi_remove_handle(multi_, target->easy);
-  curl_easy_cleanup(target->easy);
-  if (target->headers) curl_slist_free_all(target->headers);
-  inflight_.erase(target->easy);
-  delete target;
+  // Transient failure: exponential-backoff retry (opt-in via policy + rebuild).
+  if (target->rebuild &&
+      retry_policy_.ShouldRetry(status, static_cast<int>(target->curl_code),
+                                target->attempt)) {
+    target->attempt += 1;
+    ScheduleRetry(target, /*immediate=*/false, status);
+    return false;
+  }
+
+  FinalizeOp(target, out, status);
   return true;
 }
 

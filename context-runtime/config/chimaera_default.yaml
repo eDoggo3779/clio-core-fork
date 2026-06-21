@@ -96,18 +96,31 @@ compose:
   #   bdev_type: s3                      # Options: file, ram, hbm, pinned, noop, s3, gcs
   #   capacity: "10GB"
 
-  # === Block Device (Google Cloud Storage) — prototype ===
-  # Requires building with -DCLIO_CORE_ENABLE_GCS=ON (libcurl + OpenSSL OAuth2).
-  # pool_name encodes the bucket + key prefix: gcs://<bucket>/<prefix>.
-  # The endpoint, project, and credentials come from the environment (NOT this
-  # file, so no secrets are serialized):
-  #   GCS_ENDPOINT     (default https://storage.googleapis.com)
-  #   GCS_PROJECT_ID   (default clio-prototype; only used to create the bucket)
-  #   Auth, by precedence: GCS_ACCESS_TOKEN (verbatim bearer token), else
-  #   GOOGLE_APPLICATION_CREDENTIALS (service-account JSON -> JWT exchange),
-  #   else anonymous (for fake-gcs-server / public objects).
-  # Uses the GCS JSON API (media upload + alt=media download); same s3backer
-  # block->object mapping as kS3. capacity is required.
+  # === Block Device (Google Cloud Storage) ===
+  # Requires building with -DCLIO_CORE_ENABLE_GCS=ON (libcurl + OpenSSL +
+  # nlohmann/json). pool_name encodes the bucket + key prefix: gcs://<bucket>/
+  # <prefix>. Endpoint, project, credentials, and tuning come from the
+  # environment (NOT this file, so no secrets are serialized):
+  #   GCS_ENDPOINT    (default https://storage.googleapis.com; point at a
+  #                    fake-gcs-server, e.g. http://127.0.0.1:4443, to emulate)
+  #   GCS_PROJECT_ID  (default clio-prototype; only used to create the bucket)
+  # Auth resolves via the Application Default Credentials precedence chain, and
+  # the bearer token is cached + refreshed before expiry, shared across workers:
+  #   1. GCS_ACCESS_TOKEN                (verbatim bearer token)
+  #   2. GOOGLE_APPLICATION_CREDENTIALS  (service-account JSON -> RS256 JWT, or a
+  #                                       gcloud authorized_user refresh token)
+  #   3. gcloud ADC file (~/.config/gcloud/application_default_credentials.json)
+  #   4. GCE/GKE metadata server         (also GKE Workload Identity)
+  #   5. anonymous                       (fake-gcs-server / public objects)
+  # Optional tuning knobs (all default to safe production values):
+  #   GCS_MAX_RETRIES (5) / GCS_RETRY_BASE_MS (100) / GCS_RETRY_MAX_MS (30000)
+  #        exponential-backoff retry on HTTP 429/5xx + transient network errors
+  #   GCS_RESUMABLE_THRESHOLD (8388608)  writes >= N bytes use a resumable
+  #        upload; block writes are smaller, so media upload is the normal path
+  #   GCS_CONNECT_TIMEOUT_S (10) / GCS_FORCE_HTTP11 (unset => HTTP/2) / GCS_CA_BUNDLE
+  #   GCS_DISABLE_METADATA               skip the off-GCP metadata probe
+  # Uses the GCS JSON API (media/resumable upload + alt=media download); same
+  # s3backer block->object mapping as kS3. capacity is required.
   # Example against a local fake-gcs-server (anonymous):
   #   export GCS_ENDPOINT=http://127.0.0.1:4443 GCS_PROJECT_ID=clio-prototype
   # - mod_name: clio_bdev

@@ -26,14 +26,24 @@ if(CLIO_CORE_ENABLE_S3)
   message(STATUS "bdev: S3 backend enabled (libcurl + OpenSSL SigV4)")
 endif()
 
-# Hand-rolled GCS client (kGcs bdev type, prototype): libcurl for the GCS JSON
-# API + OpenSSL for the OAuth2 service-account JWT (RSA-SHA256) auth path.
+# Production GCS client (kGcs bdev type): libcurl (HTTP/2 + TLS) for the GCS
+# JSON API, OpenSSL for the OAuth2 service-account JWT (RSA-SHA256) auth path,
+# and nlohmann/json (header-only, system) for robust token/key-file parsing.
+# gcs_credentials.cc owns the ADC token lifecycle (cache/refresh/metadata) and
+# gcs_retry.cc the transient-failure backoff policy.
 if(CLIO_CORE_ENABLE_GCS)
   find_package(CURL REQUIRED)
   find_package(OpenSSL REQUIRED)
+  find_package(nlohmann_json QUIET)
   list(APPEND BDEV_S3_LIBS CURL::libcurl OpenSSL::Crypto)
-  list(APPEND BDEV_RUNTIME_EXTRA_SOURCES src/gcs_client.cc)
-  message(STATUS "bdev: GCS backend enabled (libcurl + OpenSSL OAuth2/JWT)")
+  if(TARGET nlohmann_json::nlohmann_json)
+    list(APPEND BDEV_S3_LIBS nlohmann_json::nlohmann_json)
+  endif()
+  list(APPEND BDEV_RUNTIME_EXTRA_SOURCES
+    src/gcs_client.cc
+    src/gcs_credentials.cc
+    src/gcs_retry.cc)
+  message(STATUS "bdev: GCS backend enabled (libcurl + OpenSSL OAuth2/JWT + nlohmann_json)")
 endif()
 
 # Hand-rolled Azure Blob client (kAzure / kAzurePage bdev types, prototype):

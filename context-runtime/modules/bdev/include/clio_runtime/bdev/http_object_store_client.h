@@ -38,9 +38,12 @@
 
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
+#include "gcs_retry.h"  // RetryPolicy (provider-agnostic, despite the file name)
 #include "object_store_client.h"
 
 namespace clio::run::bdev {
@@ -57,6 +60,14 @@ namespace clio::run::bdev {
  * configure the request on op->easy (URL + verb + signed headers), wire the
  * shared callbacks, and call Submit(). The provider-specific signing/addressing
  * stays in the subclass so the signed bytes are unchanged.
+ *
+ * The base also owns a transient-failure retry loop (RetryPolicy + the Op
+ * `rebuild` closure + the OnAuthError() hook). Retry is opt-in: the default
+ * policy is a single attempt and the default OnAuthError() is a no-op, so a
+ * subclass that sets neither (S3/Azure/OSS) behaves exactly as before. A
+ * subclass that opts in (GCS) inherits exponential-backoff retries and a
+ * 401-driven token refresh with no change to the bdev coroutine, which only
+ * sees IsComplete() keep returning false until the operation truly settles.
  */
 class HttpObjectStoreClient : public ObjectStoreClient {
  public:
@@ -68,7 +79,8 @@ class HttpObjectStoreClient : public ObjectStoreClient {
   /**
    * Drive in-flight transfers and report whether `token`'s op has finished.
    * Provider-agnostic: HTTP status, latency, byte count, and 404 handling are
-   * identical across providers; the only per-provider input is LogTag().
+   * identical across providers; the only per-provider inputs are LogTag(),
+   * OnAuthError(), and the op's `rebuild` closure used for retries.
    */
   bool IsComplete(void *token, ObjectStoreResult &out) override;
 
@@ -91,6 +103,13 @@ class HttpObjectStoreClient : public ObjectStoreClient {
     size_t cap = 0;
     size_t written = 0;
     std::chrono::high_resolution_clock::time_point start;
+    // Retry bookkeeping (inert unless the subclass installs `rebuild`).
+    int attempt = 0;                /**< 0-based count of attempts already made */
+    bool pending_retry = false;     /**< Parked in a backoff window */
+    bool auth_retried = false;      /**< A 401/403 auth-retry was already spent */
+    std::chrono::high_resolution_clock::time_point next_earliest; /**< Re-arm at */
+    /** Reconfigure easy + headers for a fresh attempt (subclass-supplied). */
+    std::function<void(Op *)> rebuild;
   };
 
   /** libcurl read callback: stream the PUT body out of op->src. */
@@ -111,9 +130,26 @@ class HttpObjectStoreClient : public ObjectStoreClient {
   /** @return A short provider tag for log lines ("S3"/"Gcs"/"Azure"/"OSS"). */
   virtual const char *LogTag() const = 0;
 
+  /**
+   * Invoked once before an auth-retry when a request returns 401/403. The base
+   * default is a no-op; a subclass (GCS) overrides it to invalidate/refresh its
+   * cached credential so the retried request carries a fresh token.
+   */
+  virtual void OnAuthError() {}
+
+  RetryPolicy retry_policy_;  /**< Default: 1 attempt (retries disabled) */
+
  private:
+  /** Tear down a finished transfer but keep the op parked for another attempt. */
+  void ScheduleRetry(Op *op, bool immediate, long status);
+  /** Rebuild a parked op's easy/headers and re-submit. @return false on failure. */
+  bool RearmOp(Op *op);
+  /** Populate `out`, log, free the op's resources, and delete it. */
+  void FinalizeOp(Op *op, ObjectStoreResult &out, long status);
+
   CURLM *multi_ = nullptr;
   std::unordered_map<CURL *, Op *> inflight_;  /**< easy handle -> op */
+  std::unordered_set<Op *> parked_;            /**< ops in a backoff window */
 };
 
 }  // namespace clio::run::bdev
