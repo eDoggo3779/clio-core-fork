@@ -35,7 +35,7 @@
 #   ${HOME}/cte_sweep_results/results.csv  (48 rows)
 
 config:
-  name: cte_sweep_1n
+  name: cte_sweep_juicefs_1n
   pkgs:
     # --- Chimaera runtime (owns the daemon; shm IPC for single-node) ---
     - pkg_type: jarvis_clio_core.clio_runtime

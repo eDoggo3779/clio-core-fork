@@ -1,7 +1,7 @@
 #!/bin/bash
 # Queue the single-node CLIO Core (CTE) performance sweep on Ares.
 #
-# Wraps `jarvis ppl run yaml .../ares/cte_sweep_1n.yaml` in a SLURM batch job:
+# Wraps `jarvis ppl run yaml .../ares/cte_sweep_juicefs_1n.yaml` in a SLURM batch job:
 # grabs one compute node, activates the iowarp conda env, (re)registers the
 # repo, and runs the 48-run sweep (io_size {4k,16k,64k,128k} x threads {1,2,4,8}
 # x 3 repeats, 60 s each, Put). Output lands in $HOME/cte_sweep_results/results.csv.
@@ -15,7 +15,7 @@
 #
 # Watch it:   squeue -u $USER ; tail -f cte_sweep-<jobid>.out
 #
-#SBATCH --job-name=cte_sweep_1n
+#SBATCH --job-name=cte_sweep_juicefs_1n
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 # ConstrainCores=yes on Ares hands an ntasks=1 job a single core unless we ask
@@ -33,7 +33,7 @@ set -euo pipefail
 CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-iowarp}"
 REPO="${REPO:-$HOME/clio-core-fork}"
-PIPELINE="${PIPELINE:-$REPO/jarvis_clio_core/pipelines/ares/cte_sweep_1n.yaml}"
+PIPELINE="${PIPELINE:-$REPO/jarvis_clio_core/pipelines/ares/cte_sweep_juicefs_1n.yaml}"
 RESULTS="${RESULTS:-$HOME/cte_sweep_results/results.csv}"
 
 echo "=== CTE sweep on $(hostname) — job ${SLURM_JOB_ID:-local} ==="
