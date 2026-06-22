@@ -1,0 +1,116 @@
+# CLIO Core (CTE) two-node performance sweep — TCP, Mofka-comparable grid.
+#
+# Companion to the Mofka two-node TCP sweep
+# (jarvis_clio_core/pipelines/mofka/microbench_mofka_ares_multinode_2n.yaml).
+# Same 45-run grid as the CTE single-node sweep, so the CSV compares row-for-row
+# against BOTH the CTE-1n sweep and the Mofka-2n sweep:
+#
+#   * payload size (--io-size):  256, 1024, 4096, 16384, 65536  bytes
+#         == mofka_bench.data_size [256, 1024, 4096, 16384, 65536]
+#   * threads      (--threads):  1, 2, 4   == mofka_bench.num_threads [1, 2, 4]
+#   * 3 repeats                  => 5 x 3 x 3 = 45 runs
+#
+# TOPOLOGY — symmetric, the load-bearing difference from Mofka-2n.
+# CTE is symmetric: EVERY node runs its own Chimaera runtime + CTE pool + RAM
+# tier and serves its own local data. The runtime package PSSH-launches the
+# daemon on both allocated nodes; clio_cte PSSH-composes the pool on both; and
+# clio_cte_bench runs nprocs=2 / ppn=1 -> one Put rank per node. Each rank talks
+# to ITS OWN local daemon over TCP loopback (CLIO_SERVER_ADDR=127.0.0.1) and,
+# with query_type: local, every PutBlob stays on that node's tier. Aggregate
+# 2-node throughput is therefore the SUM of two independent local-service nodes.
+#
+# Contrast with Mofka-2n, which is ASYMMETRIC: 1 bedrock broker on the head node
+# + 1 producer/consumer client on the other node, all client traffic funneling
+# into the single warabi data provider over Mercury. So "2 nodes" means 2
+# local-serving CTE nodes vs. (1 server + 1 client) for Mofka — CTE's effective
+# client count is N, Mofka's is N-1, and Mofka's single-broker fan-in is the
+# structural ceiling CTE's symmetric model does not have. Interpret the 2n
+# numbers with that architectural difference in mind (see
+# jarvis_clio_core/pipelines/ares/CTE_MOFKA_COMPARISON.md).
+#
+# Transport is **TCP** (ipc_mode: tcp; CTE has no RDMA). This sweep exercises the
+# client<->local-daemon TCP path on each node; it does NOT drive cross-node CTE
+# traffic (query_type stays local), mirroring how the Mofka-2n client pulls from
+# its co-located-on-the-wire broker rather than CTE deliberately sharding.
+#
+# Working set is held CONSTANT at 256 MiB per io_size per node via
+# --max-total-blobs (see the 1n file for the rationale + the zip table).
+#
+# clio_cte_bench._get_stat writes results.csv columns:
+#   cte_bench.put.{agg_bw_mbps, agg_ops_per_sec, avg_latency_per_op_us,
+#                  bw_per_thread_avg_mbps, total_data_mb, total_ops, ...}
+# (Per the bench, these are the LOCAL rank's metrics; the two ranks share one
+# bench_output.txt on the shared FS — the last writer wins, so treat 2n rows as
+# per-node figures and double for the symmetric aggregate. This matches how the
+# Mofka harness reports a single client's throughput at 2n.)
+#
+# Requires on PATH (inside the iowarp conda env, on every node): clio_cte_bench
+# (built from a branch carrying the rich bench_common.h PrintResults — e.g.
+# cte-benchmarking / main) and clio_run. Launch via
+# scripts/run_cte_sweep_2n_ares.sbatch (grabs 2 nodes, sets the jarvis hostfile
+# to both, then `jarvis ppl run yaml` this file).
+#
+# Usage (inside a 2-node allocation, jarvis hostfile already set to both nodes):
+#   jarvis ppl run yaml jarvis_clio_core/pipelines/ares/cte_sweep_2n.yaml
+# Output:
+#   ${HOME}/cte_sweep_2n_results/results.csv  (45 rows)
+
+config:
+  name: cte_sweep_2n
+  # Pssh-to-node route — the conda libcrypto.so.3 shadows the system libcrypto
+  # that /usr/bin/ssh was built against. Strip the conda LD_LIBRARY_PATH only
+  # for the ssh hop so the binary launcher still finds its own libs. (Same fix
+  # the Mofka-2n + clio_cte_bench_baremetal_2n pipelines use.)
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+  pkgs:
+    # --- Chimaera runtime on BOTH nodes (PSSH); TCP client transport ---
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      port: 9413
+      ipc_mode: "tcp"
+      log_level: "info"
+      sleep: 4
+
+    # --- CTE core: single local RAM tier per node (neighborhood: 1 = local only) ---
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "16GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      # Pssh fans the compose to every node; each hits its local admin via
+      # pool_query: local, so both nodes end up with a configured CTE pool.
+      pool_query: "local"
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    # --- CTE benchmark: one Put rank per node (nprocs=2, ppn=1), local target ---
+    - pkg_type: jarvis_clio_core.clio_cte_bench
+      pkg_name: cte_bench
+      test_case: "Put"
+      num_threads: 1
+      depth: 1
+      io_size: "256"
+      time_limit: 60
+      max_total_blobs: 1048576
+      query_type: "local"
+      nprocs: 2
+      ppn: 1
+      init_runtime: false
+      output_file: cte_bench.log
+
+vars:
+  # Payload size + matching 256 MiB-unique per-node working set (zipped).
+  cte_bench.io_size:         ["256",   "1024",  "4096", "16384", "65536"]
+  cte_bench.max_total_blobs: [1048576, 262144,  65536,  16384,   4096]
+
+  # Client thread scaling per node (matches mofka_bench.num_threads).
+  cte_bench.num_threads:     [1, 2, 4]
+
+loop:
+  - [cte_bench.io_size, cte_bench.max_total_blobs]   # outer (zipped pair) -> 5
+  - [cte_bench.num_threads]                          # inner -> 3  => 15 combos
+
+repeat: 3                       # x3 repeats -> 45 runs
+output: "${HOME}/cte_sweep_2n_results"

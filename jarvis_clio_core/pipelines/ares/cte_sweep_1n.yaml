@@ -1,0 +1,105 @@
+# CLIO Core (CTE) single-node performance sweep — TCP, Mofka-comparable grid.
+#
+# Companion to the Mofka single-node TCP sweep
+# (jarvis_clio_core/pipelines/mofka/microbench_mofka_ares.yaml). Brings up the
+# Chimaera runtime + a CTE pool with a single RAM tier, then drives
+# clio_cte_bench (Put / write) against it over the SAME knob grid Mofka used, so
+# CTE and Mofka are directly comparable row-for-row:
+#
+#   * payload size (--io-size):  256, 1024, 4096, 16384, 65536  bytes
+#         == mofka_bench.data_size [256, 1024, 4096, 16384, 65536]
+#   * threads      (--threads):  1, 2, 4   == mofka_bench.num_threads [1, 2, 4]
+#   * 3 repeats                  => 5 x 3 x 3 = 45 runs   (matches Mofka's 45)
+#
+# Transport is **TCP** (ipc_mode: tcp), the CTE analog of Mofka's `protocol:
+# "tcp"`: the bench client serializes each PutBlob over a ZeroMQ TCP socket to
+# its LOCAL Chimaera daemon (CLIO_SERVER_ADDR defaults to 127.0.0.1) instead of
+# attaching shared memory. CTE has no RDMA transport, so only TCP is swept
+# (Mofka additionally has an ofi+verbs twin; there is no CTE counterpart).
+# ipc_mode is set on the runtime package and propagates to the bench via the
+# jarvis pipeline env (CLIO_IPC_MODE=TCP).
+#
+# Operation is **Put** to mirror Mofka's data-producing path (push events ->
+# write blobs). Mofka's headline metric is events/sec & derived MB/s; CTE's is
+# Put MB/s & IOPS at the matched payload size — align comparisons on payload
+# size and on aggregate throughput.
+#
+# Working set is held CONSTANT at 256 MiB per io_size via --max-total-blobs
+# (total unique bytes = max_total_blobs * io_size, split evenly across threads —
+# see clio_cte_bench help). Holding it constant isolates the thread-scaling
+# effect, and 256 MiB keeps the small-payload key count bounded (256 B -> 1 Mi
+# blobs, ~150 MB of blob metadata) so the RAM tier and the runtime main segment
+# never overflow under a 60 s time-limited Put at any thread count. The values
+# zip with io_size: 256->1048576, 1024->262144, 4096->65536, 16384->16384,
+# 65536->4096 (each = 256 MiB / io_size).
+#
+# clio_cte_bench._get_stat writes results.csv columns:
+#   cte_bench.put.{agg_bw_mbps, agg_ops_per_sec, avg_latency_per_op_us,
+#                  bw_per_thread_avg_mbps, total_data_mb, total_ops, ...}
+#
+# Requires on PATH (inside the iowarp conda env): clio_cte_bench (built from a
+# branch carrying the rich bench_common.h PrintResults — e.g. cte-benchmarking /
+# main), plus the clio_run runtime. Launch on a compute node via
+# scripts/run_cte_sweep_1n_ares.sbatch (which calls `jarvis ppl run yaml` on
+# this file — the runner auto-detects the vars:+loop: sweep and writes
+# ${output}/results.csv).
+#
+# Usage (inside an allocation):
+#   jarvis ppl run yaml jarvis_clio_core/pipelines/ares/cte_sweep_1n.yaml
+# Output:
+#   ${HOME}/cte_sweep_1n_results/results.csv  (45 rows)
+
+config:
+  name: cte_sweep_1n
+  pkgs:
+    # --- Chimaera runtime (owns the daemon; TCP client transport) ---
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      port: 9413
+      ipc_mode: "tcp"
+      log_level: "info"
+      sleep: 4
+
+    # --- CTE core: single RAM tier (16 GiB -> 64x headroom over the 256 MiB set) ---
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "16GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    # --- CTE benchmark (Put / write; metrics -> results.csv) ---
+    - pkg_type: jarvis_clio_core.clio_cte_bench
+      pkg_name: cte_bench
+      test_case: "Put"
+      num_threads: 1
+      depth: 1
+      io_size: "256"
+      time_limit: 60
+      max_total_blobs: 1048576
+      query_type: "local"
+      nprocs: 1
+      ppn: 1
+      init_runtime: false
+      output_file: cte_bench.log
+
+vars:
+  # Payload size + matching 256 MiB-unique working set (zipped so each io_size
+  # pairs with 256 MiB/io_size). Because --max-total-blobs is split across
+  # threads, the working set is thread-independent.
+  cte_bench.io_size:         ["256",   "1024",  "4096", "16384", "65536"]
+  cte_bench.max_total_blobs: [1048576, 262144,  65536,  16384,   4096]
+
+  # Client thread scaling (matches mofka_bench.num_threads).
+  cte_bench.num_threads:     [1, 2, 4]
+
+loop:
+  - [cte_bench.io_size, cte_bench.max_total_blobs]   # outer (zipped pair) -> 5
+  - [cte_bench.num_threads]                          # inner -> 3  => 15 combos
+
+repeat: 3                       # x3 repeats -> 45 runs
+output: "${HOME}/cte_sweep_1n_results"
