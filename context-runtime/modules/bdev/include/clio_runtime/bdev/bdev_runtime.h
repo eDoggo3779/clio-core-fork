@@ -46,6 +46,14 @@
 #include <memory>
 #include <mutex>
 
+#if defined(CLIO_BDEV_ANY_CLOUD_ENABLED)
+// Cloud object-store backends (kS3/kGcs/kAzure/kAzurePage/kOss) are unified
+// behind one ObjectStoreClient interface + a factory; the concrete provider
+// clients are pulled in only by object_store_factory.cc.
+#include "object_store_client.h"
+#include "object_store_factory.h"
+#endif
+
 /**
  * Runtime container for bdev ChiMod
  *
@@ -402,6 +410,17 @@ class Runtime : public chi::Container {
 
   // kHbm / kPinned removed — see WriteToRam comment above.
 
+#if defined(CLIO_BDEV_ANY_CLOUD_ENABLED)
+  // Cloud object-store storage (kS3/kGcs/kAzure/kAzurePage/kOss). One client is
+  // owned per worker because a curl multi handle is not safe to share across
+  // threads. The pool name captured at Create lets the factory reconstruct the
+  // per-worker client lazily; the offset->object mapping (block->object vs
+  // in-place page blob) lives inside the concrete ObjectStoreClient, so the
+  // runtime stays fully provider-agnostic.
+  std::string cloud_pool_name_;
+  std::vector<std::unique_ptr<ObjectStoreClient>> worker_cloud_clients_;
+#endif
+
   // New allocator components
   GlobalBlockMap global_block_map_;              // Global block cache with per-worker locking
   Heap heap_;                                     // Heap allocator for new blocks
@@ -491,6 +510,27 @@ class Runtime : public chi::Container {
    */
   void WriteToRam(ctp::ipc::FullPtr<WriteTask> task);
   void ReadFromRam(ctp::ipc::FullPtr<ReadTask> task);
+
+#if defined(CLIO_BDEV_ANY_CLOUD_ENABLED)
+  /**
+   * Backend-specific cloud object-store operations (coroutines that yield while
+   * the async PUT/GET is in flight, mirroring WriteToFile/ReadFromFile). One
+   * pair serves every cloud BdevType; the per-provider request construction and
+   * the offset->object mapping (block->object vs in-place page blob) live behind
+   * the ObjectStoreClient interface, so these are fully provider-agnostic.
+   */
+  chi::TaskResume WriteToCloud(ctp::ipc::FullPtr<WriteTask> task,
+                               chi::RunContext &ctx);
+  chi::TaskResume ReadFromCloud(ctp::ipc::FullPtr<ReadTask> task,
+                                chi::RunContext &ctx);
+
+  /**
+   * Get (lazily creating) the cloud object-store client for the given worker.
+   * @param worker_id Worker ID.
+   * @return Pointer to the worker's client, or nullptr on failure.
+   */
+  ObjectStoreClient *GetWorkerCloudClient(size_t worker_id);
+#endif
 
   // BdevType::kHbm / BdevType::kPinned tiers were removed. PutBlob /
   // GetBlob with HBM-resident ShmPtr data buffers route through kRam

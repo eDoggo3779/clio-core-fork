@@ -75,8 +75,119 @@ compose:
   #   pool_name: "/mnt/nvme/chi_bdev"
   #   pool_query: local
   #   pool_id: "302.0"
-  #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop
+  #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop, s3, gcs
   #   capacity: "100GB"
+
+  # === Block Device (S3 object store) — prototype ===
+  # Requires building with -DCLIO_CORE_ENABLE_S3=ON (libcurl + OpenSSL SigV4).
+  # pool_name encodes the bucket + key prefix: s3://<bucket>/<prefix>.
+  # The endpoint, region, and credentials come from the environment (NOT this
+  # file, so no secrets are serialized): S3_ENDPOINT (or AWS_ENDPOINT_URL),
+  # AWS_REGION (default us-east-1), AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+  # Each allocator block maps to one object keyed by byte offset (s3backer
+  # model); capacity is required (the object store has no device size to stat).
+  # Example against a local MinIO:
+  #   export S3_ENDPOINT=http://127.0.0.1:9000
+  #   export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
+  # - mod_name: clio_bdev
+  #   pool_name: "s3://clio-bdev/pool0"
+  #   pool_query: local
+  #   pool_id: "303.0"
+  #   bdev_type: s3                      # Options: file, ram, hbm, pinned, noop, s3, gcs
+  #   capacity: "10GB"
+
+  # === Block Device (Google Cloud Storage) ===
+  # Requires building with -DCLIO_CORE_ENABLE_GCS=ON (libcurl + OpenSSL +
+  # nlohmann/json). pool_name encodes the bucket + key prefix: gcs://<bucket>/
+  # <prefix>. Endpoint, project, credentials, and tuning come from the
+  # environment (NOT this file, so no secrets are serialized):
+  #   GCS_ENDPOINT    (default https://storage.googleapis.com; point at a
+  #                    fake-gcs-server, e.g. http://127.0.0.1:4443, to emulate)
+  #   GCS_PROJECT_ID  (default clio-prototype; only used to create the bucket)
+  # Auth resolves via the Application Default Credentials precedence chain, and
+  # the bearer token is cached + refreshed before expiry, shared across workers:
+  #   1. GCS_ACCESS_TOKEN                (verbatim bearer token)
+  #   2. GOOGLE_APPLICATION_CREDENTIALS  (service-account JSON -> RS256 JWT, or a
+  #                                       gcloud authorized_user refresh token)
+  #   3. gcloud ADC file (~/.config/gcloud/application_default_credentials.json)
+  #   4. GCE/GKE metadata server         (also GKE Workload Identity)
+  #   5. anonymous                       (fake-gcs-server / public objects)
+  # Optional tuning knobs (all default to safe production values):
+  #   GCS_MAX_RETRIES (5) / GCS_RETRY_BASE_MS (100) / GCS_RETRY_MAX_MS (30000)
+  #        exponential-backoff retry on HTTP 429/5xx + transient network errors
+  #   GCS_RESUMABLE_THRESHOLD (8388608)  writes >= N bytes use a resumable
+  #        upload; block writes are smaller, so media upload is the normal path
+  #   GCS_CONNECT_TIMEOUT_S (10) / GCS_FORCE_HTTP11 (unset => HTTP/2) / GCS_CA_BUNDLE
+  #   GCS_DISABLE_METADATA               skip the off-GCP metadata probe
+  # Uses the GCS JSON API (media/resumable upload + alt=media download); same
+  # s3backer block->object mapping as kS3. capacity is required.
+  # Example against a local fake-gcs-server (anonymous):
+  #   export GCS_ENDPOINT=http://127.0.0.1:4443 GCS_PROJECT_ID=clio-prototype
+  # - mod_name: clio_bdev
+  #   pool_name: "gcs://clio-bdev/pool0"
+  #   pool_query: local
+  #   pool_id: "304.0"
+  #   bdev_type: gcs                     # Options: file, ram, hbm, pinned, noop, s3, gcs
+  #   capacity: "10GB"
+
+  # === Block Device (Azure Blob storage) — prototype ===
+  # Requires building with -DCLIO_CORE_ENABLE_AZURE=ON (libcurl + OpenSSL
+  # Shared Key signing). pool_name encodes the container + key prefix:
+  # azure://<container>/<prefix>. The endpoint, account, and access key come
+  # from the environment (NOT this file, so no secrets are serialized):
+  #   AZURE_BLOB_ENDPOINT   (e.g. http://127.0.0.1:10000 for Azurite, or
+  #                          https://<account>.blob.core.windows.net for Azure)
+  #   AZURE_STORAGE_ACCOUNT (storage account name; "devstoreaccount1" on Azurite)
+  #   AZURE_STORAGE_KEY     (base64 account access key)
+  # Addressing style is auto-detected: account-in-host -> virtual-hosted,
+  # otherwise account-as-first-path-segment (the Azurite emulator convention).
+  # Two backends are provided:
+  #   bdev_type: azure       -> Block Blob. One immutable blob per allocator
+  #                             block, keyed by byte offset (s3backer model;
+  #                             whole-object PUT/GET, like kS3).
+  #   bdev_type: azure_page  -> Page Blob. The WHOLE device is one page blob
+  #                             written in-place at 512-byte-aligned byte
+  #                             offsets (Put Page) — the cloud primitive that
+  #                             matches the bdev's flat-device offset model.
+  # capacity is required (it sizes the heap allocator and, for page blobs, the
+  # page blob's virtual length).
+  # Example against a local Azurite (well-known dev account):
+  #   export AZURE_BLOB_ENDPOINT=http://127.0.0.1:10000
+  #   export AZURE_STORAGE_ACCOUNT=devstoreaccount1
+  #   export AZURE_STORAGE_KEY=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+  # - mod_name: clio_bdev
+  #   pool_name: "azure://clio-bdev/pool0"
+  #   pool_query: local
+  #   pool_id: "305.0"
+  #   bdev_type: azure                   # or azure_page (in-place Page Blob)
+  #   capacity: "10GB"
+
+  # === Block Device (Alibaba Cloud OSS) — prototype ===
+  # Requires building with -DCLIO_CORE_ENABLE_OSS=ON (libcurl + OpenSSL). The
+  # genuinely OSS-specific part is the native V1 signer: HMAC-SHA1 over a
+  # canonicalized request, "Authorization: OSS <AccessKeyId>:<Signature>", an
+  # RFC-1123 Date header, and x-oss-* canonical headers (structurally different
+  # from AWS SigV4). pool_name encodes the bucket + key prefix:
+  # oss://<bucket>/<prefix>. Endpoint/region/credentials come from the
+  # environment (NOT this file, so no secrets are serialized):
+  #   OSS_ENDPOINT          (e.g. https://oss-cn-hangzhou.aliyuncs.com, or
+  #                          http://127.0.0.1:9000 for a local S3 emulator)
+  #   OSS_REGION            (default cn-hangzhou; us-east-1 for MinIO s3-compat)
+  #   OSS_ACCESS_KEY_ID     (AccessKeyId; AWS_ACCESS_KEY_ID also accepted)
+  #   OSS_ACCESS_KEY_SECRET (AccessKeySecret; AWS_SECRET_ACCESS_KEY accepted)
+  #   OSS_SIGNATURE         (v1 = native OSS [default]; s3 = AWS SigV4 for OSS's
+  #                          S3-compatible endpoint or an S3 emulator like MinIO)
+  # Each allocator block maps to one object keyed by byte offset (s3backer
+  # model; whole-object PUT/GET, like kS3); capacity is required.
+  # Example against real OSS (native V1 signing):
+  #   export OSS_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com
+  #   export OSS_ACCESS_KEY_ID=...  OSS_ACCESS_KEY_SECRET=...
+  # - mod_name: clio_bdev
+  #   pool_name: "oss://clio-bdev/pool0"
+  #   pool_query: local
+  #   pool_id: "306.0"
+  #   bdev_type: oss
+  #   capacity: "10GB"
 
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0

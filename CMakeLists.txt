@@ -144,6 +144,10 @@ option(CLIO_CORE_ENABLE_GPU_RUNTIME "Enable GPU runtime (CDP-based parallelism)"
 option(CLIO_CORE_ENABLE_ROCM "Enable ROCm support" OFF)
 option(CLIO_CORE_ENABLE_NIXL "Enable NIXL (NVIDIA Inference Xfer Library) transport" OFF)
 option(CLIO_CORE_ENABLE_NVSHMEM "Enable NVSHMEM GPU-to-GPU communication library" OFF)
+option(CLIO_CORE_ENABLE_S3 "Enable S3 object-store bdev backend (libcurl + SigV4)" OFF)
+option(CLIO_CORE_ENABLE_GCS "Enable Google Cloud Storage bdev backend (libcurl + OAuth2)" OFF)
+option(CLIO_CORE_ENABLE_AZURE "Enable Azure Blob bdev backend (libcurl + Shared Key)" OFF)
+option(CLIO_CORE_ENABLE_OSS "Enable Alibaba Cloud OSS bdev backend (libcurl + OSS V1 HMAC-SHA1)" OFF)
 option(CLIO_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fsycl)" OFF)
 option(CLIO_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 

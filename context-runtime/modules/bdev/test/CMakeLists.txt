@@ -166,6 +166,193 @@ add_custom_target(test_bdev_error
   COMMENT "Running Chimaera bdev error handling tests"
 )
 
+# S3 backend roundtrip test (prototype) — built only when S3 is enabled.
+# Self-skips at runtime unless S3_ENDPOINT is set, so it is safe in CI.
+if(CLIO_CORE_ENABLE_S3)
+  set(BDEV_S3_TEST_TARGET chimaera_bdev_s3_tests)
+  add_executable(${BDEV_S3_TEST_TARGET} test_bdev_s3.cc)
+  target_include_directories(${BDEV_S3_TEST_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+    ${CLIO_RUN_ROOT}/modules/admin/include
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(${BDEV_S3_TEST_TARGET}
+    clio_admin_runtime
+    clio_admin_client
+    clio_bdev_runtime
+    clio_bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(${BDEV_S3_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_bdev_s3_tests
+    COMMAND ${BDEV_S3_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_s3_tests PROPERTIES
+    TIMEOUT 300
+    LABELS "msan_skip"
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+  )
+  install(TARGETS ${BDEV_S3_TEST_TARGET} RUNTIME DESTINATION bin)
+endif()
+
+# GCS backend roundtrip test (prototype) — built only when GCS is enabled.
+# Self-skips at runtime unless GCS_ENDPOINT is set, so it is safe in CI.
+if(CLIO_CORE_ENABLE_GCS)
+  set(BDEV_GCS_TEST_TARGET chimaera_bdev_gcs_tests)
+  add_executable(${BDEV_GCS_TEST_TARGET} test_bdev_gcs.cc)
+  target_include_directories(${BDEV_GCS_TEST_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+    ${CLIO_RUN_ROOT}/modules/admin/include
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(${BDEV_GCS_TEST_TARGET}
+    clio_admin_runtime
+    clio_admin_client
+    clio_bdev_runtime
+    clio_bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(${BDEV_GCS_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_bdev_gcs_tests
+    COMMAND ${BDEV_GCS_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_gcs_tests PROPERTIES
+    TIMEOUT 300
+    LABELS "msan_skip"
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+  )
+  install(TARGETS ${BDEV_GCS_TEST_TARGET} RUNTIME DESTINATION bin)
+
+  # Offline GCS unit tests (JWT signer, JSON parsing, ADC precedence, retry
+  # policy). No network and no runtime init, so this ALWAYS runs (unlike the
+  # endpoint-gated trace test above) — it is the primary correctness proof for
+  # the auth/retry code real GCS exercises.
+  set(BDEV_GCS_UNIT_TARGET chimaera_bdev_gcs_unit_tests)
+  add_executable(${BDEV_GCS_UNIT_TARGET} test_gcs_unit.cc)
+  target_include_directories(${BDEV_GCS_UNIT_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+    ${CLIO_RUN_ROOT}/modules/admin/include
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(${BDEV_GCS_UNIT_TARGET}
+    clio_admin_runtime
+    clio_admin_client
+    clio_bdev_runtime
+    clio_bdev_client
+    ctp::cxx
+    CURL::libcurl
+    OpenSSL::Crypto
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(${BDEV_GCS_UNIT_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_bdev_gcs_unit_tests
+    COMMAND ${BDEV_GCS_UNIT_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_gcs_unit_tests PROPERTIES
+    TIMEOUT 120
+    LABELS "msan_skip"
+  )
+  install(TARGETS ${BDEV_GCS_UNIT_TARGET} RUNTIME DESTINATION bin)
+endif()
+
+# Azure Blob backend roundtrip test (prototype) — built only when Azure is
+# enabled. Self-skips at runtime unless AZURE_BLOB_ENDPOINT is set (CI-safe).
+if(CLIO_CORE_ENABLE_AZURE)
+  set(BDEV_AZURE_TEST_TARGET chimaera_bdev_azure_tests)
+  add_executable(${BDEV_AZURE_TEST_TARGET} test_bdev_azure.cc)
+  target_include_directories(${BDEV_AZURE_TEST_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+    ${CLIO_RUN_ROOT}/modules/admin/include
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(${BDEV_AZURE_TEST_TARGET}
+    clio_admin_runtime
+    clio_admin_client
+    clio_bdev_runtime
+    clio_bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(${BDEV_AZURE_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_bdev_azure_tests
+    COMMAND ${BDEV_AZURE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_azure_tests PROPERTIES
+    TIMEOUT 300
+    LABELS "msan_skip"
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+  )
+  install(TARGETS ${BDEV_AZURE_TEST_TARGET} RUNTIME DESTINATION bin)
+endif()
+
+# Alibaba Cloud OSS backend test (prototype) — built only when OSS is enabled.
+# The native OSS V1 signer test-vector case always runs (no network); the
+# data-plane roundtrip/sparse cases self-skip unless OSS_ENDPOINT is set.
+if(CLIO_CORE_ENABLE_OSS)
+  set(BDEV_OSS_TEST_TARGET chimaera_bdev_oss_tests)
+  add_executable(${BDEV_OSS_TEST_TARGET} test_bdev_oss.cc)
+  target_include_directories(${BDEV_OSS_TEST_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+    ${CLIO_RUN_ROOT}/modules/admin/include
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(${BDEV_OSS_TEST_TARGET}
+    clio_admin_runtime
+    clio_admin_client
+    clio_bdev_runtime
+    clio_bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(${BDEV_OSS_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_bdev_oss_tests
+    COMMAND ${BDEV_OSS_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_oss_tests PROPERTIES
+    TIMEOUT 300
+    LABELS "msan_skip"
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10502"
+  )
+  install(TARGETS ${BDEV_OSS_TEST_TARGET} RUNTIME DESTINATION bin)
+endif()
+
 # Install test executable
 install(TARGETS ${BDEV_TEST_TARGET}
   RUNTIME DESTINATION bin
