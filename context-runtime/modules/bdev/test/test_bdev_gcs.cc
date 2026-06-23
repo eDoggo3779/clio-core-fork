@@ -88,6 +88,13 @@ void EnsureInit() {
   }
 }
 
+/** Bucket for the trace test; override with GCS_TEST_BUCKET for real GCS.
+ *  Defaults to the local fake-gcs-server bucket name used in CI. */
+inline std::string TestBucket() {
+  const char* b = std::getenv("GCS_TEST_BUCKET");
+  return (b && *b) ? std::string(b) : std::string("clio-gcs-test");
+}
+
 /** @return true if no GCS endpoint is configured (test should skip). */
 bool ShouldSkip() {
   const char* ep = std::getenv("GCS_ENDPOINT");
@@ -112,7 +119,7 @@ TEST_CASE("bdev_gcs_allocation_and_io", "[bdev][gcs][io]") {
   // 4 MiB logical capacity; bucket/prefix encoded in pool_name.
   const chi::u64 gcs_capacity = 4 * 1024 * 1024;
   std::string pool_name =
-      "gcs://clio-gcs-test/pool_" + std::to_string(getpid());
+      "gcs://" + TestBucket() + "/clio-validation/pool_" + std::to_string(getpid());
   auto create_task = bdev_client.AsyncCreate(
       chi::PoolQuery::Dynamic(), pool_name, custom_pool_id,
       clio::run::bdev::BdevType::kGcs, gcs_capacity);
@@ -186,7 +193,7 @@ TEST_CASE("bdev_gcs_sparse_read_zeros", "[bdev][gcs][sparse]") {
   clio::run::bdev::Client bdev_client(custom_pool_id);
   const chi::u64 gcs_capacity = 4 * 1024 * 1024;
   std::string pool_name =
-      "gcs://clio-gcs-test/sparse_" + std::to_string(getpid());
+      "gcs://" + TestBucket() + "/clio-validation/sparse_" + std::to_string(getpid());
   auto create_task = bdev_client.AsyncCreate(
       chi::PoolQuery::Dynamic(), pool_name, custom_pool_id,
       clio::run::bdev::BdevType::kGcs, gcs_capacity);
