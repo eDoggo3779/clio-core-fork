@@ -89,6 +89,15 @@ class JuicefsBench(Application):
                 'default': False,
             },
             {
+                'name': 'fallocate',
+                'msg': 'fio --fallocate mode. Use "none" for FUSE mounts '
+                       'that reject fallocate (e.g. the CTE libfuse mount); '
+                       '"native" preserves fio\'s default.',
+                'type': str,
+                'choices': ['none', 'native', 'posix', 'keep'],
+                'default': 'native',
+            },
+            {
                 'name': 'fio_bin',
                 'msg': 'Path to the fio binary',
                 'type': str,
@@ -153,6 +162,7 @@ class JuicefsBench(Application):
             f"--size={self.config['size_per_job']}",
             f"--ioengine={self.config['ioengine']}",
             f"--direct={1 if self.config['direct'] else 0}",
+            f"--fallocate={self.config['fallocate']}",
             '--group_reporting',
             '--output-format=json',
             f'--output={json_path}',

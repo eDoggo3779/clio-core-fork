@@ -1,0 +1,83 @@
+# =============================================================================
+# Dockerfile.regression — prebuilt image for the #526 CONTAINER pipelines
+# (single_node.yaml / distributed.yaml with base_deploy_mode: container).
+# =============================================================================
+#
+# The jarvis dev ContainerInstaller pulls this image (container_uri) and runs
+# the WHOLE pipeline inside ONE container per node (entrypoint:
+# `jarvis ppl run yaml ...`, network_mode host, ipc host, as root). Every
+# package — redis, juicefs, fio, clio_* — runs bare-metal inside it, so a FUSE
+# mount made by juicefs/CTE is visible to fio in the same mount namespace.
+#
+# THE BUILD IS THE "installs run cleanly" GATE: the final RUN fails the build if
+# any required binary is missing.
+#
+# Build once (Ares login node has docker), then push + reference via
+# container_uri (or `docker save`/`load` per node + reference via
+# container_image). Rebuild daily so #526 tracks the latest IOWarp.
+#
+#   # build from the REPO ROOT so the COPY below bakes in the local
+#   # jarvis_clio_core edits (redis _get_stat, juicefs_bench fallocate):
+#   docker build -f jarvis_clio_core/pipelines/container/Dockerfile.regression \
+#     --build-arg IOWARP_SPEC='iowarp@main +libfuse' \
+#     -t <registry>/iowarp-regression:<tag> .
+#   docker push <registry>/iowarp-regression:<tag>
+#
+# SITE-SPECIFIC ARGs (override at build):
+ARG BASE_IMAGE=iowarp/iowarp-build:latest   # carries spack + IOWarp build deps
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+# IOWarp spec — the FUSE-adapter variant is SITE-SPECIFIC: project_info says
+# `+libfuse`; the Ares semantic_search pipeline uses `+fuse`; a stock recipe may
+# expose neither. Must yield clio_run, clio_cte_fuse, clio_cte_bench,
+# clio_redis_bench (the last needs the recipe's redis/CLIO_CORE_ENABLE_REDIS).
+ARG IOWARP_SPEC=iowarp@main +libfuse
+ARG JUICEFS_VERSION=1.2.3
+ARG JARVIS_REF=dev                          # MUST match the Ares jarvis pin
+ARG SPACK_SETUP=/opt/spack/share/spack/setup-env.sh
+
+# 1) System deps: FUSE, MPI, redis (server+cli+benchmark), fio, ssh, python.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        fuse3 libfuse3-3 \
+        openmpi-bin libopenmpi-dev \
+        redis-server redis-tools \
+        fio \
+        git curl ca-certificates \
+        python3 python3-pip python3-venv \
+        openssh-server openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2) JuiceFS — official single static binary.
+RUN curl -fsSL "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-linux-amd64.tar.gz" \
+      | tar -xz -C /usr/local/bin juicefs \
+    && juicefs version
+
+# 3) IOWarp + FUSE adapter via spack (base image provides spack). Symlink a view
+#    onto a stable prefix so the clio_* binaries are on PATH without `spack load`.
+#    Adjust SPACK_SETUP to your base image's spack location if different.
+RUN . "${SPACK_SETUP}" \
+    && spack install --fail-fast ${IOWARP_SPEC} \
+    && spack view --dependencies yes symlink -i /opt/iowarp-view ${IOWARP_SPEC}
+ENV PATH=/opt/iowarp-view/bin:${PATH}
+ENV LD_LIBRARY_PATH=/opt/iowarp-view/lib:/opt/iowarp-view/lib64:${LD_LIBRARY_PATH}
+
+# 4) jarvis-cd at the PINNED dev ref — the orchestrator the entrypoint runs.
+RUN git clone --branch ${JARVIS_REF} https://github.com/grc-iit/jarvis-cd.git /opt/jarvis-cd \
+    && pip3 install --break-system-packages -e /opt/jarvis-cd
+
+# 5) jarvis_clio_core — COPY from the build context so the local edits (redis
+#    _get_stat, juicefs_bench fallocate) are baked in, then register the repo so
+#    `jarvis_clio_core.*` pkg_types resolve inside the container.
+COPY jarvis_clio_core /opt/clio-core/jarvis_clio_core
+RUN jarvis bootstrap local 2>/dev/null || true \
+    && jarvis repo add /opt/clio-core/jarvis_clio_core
+
+# 6) sshd: the jarvis docker-compose entrypoint starts sshd for orchestration.
+RUN mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh
+
+# 7) GATE — fail the build if any required binary is missing.
+RUN for b in clio_run clio_cte_fuse clio_cte_bench clio_redis_bench \
+             juicefs fio redis-server redis-cli redis-benchmark mpiexec jarvis; do \
+        command -v "$b" >/dev/null || { echo "MISSING REQUIRED BINARY: $b"; exit 1; }; \
+    done && echo "iowarp-regression image: all required binaries present"

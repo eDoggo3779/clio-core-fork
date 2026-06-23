@@ -1,0 +1,258 @@
+# =============================================================================
+# Issue #526 — Reproducible Jarvis pipeline: SINGLE-NODE regression sweep.
+# CONTAINERIZED (Docker) deployment.
+# =============================================================================
+#
+# One scheduler-wrapped pipeline test that benchmarks FOUR storage stacks
+# back-to-back over a shared (I/O size x thread count) grid and records every
+# run into ONE results.csv, so a daily Ares run can be diffed against yesterday
+# to catch performance regressions.
+#
+#   Experiments (project_info.md, Project 2 single-node):
+#     1. NFS            -> fio against the cluster's NFS home (bind-mounted)
+#     2. CTE + libfuse  -> fio against the CTE FUSE mount (POSIX -> FUSE -> CTE)
+#     3. redis          -> clio_redis_bench (SET/GET) against a local redis
+#     4. juicefs        -> fio against the JuiceFS FUSE mount (redis meta +
+#                          local-file object backend)
+#
+#   Grid (project_info.md):
+#     * I/O size:     4 KB, 64 KB, 128 KB, 1024 KB   -> 4k, 64k, 128k, 1m
+#     * thread count: 1, 2, 4, 8, 16, 32             -> 4 x 6 = 24 combinations
+#
+# CONTAINER MODEL (verified against the Ares dev jarvis @ 2925ee8):
+#   base_deploy_mode: container => jarvis's ContainerInstaller PULLS container_uri
+#   and runs the WHOLE pipeline inside ONE Docker container per node (entrypoint
+#   `jarvis ppl run yaml ...`, network_mode host, ipc host, as root). All five
+#   service/driver packages run bare-metal inside that one container, so the
+#   JuiceFS and CTE FUSE mounts are visible to fio in the SAME mount namespace.
+#   FUSE needs CAP_SYS_ADMIN + /dev/fuse + seccomp=unconfined (container_extensions
+#   below) — confirmed working on Ares compute-node docker.
+#
+# DRIVERS (reuse the repo's rich-metric drivers; builtin.ior emits no throughput):
+#   * juicefs_bench  -- generic "fio against a POSIX mountpoint" driver; one
+#                       instance per filesystem (NFS, CTE-libfuse, juicefs),
+#                       only target_dir differs. fio and ior measure the same
+#                       sequential-write bandwidth on a POSIX mount.
+#   * clio_redis_bench -- apples-to-apples mirror of clio_cte_bench (shared
+#                       bench_common.h metrics).
+#
+# ONE PIPELINE (coupled backends): a jarvis pipeline TEST applies the sweep to a
+# FIXED package set, so all four backends are swept together; each iteration
+# brings the services up once, runs the four drivers in order (Applications ->
+# sequential, one active at a time), tears down, and writes one CSV row with all
+# backends' columns at that (io_size, threads) point.
+#
+# INSTALLATION: baked into the prebuilt image (see
+# pipelines/container/Dockerfile.regression — the build is the install-cleanliness
+# gate). The image carries iowarp(+libfuse), redis, juicefs, fio, jarvis-cd, and
+# this repo. Rebuild the image daily so #526 tracks the latest IOWarp.
+#
+# PATHS: the container runs as root (${HOME} -> /root), so host storage is
+# bind-mounted (container_binds) and the experiments write to those binds:
+#   - NFS experiment  -> /mnt/nfs       (bound to the host NFS home -> real NFS)
+#   - juicefs object store -> /mnt/jfs_data (bound to host FS, not the overlay)
+#   - CTE/juicefs FUSE mounts + cache live on in-container paths (/mnt, /tmp);
+#     bench output files land in the auto-mounted shared_dir, and the runner
+#     writes results.csv on the HOST at `output:` below.
+#
+# USAGE (scheduler.nodes NOT swept => ONE allocation runs the whole 24-combo grid):
+#   jarvis ppl submit ${IOWARP}/jarvis_clio_core/pipelines/ares/single_node.yaml
+# Output:
+#   ${HOME}/single_node_results/results.csv   (24 rows; per-backend columns:
+#   <driver>.write.{agg_bw_mbps,iops,lat_mean_us,lat_p99_us,total_io_mb} for the
+#   fio drivers, redis_bench.put.{agg_bw_mbps,agg_ops_per_sec,...}.)
+#
+# NOTE: needs ~24 GiB free RAM for the CTE tier (peak fio set = 32 threads x
+# 256 MiB = 8 GiB; tier sized 3x). Wall-clock ~ 24 combos x 4 phases x ~70 s
+# ~= 1.9 h; bump `repeat` for day-to-day variance at proportional cost.
+
+scheduler:
+  name: slurm
+  job_name: single_node
+  nodes: 1
+  ntasks_per_node: 1
+  # Whole-node cgroup headroom for chimaera workers + FUSE + fio + redis (see
+  # ior_cte_libfuse_sbatch.yaml for why ntasks_per_node=1 needs cpus_per_task
+  # >> num_threads under proctrack/cgroup).
+  cpus_per_task: 32
+  partition: compute
+  time: "04:00:00"
+  exclude: "ares-comp-10,ares-comp-11"
+  output: slurm-%j.out
+  error: slurm-%j.err
+  pre_cmds:
+    # No software install here — it's baked into the image. Just create the
+    # HOST directories that container_binds maps in (so the NFS experiment hits
+    # real NFS and the juicefs object store lands on real FS, not the overlay).
+    - 'mkdir -p "$HOME/single_node_nfs" "$HOME/juicefs_data"'
+
+config:
+  name: single_node
+
+  # ---- Containerized deployment (Ares dev jarvis) ----------------------
+  # ContainerInstaller pulls this image and runs the pipeline inside it.
+  base_deploy_mode: container
+  container_engine: docker
+  # REPLACE with the image you built+pushed from Dockerfile.regression, e.g.
+  # ghcr.io/<you>/iowarp-regression:<tag>. (No registry? `docker save` it to a
+  # shared path, `docker load` on each node, and use `container_image:` with the
+  # local image name instead of `container_uri:`.)
+  container_uri: "iowarp-regression:latest"
+  # FUSE-in-container recipe (verified on Ares): mount syscalls + /dev/fuse +
+  # unblock io_uring_setup (CTE bdev) + relax AppArmor on mount.
+  container_extensions:
+    cap_add: [SYS_ADMIN]
+    devices: ["/dev/fuse:/dev/fuse"]
+    security_opt: ["apparmor:unconfined", "seccomp=unconfined"]
+  # Host paths bound into the container (env-expanded on the host). The NFS
+  # experiment and the juicefs object store MUST hit real host storage, not the
+  # container's ephemeral overlay.
+  container_binds:
+    - "${HOME}/single_node_nfs:/mnt/nfs"
+    - "${HOME}/juicefs_data:/mnt/jfs_data"
+
+  env:
+    # In-container memfd dir for chimaera (container /tmp is private + writable).
+    CLIO_MEMFD_DIR: "/tmp/iowarp_chimaera"
+
+  pkgs:
+    # ---- Services (started in order; stopped in reverse) -----------------
+    # Redis: metadata engine for JuiceFS (DB 1) AND server for the redis
+    # benchmark (DB 0). One server covers both; no persistence keeps it a fair
+    # in-memory peer of the CTE RAM tier.
+    - pkg_type: jarvis_clio_core.redis
+      pkg_name: redis
+      port: 6379
+      sleep: 4
+
+    # Chimaera runtime daemon (shm IPC for single-node).
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      sleep: 4
+
+    # CTE pool, single RAM tier. 24 GiB = 3x the 8 GiB peak fio set
+    # (32 threads x 256 MiB), so a 60 s time-based Put never overflows the tier.
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "24GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    # CTE libfuse mount (in-container): the "+ libfuse" path the fio driver
+    # below writes through (POSIX -> FUSE -> CTE).
+    - pkg_type: jarvis_clio_core.clio_cte_libfuse
+      pkg_name: cte_fuse
+      mountpoint: /mnt/cte_mnt
+      log_level: "info"
+      extra_fuse_args: "-f"
+      sleep: 2
+
+    # JuiceFS: format (storage=file) + FUSE mount. Object store on the bound
+    # host FS (/mnt/jfs_data); mount + cache on in-container paths.
+    - pkg_type: jarvis_clio_core.juicefs
+      pkg_name: juicefs
+      meta_url: "redis://127.0.0.1:6379/1"
+      storage: file
+      data_dir: /mnt/jfs_data
+      mountpoint: /mnt/jfs_mnt
+      cache_dir: /tmp/juicefs_cache
+      name: jfsbench
+      format_fresh: true
+      mount_wait: 20
+
+    # ---- Benchmark drivers (Applications; run sequentially) --------------
+    # 1) NFS: fio against the bound host NFS dir. fallocate=native (NFS supports).
+    - pkg_type: jarvis_clio_core.juicefs_bench
+      pkg_name: nfs_fio
+      target_dir: /mnt/nfs
+      io_size: "4k"
+      num_threads: 1
+      runtime: 60
+      mode: write
+      size_per_job: "256M"
+      ioengine: psync
+      direct: false
+      fallocate: native
+      output_file: nfs_fio.json
+
+    # 2) CTE + libfuse: fio against the CTE FUSE mount. fallocate=none because
+    #    the libfuse adapter may not implement fallocate (would error fio).
+    - pkg_type: jarvis_clio_core.juicefs_bench
+      pkg_name: cte_fio
+      target_dir: /mnt/cte_mnt
+      io_size: "4k"
+      num_threads: 1
+      runtime: 60
+      mode: write
+      size_per_job: "256M"
+      ioengine: psync
+      direct: false
+      fallocate: none
+      output_file: cte_fio.json
+
+    # 3) redis: clio_redis_bench SET (Put). Keyspace bounded to ~1 GiB global
+    #    via max_total_blobs (zipped with io_size below), so the working set is
+    #    thread-independent and redis never balloons next to the juicefs meta.
+    - pkg_type: jarvis_clio_core.clio_redis_bench
+      pkg_name: redis_bench
+      test_case: "Put"
+      num_threads: 1
+      depth: 1
+      io_size: "4k"
+      time_limit: 60
+      max_total_blobs: 262144
+      redis_host: "127.0.0.1"
+      redis_port: 6379
+      nprocs: 1
+      ppn: 1
+      output_file: redis_bench.log
+
+    # 4) juicefs: fio against the JuiceFS FUSE mount.
+    - pkg_type: jarvis_clio_core.juicefs_bench
+      pkg_name: jfs_fio
+      target_dir: /mnt/jfs_mnt
+      io_size: "4k"
+      num_threads: 1
+      runtime: 60
+      mode: write
+      size_per_job: "256M"
+      ioengine: psync
+      direct: false
+      fallocate: none
+      output_file: jfs_fio.json
+
+vars:
+  # I/O size, applied to all four drivers at once (zipped, length 4). 1m = the
+  # project's 1024 KB point. redis's matching ~1 GiB-unique keyspace is zipped
+  # in so 4k<->262144, 64k<->16384, 128k<->8192, 1m<->1024 stay paired
+  # (each = 1 GiB / io_size).
+  nfs_fio.io_size:             ["4k",   "64k",  "128k", "1m"]
+  cte_fio.io_size:             ["4k",   "64k",  "128k", "1m"]
+  jfs_fio.io_size:             ["4k",   "64k",  "128k", "1m"]
+  redis_bench.io_size:         ["4k",   "64k",  "128k", "1m"]
+  redis_bench.max_total_blobs: [262144, 16384,  8192,   1024]
+
+  # Thread count, applied to all four drivers at once (zipped, length 6).
+  nfs_fio.num_threads:        [1, 2, 4, 8, 16, 32]
+  cte_fio.num_threads:        [1, 2, 4, 8, 16, 32]
+  jfs_fio.num_threads:        [1, 2, 4, 8, 16, 32]
+  redis_bench.num_threads:    [1, 2, 4, 8, 16, 32]
+
+loop:
+  # Outer group: I/O size (+ redis keyspace), 4 values.
+  - [nfs_fio.io_size, cte_fio.io_size, jfs_fio.io_size,
+     redis_bench.io_size, redis_bench.max_total_blobs]
+  # Inner group: thread count, 6 values  =>  4 x 6 = 24 combinations.
+  - [nfs_fio.num_threads, cte_fio.num_threads, jfs_fio.num_threads,
+     redis_bench.num_threads]
+
+repeat: 1                       # bump to 3 for variance (~3x wall-clock)
+output: "${HOME}/single_node_results"

@@ -1,0 +1,193 @@
+# =============================================================================
+# Issue #526 — Reproducible Jarvis pipeline: MULTI-NODE (distributed) sweep.
+# CONTAINERIZED (Docker) deployment.
+# =============================================================================
+#
+# Sweeps the SLURM node count 1 -> 2 -> 4 at a FIXED (I/O size, thread) working
+# point and benchmarks three storage stacks, recording every run into one
+# results.csv for day-over-day regression tracking.
+#
+#   Experiments (project_info.md, Project 2 multi-node):
+#     1. NFS            -> fio against the cluster's shared NFS home (bind-mounted)
+#     2. CTE + libfuse  -> clio_cte_bench, one rank per node (see DRIVER NOTE)
+#     3. juicefs        -> fio against a JuiceFS mount
+#
+#   Sweep (project_info.md lists only the node count for multi-node):
+#     * nodes: 1, 2, 4      (fixed: io_size = 1m = 1024 KB, threads = 4)
+#
+# CONTAINER MODEL (verified against the Ares dev jarvis @ 2925ee8):
+#   base_deploy_mode: container => ContainerInstaller pulls container_uri; the
+#   pipeline runs inside ONE Docker container PER NODE (network_mode host, ipc
+#   host, root). Each node-container runs sshd, so jarvis Pssh / clio_cte_bench's
+#   MPI fan-out reaches the other nodes' containers (the dev docker-cluster
+#   model). FUSE (juicefs) needs CAP_SYS_ADMIN + /dev/fuse + seccomp=unconfined.
+#
+# DRIVER NOTE — why CTE uses clio_cte_bench here (not fio-through-libfuse):
+#   The only EXISTING rich-metric driver that scales across nodes and folds a
+#   per-node aggregate into results.csv is clio_cte_bench (validated 2-node in
+#   cte_sweep_2n.yaml): nprocs = node count, ppn = 1 => one Put rank per node,
+#   each talking to ITS OWN local CTE pool over loopback (query_type: local),
+#   _get_stat SUM-folds the per-host bandwidth/IOPS. fio (juicefs_bench) is
+#   single-node, so a fio-through-libfuse CTE run could not span nodes without a
+#   new multi-node fio driver. Trade-off: this measures the CTE *client API*
+#   path where single_node measures the *libfuse POSIX* path; per-cell
+#   (fixed-node) day-over-day regression tracking is unaffected.
+#
+#   NFS and juicefs are driven by fio FROM THE HEAD-NODE container (single
+#   client). NFS spans the allocation intrinsically (shared $HOME -> bound to
+#   /mnt/nfs); juicefs is a single-mount baseline. Their numbers should stay
+#   roughly FLAT across node counts -- itself a useful regression signal.
+#
+# MODE B (scheduler.nodes is a swept var): each (node-count x repeat) is
+# submitted as its OWN SLURM job, scheduler.nodes overridden per combination and
+# clio_cte_bench.nprocs zipped to match. Run with:
+#   jarvis ppl run yaml ${IOWARP}/jarvis_clio_core/pipelines/ares/distributed.yaml
+# (`jarvis ppl submit` is rejected when scheduler.nodes is swept.)
+# Output:
+#   ${HOME}/distributed_results/results.csv   (3 rows, one per node count;
+#   columns: nfs_fio.write.*, cte_bench.put.* (per-node-folded), jfs_fio.write.*)
+#
+# INSTALLATION: baked into the prebuilt image (pipelines/container/
+# Dockerfile.regression). PATHS: container runs as root; host storage is
+# bind-mounted (container_binds) so NFS + juicefs object store hit real FS.
+
+config:
+  name: distributed
+  # The OUTER jarvis (compute node, conda env) Pssh's between nodes to bring up
+  # the per-node containers; strip the conda LD_LIBRARY_PATH for that ssh hop so
+  # /usr/bin/ssh doesn't abort on an OpenSSL mismatch (as in cte_sweep_2n.yaml).
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+
+  # ---- Containerized deployment (Ares dev jarvis) ----------------------
+  base_deploy_mode: container
+  container_engine: docker
+  # REPLACE with your pushed image (see single_node.yaml / Dockerfile.regression).
+  container_uri: "iowarp-regression:latest"
+  container_extensions:
+    cap_add: [SYS_ADMIN]
+    devices: ["/dev/fuse:/dev/fuse"]
+    security_opt: ["apparmor:unconfined", "seccomp=unconfined"]
+  container_binds:
+    - "${HOME}/distributed_nfs:/mnt/nfs"
+    - "${HOME}/juicefs_data:/mnt/jfs_data"
+
+  env:
+    CLIO_MEMFD_DIR: "/tmp/iowarp_chimaera"
+
+  pkgs:
+    # ---- Services -------------------------------------------------------
+    # Redis metadata engine for JuiceFS (head-node container).
+    - pkg_type: jarvis_clio_core.redis
+      pkg_name: redis
+      port: 6379
+      sleep: 4
+
+    # Chimaera runtime on EVERY allocated node's container (Pssh-launched across
+    # the hostfile). shm client transport within each node.
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      sleep: 4
+
+    # CTE pool on every node, single local RAM tier (neighborhood: 1 = each node
+    # serves its own data). pool_query: local => every PutBlob stays node-local
+    # -> symmetric scaling.
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "16GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    # JuiceFS: format (storage=file) + FUSE mount on the head-node container.
+    - pkg_type: jarvis_clio_core.juicefs
+      pkg_name: juicefs
+      meta_url: "redis://127.0.0.1:6379/1"
+      storage: file
+      data_dir: /mnt/jfs_data
+      mountpoint: /mnt/jfs_mnt
+      cache_dir: /tmp/juicefs_cache
+      name: jfsbench
+      format_fresh: true
+      mount_wait: 20
+
+    # ---- Benchmark drivers ---------------------------------------------
+    # 1) NFS: fio against the bound host NFS dir (head-node client baseline).
+    - pkg_type: jarvis_clio_core.juicefs_bench
+      pkg_name: nfs_fio
+      target_dir: /mnt/nfs
+      io_size: "1m"
+      num_threads: 4
+      runtime: 60
+      mode: write
+      size_per_job: "256M"
+      ioengine: psync
+      direct: false
+      fallocate: native
+      output_file: nfs_fio.json
+
+    # 2) CTE: one Put rank per node (nprocs swept with scheduler.nodes), local
+    #    target, per-host-folded aggregate -> results.csv (cte_sweep_2n pattern).
+    - pkg_type: jarvis_clio_core.clio_cte_bench
+      pkg_name: cte_bench
+      test_case: "Put"
+      num_threads: 4
+      depth: 1
+      io_size: "1m"
+      time_limit: 60
+      max_total_blobs: 1024
+      query_type: "local"
+      nprocs: 1
+      ppn: 1
+      init_runtime: false
+      output_file: cte_bench.log
+
+    # 3) juicefs: fio against the JuiceFS mount (head-node client baseline).
+    - pkg_type: jarvis_clio_core.juicefs_bench
+      pkg_name: jfs_fio
+      target_dir: /mnt/jfs_mnt
+      io_size: "1m"
+      num_threads: 4
+      runtime: 60
+      mode: write
+      size_per_job: "256M"
+      ioengine: psync
+      direct: false
+      fallocate: none
+      output_file: jfs_fio.json
+
+# Top-level scheduler = per-iteration template; scheduler.nodes is overridden
+# per combination (Mode B: one SLURM job per node count).
+scheduler:
+  name: slurm
+  job_name: distributed
+  ntasks_per_node: 1
+  cpus_per_task: 32
+  partition: compute
+  time: "00:30:00"
+  exclude: "ares-comp-10,ares-comp-11"
+  output: slurm-%j.out
+  error: slurm-%j.err
+  pre_cmds:
+    # No software install (baked into the image). Create the HOST dirs that
+    # container_binds maps in (NFS experiment target + juicefs object store).
+    - 'mkdir -p "$HOME/distributed_nfs" "$HOME/juicefs_data"'
+
+# Node-count sweep. scheduler.nodes drives the allocation size; cte_bench.nprocs
+# is zipped to it so there is always exactly ONE CTE Put rank per node (ppn: 1).
+# The fio drivers are unaffected (single head-node client at every node count).
+vars:
+  scheduler.nodes:   [1, 2, 4]
+  cte_bench.nprocs:  [1, 2, 4]
+
+loop:
+  - [scheduler.nodes, cte_bench.nprocs]
+
+repeat: 1
+output: "${HOME}/distributed_results"
