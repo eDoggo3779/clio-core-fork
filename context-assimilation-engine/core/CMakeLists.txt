@@ -121,6 +121,26 @@ if(GLOBUS_ENABLED)
   list(APPEND RUNTIME_LINK_LIBRARIES Poco::Net Poco::NetSSL Poco::Crypto Poco::JSON nlohmann_json::nlohmann_json)
 endif()
 
+# Conditionally add S3 assimilator if enabled (AWS SDK found by root CMakeLists).
+if(CAE_ENABLE_S3)
+  message(STATUS "CAE S3 support: ENABLED")
+  add_compile_definitions(CAE_ENABLE_S3)
+  list(APPEND RUNTIME_SOURCES src/factory/s3_file_assimilator.cc)
+  list(APPEND RUNTIME_LINK_LIBRARIES aws-cpp-sdk-s3 aws-cpp-sdk-core)
+else()
+  message(STATUS "CAE S3 support: DISABLED")
+endif()
+
+# Conditionally add GCS assimilator if enabled (google-cloud-cpp found by root).
+if(CAE_ENABLE_GCS)
+  message(STATUS "CAE GCS support: ENABLED")
+  add_compile_definitions(CAE_ENABLE_GCS)
+  list(APPEND RUNTIME_SOURCES src/factory/gcs_file_assimilator.cc)
+  list(APPEND RUNTIME_LINK_LIBRARIES google-cloud-cpp::storage)
+else()
+  message(STATUS "CAE GCS support: DISABLED")
+endif()
+
 add_clio_module_runtime(
   SOURCES
     ${RUNTIME_SOURCES}

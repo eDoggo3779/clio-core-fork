@@ -223,6 +223,66 @@ if(HDF5_ENABLED)
 endif()
 
 #------------------------------------------------------------------------------
+# Test: Cloud Assimilator Factory Guard (always on)
+#------------------------------------------------------------------------------
+# Exercises AssimilatorFactory protocol dispatch for s3://, gs://, gcs:// — the
+# loud-fail guard returns nullptr when a backend is compiled out, and a backend
+# when it is compiled in. Touches no cloud service. Links the runtime library
+# (where the factory + backends live) and is told which backends are enabled.
+#------------------------------------------------------------------------------
+add_cae_unit_test(cae_cloud_factory_guard
+  ${CMAKE_CURRENT_SOURCE_DIR}/cloud_factory_guard/test_cloud_factory_guard.cc
+  EXTRA_LIBS clio_cae_core_runtime
+)
+if(CAE_ENABLE_S3)
+  target_compile_definitions(cae_cloud_factory_guard PRIVATE CAE_ENABLE_S3)
+endif()
+if(CAE_ENABLE_GCS)
+  target_compile_definitions(cae_cloud_factory_guard PRIVATE CAE_ENABLE_GCS)
+endif()
+set_tests_properties(cae_cloud_factory_guard PROPERTIES LABELS "cloud;factory;msan_skip")
+
+#------------------------------------------------------------------------------
+# Test: S3 (s3://) Assimilation (Conditional, self-skips without S3_ENDPOINT)
+#------------------------------------------------------------------------------
+# Seeds an object into an S3-compatible store (MinIO) via the AWS SDK, imports
+# it through ParseOmni, and verifies the bytes landed in CTE. Requires
+# -DCAE_ENABLE_S3=ON; the test self-skips at runtime unless S3_ENDPOINT is set.
+#------------------------------------------------------------------------------
+if(CAE_ENABLE_S3)
+  add_cae_unit_test(cae_s3_assim
+    ${CMAKE_CURRENT_SOURCE_DIR}/s3_assim/test_s3_assim.cc
+    EXTRA_LIBS aws-cpp-sdk-s3 aws-cpp-sdk-core
+  )
+  set_tests_properties(cae_s3_assim PROPERTIES LABELS "cloud;s3;msan_skip")
+
+  install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/s3_assim/s3_assim_omni.yaml
+    DESTINATION share/clio_cae/test/s3_assim
+  )
+endif()
+
+#------------------------------------------------------------------------------
+# Test: GCS (gs://) Assimilation (Conditional, self-skips without GCS_ENDPOINT)
+#------------------------------------------------------------------------------
+# Seeds an object into GCS (fake-gcs-server / real GCS) via google-cloud-cpp,
+# imports it through ParseOmni, and verifies the bytes landed in CTE. Requires
+# -DCAE_ENABLE_GCS=ON; self-skips at runtime unless GCS_ENDPOINT is set.
+#------------------------------------------------------------------------------
+if(CAE_ENABLE_GCS)
+  add_cae_unit_test(cae_gcs_assim
+    ${CMAKE_CURRENT_SOURCE_DIR}/gcs_assim/test_gcs_assim.cc
+    EXTRA_LIBS google-cloud-cpp::storage
+  )
+  set_tests_properties(cae_gcs_assim PROPERTIES LABELS "cloud;gcs;msan_skip")
+
+  install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/gcs_assim/gcs_assim_omni.yaml
+    DESTINATION share/clio_cae/test/gcs_assim
+  )
+endif()
+
+#------------------------------------------------------------------------------
 # Test 5: Globus Transfer Integration (Conditional) - REMOVED
 #------------------------------------------------------------------------------
 # Globus integration testing has been moved to integration tests only
