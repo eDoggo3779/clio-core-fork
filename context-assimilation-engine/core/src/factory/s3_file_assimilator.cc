@@ -34,18 +34,13 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/factory/s3_file_assimilator.h>
 
-#include <aws/core/Aws.h>
-#include <aws/core/auth/AWSAuthSigner.h>
-#include <aws/core/client/ClientConfiguration.h>
-#include <aws/core/utils/memory/stl/AWSString.h>
-#include <aws/s3/S3Client.h>
-#include <aws/s3/model/GetObjectRequest.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
-#include <istream>
-#include <mutex>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -58,21 +53,77 @@ namespace clio::cae::core {
 
 namespace {
 
+// The S3 download is performed by a SEPARATE process (`cae_s3_tool`), never by
+// linking the AWS SDK into this runtime. Loading libaws-cpp-sdk-core.so into the
+// CLIO runtime process corrupts runtime startup (its load-time global ctors /
+// static-baked s2n collide with CLIO's init), so the SDK is fully isolated in the
+// helper and reached via fork+exec — the same approach the Globus assimilator uses
+// to shell out to curl.
+
 /**
- * Initialize the AWS SDK exactly once for the lifetime of the process.
+ * Resolve the path/name of the cae_s3_tool helper executable.
  *
- * The SDK is intentionally never shut down: this is a long-running runtime
- * that may assimilate many objects, and Aws::ShutdownAPI() must not run while
- * any other thread (e.g. the bdev S3 transport) still uses the SDK. A single
- * process-global init avoids that hazard and the coroutine-cleanup bookkeeping
- * a refcounted shutdown would require.
+ * Honors the CAE_S3_TOOL environment override (used by the test harness to point
+ * at the build-tree binary); otherwise returns the bare name, resolved via PATH.
+ *
+ * @return Helper executable path or name.
  */
-void EnsureAwsApiInitialized() {
-  static std::once_flag once;
-  std::call_once(once, []() {
-    static Aws::SDKOptions options;
-    Aws::InitAPI(options);
-  });
+std::string ResolveS3Tool() {
+  const char* override_path = std::getenv("CAE_S3_TOOL");
+  if (override_path && *override_path) {
+    return override_path;
+  }
+  return "cae_s3_tool";
+}
+
+/**
+ * Fork + exec a process and wait for it to finish.
+ *
+ * @param args Full argv (args[0] is the program, resolved via PATH).
+ * @return The child's exit status (0 = success), or -1 if fork/exec failed.
+ */
+int RunProcess(const std::vector<std::string>& args) {
+  pid_t pid = fork();
+  if (pid == -1) {
+    return -1;
+  }
+  if (pid == 0) {
+    std::vector<const char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& a : args) {
+      argv.push_back(a.c_str());
+    }
+    argv.push_back(nullptr);
+    execvp(argv[0], const_cast<char* const*>(argv.data()));
+    _exit(127);  // exec failed
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  return -1;
+}
+
+/**
+ * Create a unique temporary file and return its path. The file is created empty.
+ *
+ * @param out_path Output: the created temp file path (unchanged on failure).
+ * @return true on success, false if the temp file could not be created.
+ */
+bool MakeTempFile(std::string& out_path) {
+  const char* tmpdir = std::getenv("TMPDIR");
+  std::string tmpl = (tmpdir && *tmpdir) ? tmpdir : "/tmp";
+  tmpl += "/cae_s3_XXXXXX";
+  std::vector<char> buf(tmpl.begin(), tmpl.end());
+  buf.push_back('\0');
+  int fd = mkstemp(buf.data());
+  if (fd == -1) {
+    return false;
+  }
+  close(fd);  // helper reopens by name; keep only the path
+  out_path.assign(buf.data());
+  return true;
 }
 
 }  // namespace
@@ -143,53 +194,46 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
     CLIO_CO_RETURN;
   }
 
-  // Build an S3 client from the standard AWS environment. Region comes from
-  // AWS_DEFAULT_REGION; an S3-compatible endpoint (MinIO, etc.) can be set via
-  // S3_ENDPOINT or AWS_ENDPOINT_URL, in which case path-style addressing is
-  // used. Credentials resolve through the SDK's default provider chain.
-  EnsureAwsApiInitialized();
-  Aws::Client::ClientConfiguration client_config;
-  const char* region_env = std::getenv("AWS_DEFAULT_REGION");
-  if (region_env && *region_env) {
-    client_config.region = region_env;
+  // Download the object to a temp file via the out-of-process cae_s3_tool helper
+  // (the AWS SDK must not be loaded into this runtime process). The helper reads
+  // credentials / region / endpoint from the standard AWS environment.
+  std::string tmp_path;
+  if (!MakeTempFile(tmp_path)) {
+    HLOG(kError, "S3FileAssimilator: Failed to create temp file for download");
+    error_code = -5;
+    CLIO_CO_RETURN;
   }
-  const char* endpoint_env = std::getenv("S3_ENDPOINT");
-  if (!endpoint_env || !*endpoint_env) {
-    endpoint_env = std::getenv("AWS_ENDPOINT_URL");
-  }
-  bool use_path_style = false;
-  if (endpoint_env && *endpoint_env) {
-    client_config.endpointOverride = endpoint_env;
-    use_path_style = true;  // MinIO-style endpoints require path-style addressing
-  }
-  Aws::S3::S3Client s3_client(
-      client_config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-      /*useVirtualAddressing=*/!use_path_style);
-
-  // Issue the GetObject (ranged when range_size>0, otherwise the whole object).
-  Aws::S3::Model::GetObjectRequest request;
-  request.SetBucket(Aws::String(bucket.c_str()));
-  request.SetKey(Aws::String(key.c_str()));
+  std::vector<std::string> args = {ResolveS3Tool(), "get", bucket, key,
+                                   tmp_path};
   if (ctx.range_size > 0) {
-    std::string range = "bytes=" + std::to_string(ctx.range_off) + "-" +
-                        std::to_string(ctx.range_off + ctx.range_size - 1);
-    request.SetRange(Aws::String(range.c_str()));
+    args.push_back(std::to_string(ctx.range_off));
+    args.push_back(std::to_string(ctx.range_size));
   }
-
-  auto outcome = s3_client.GetObject(request);
-  if (!outcome.IsSuccess()) {
-    HLOG(kError, "S3FileAssimilator: GetObject failed for s3://{}/{}: {}",
-         bucket, key, outcome.GetError().GetMessage().c_str());
+  int tool_rc = RunProcess(args);
+  if (tool_rc != 0) {
+    HLOG(kError,
+         "S3FileAssimilator: cae_s3_tool get failed (rc={}) for s3://{}/{}",
+         tool_rc, bucket, key);
+    ::unlink(tmp_path.c_str());
     error_code = -7;
     CLIO_CO_RETURN;
   }
 
-  // Take ownership of the result so its body stream stays valid across the
-  // (suspending) chunk loop below.
-  auto result = outcome.GetResultWithOwnership();
-  size_t total_size = static_cast<size_t>(result.GetContentLength());
+  // Open the downloaded file and stream it into CTE. Unlinking the open file
+  // makes cleanup automatic on every return path below (POSIX: the bytes stay
+  // readable until the stream closes).
+  std::ifstream body(tmp_path, std::ios::binary);
+  ::unlink(tmp_path.c_str());
+  if (!body) {
+    HLOG(kError, "S3FileAssimilator: Failed to open downloaded object '{}'",
+         tmp_path);
+    error_code = -8;
+    CLIO_CO_RETURN;
+  }
+  body.seekg(0, std::ios::end);
+  size_t total_size = static_cast<size_t>(body.tellg());
+  body.seekg(0, std::ios::beg);
   size_t chunk_offset = (ctx.range_size > 0) ? ctx.range_off : 0;
-  std::istream& body = result.GetBody();
   HLOG(kDebug, "S3FileAssimilator: s3://{}/{} -> {} bytes (offset {})", bucket,
        key, total_size, chunk_offset);
 

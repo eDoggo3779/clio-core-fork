@@ -38,34 +38,30 @@
  *   1. Self-skips (exit 0) unless S3_ENDPOINT is set (so default CI, which has
  *      no object store, passes without an endpoint).
  *   2. Seeds a known, patterned object into the S3-compatible store (MinIO)
- *      using the AWS SDK directly.
+ *      using the out-of-process cae_s3_tool helper (the AWS SDK must NOT be
+ *      linked into this process, which initializes the CLIO runtime).
  *   3. Runs ParseOmni with src="s3://<bucket>/<key>", format="binary".
  *   4. Verifies the object's bytes landed in CTE (tag size == object size).
- *   5. Tears down the seeded object.
+ *   5. Tears down the seeded object (via cae_s3_tool del).
  *
  * Environment:
  *   S3_ENDPOINT        S3-compatible endpoint (e.g. http://127.0.0.1:9000).
  *                      REQUIRED — the test self-skips when unset.
- *   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   Credentials (read by the SDK).
+ *   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY   Credentials (read by the helper).
  *   AWS_DEFAULT_REGION Region (default us-east-1 for MinIO).
  *   S3_TEST_BUCKET     Bucket to use (default clio-cae-test).
+ *   CAE_S3_TOOL        Path to the cae_s3_tool helper (set by CTest to the
+ *                      build-tree binary; defaults to "cae_s3_tool" on PATH).
  */
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
-
-#include <unistd.h>
-
-#include <aws/core/Aws.h>
-#include <aws/core/auth/AWSAuthSigner.h>
-#include <aws/core/client/ClientConfiguration.h>
-#include <aws/core/utils/memory/stl/AWSStringStream.h>
-#include <aws/s3/S3Client.h>
-#include <aws/s3/model/CreateBucketRequest.h>
-#include <aws/s3/model/DeleteObjectRequest.h>
-#include <aws/s3/model/PutObjectRequest.h>
 
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/util/logging.h>
@@ -90,6 +86,36 @@ std::string MakePatternedData(size_t size_bytes) {
   return data;
 }
 
+/** Resolve the cae_s3_tool helper (CAE_S3_TOOL override, else PATH lookup). */
+std::string ResolveS3Tool() {
+  const char* override_path = std::getenv("CAE_S3_TOOL");
+  if (override_path && *override_path) {
+    return override_path;
+  }
+  return "cae_s3_tool";
+}
+
+/** Fork+exec a process and return its exit status (0 = success, -1 = failure). */
+int RunProcess(const std::vector<std::string>& args) {
+  pid_t pid = fork();
+  if (pid == -1) {
+    return -1;
+  }
+  if (pid == 0) {
+    std::vector<const char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& a : args) {
+      argv.push_back(a.c_str());
+    }
+    argv.push_back(nullptr);
+    execvp(argv[0], const_cast<char* const*>(argv.data()));
+    _exit(127);
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 }  // namespace
 
 int main(int /*argc*/, char* /*argv*/[]) {
@@ -111,13 +137,13 @@ int main(int /*argc*/, char* /*argv*/[]) {
   const std::string key =
       "cae_s3_test/obj_" + std::to_string(static_cast<long>(::getpid()));
   const std::string data = MakePatternedData(kObjectSize);
+  const std::string s3_tool = ResolveS3Tool();
 
   int exit_code = 0;
 
-  // Bring up CLIO + CTE + CAE BEFORE touching the AWS SDK. The assimilator
-  // initializes the AWS SDK inside the runtime worker on first use, so the
-  // runtime must come up first — this is the production ordering. (Initializing
-  // the AWS SDK before the runtime starts corrupts runtime startup.)
+  // Bring up CLIO + CTE + CAE. The AWS SDK is never linked into this process;
+  // all S3 I/O happens out-of-process via the cae_s3_tool helper, so the runtime
+  // starts cleanly (linking the AWS SDK here corrupts runtime startup).
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
     HLOG(kError, "Failed to initialize Clio");
     return 1;
@@ -133,99 +159,76 @@ int main(int /*argc*/, char* /*argv*/[]) {
     create_task.Wait();
   }
 
-  Aws::SDKOptions options;
-  Aws::InitAPI(options);
+  // Seed the object via the helper: write the pattern to a temp file, then
+  // `cae_s3_tool put` it (the helper ensures the bucket exists).
+  std::string seed_path = "/tmp/cae_s3_seed_" +
+                          std::to_string(static_cast<long>(::getpid())) + ".bin";
   {
-    // Build an S3 client pointed at the endpoint (path-style for MinIO).
-    Aws::Client::ClientConfiguration cfg;
-    if (const char* region = std::getenv("AWS_DEFAULT_REGION");
-        region && *region) {
-      cfg.region = region;
-    } else {
-      cfg.region = "us-east-1";
+    std::ofstream seed(seed_path, std::ios::binary | std::ios::trunc);
+    seed.write(data.data(), static_cast<std::streamsize>(data.size()));
+    seed.close();
+    if (!seed) {
+      HLOG(kError, "Failed to write seed file '{}'", seed_path);
+      return 1;
     }
-    cfg.endpointOverride = endpoint;
-    Aws::S3::S3Client s3(
-        cfg, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-        /*useVirtualAddressing=*/false);
-
-    // Ensure the bucket exists (best effort; already-exists is fine).
-    Aws::S3::Model::CreateBucketRequest create_bucket;
-    create_bucket.SetBucket(Aws::String(bucket.c_str()));
-    auto cb = s3.CreateBucket(create_bucket);
-    HLOG(kInfo, "S3 ensure bucket '{}' ({})", bucket,
-         cb.IsSuccess() ? "created" : cb.GetError().GetMessage().c_str());
-
-    // Seed the object.
-    Aws::S3::Model::PutObjectRequest put;
-    put.SetBucket(Aws::String(bucket.c_str()));
-    put.SetKey(Aws::String(key.c_str()));
-    auto body = std::make_shared<Aws::StringStream>();
-    body->write(data.data(), static_cast<std::streamsize>(data.size()));
-    body->seekg(0);
-    put.SetBody(body);
-    auto put_outcome = s3.PutObject(put);
-    if (!put_outcome.IsSuccess()) {
-      HLOG(kError, "Failed to seed s3://{}/{}: {}", bucket, key,
-           put_outcome.GetError().GetMessage().c_str());
-      Aws::ShutdownAPI(options);
+    int put_rc = RunProcess({s3_tool, "put", bucket, key, seed_path});
+    ::unlink(seed_path.c_str());
+    if (put_rc != 0) {
+      HLOG(kError, "Failed to seed s3://{}/{} via cae_s3_tool (rc={})", bucket,
+           key, put_rc);
       return 1;
     }
     HLOG(kSuccess, "Seeded s3://{}/{} ({} bytes)", bucket, key, data.size());
+  }
 
-    try {
-      // Assimilate the S3 object.
-      clio::cae::core::AssimilationCtx ctx;
-      ctx.src = "s3://" + bucket + "/" + key;
-      ctx.dst = "iowarp::" + kTagName;
-      ctx.format = "binary";
-      std::vector<clio::cae::core::AssimilationCtx> contexts{ctx};
+  try {
+    // Assimilate the S3 object.
+    clio::cae::core::AssimilationCtx ctx;
+    ctx.src = "s3://" + bucket + "/" + key;
+    ctx.dst = "iowarp::" + kTagName;
+    ctx.format = "binary";
+    std::vector<clio::cae::core::AssimilationCtx> contexts{ctx};
 
-      HLOG(kInfo, "Calling ParseOmni for {}", ctx.src);
-      auto parse_task = cae_client.AsyncParseOmni(contexts);
-      parse_task.Wait();
-      clio::run::u32 result_code = parse_task->GetReturnCode();
-      clio::run::u32 num_scheduled = parse_task->num_tasks_scheduled_;
-      HLOG(kInfo, "ParseOmni result_code={} num_tasks_scheduled={}", result_code,
-           num_scheduled);
-      if (result_code != 0 || num_scheduled == 0) {
-        HLOG(kError, "ParseOmni failed for S3 source");
-        exit_code = 1;
-      }
-
-      // Verify the bytes landed in CTE.
-      auto cte_client = CLIO_CTE_CLIENT;
-      auto tag_task = cte_client->AsyncGetOrCreateTag(kTagName);
-      tag_task.Wait();
-      clio::cte::core::TagId tag_id = tag_task->tag_id_;
-      if (tag_id.IsNull()) {
-        HLOG(kError, "Tag not found in CTE: {}", kTagName);
-        exit_code = 1;
-      } else {
-        auto size_task = cte_client->AsyncGetTagSize(tag_id);
-        size_task.Wait();
-        size_t tag_size = size_task->tag_size_;
-        HLOG(kInfo, "CTE tag size={} (expected {})", tag_size, kObjectSize);
-        if (tag_size != kObjectSize) {
-          HLOG(kError, "Tag size mismatch: got {}, expected {}", tag_size,
-               kObjectSize);
-          exit_code = 1;
-        } else {
-          HLOG(kSuccess, "S3 object bytes verified in CTE");
-        }
-      }
-    } catch (const std::exception& e) {
-      HLOG(kError, "Exception: {}", e.what());
+    HLOG(kInfo, "Calling ParseOmni for {}", ctx.src);
+    auto parse_task = cae_client.AsyncParseOmni(contexts);
+    parse_task.Wait();
+    clio::run::u32 result_code = parse_task->GetReturnCode();
+    clio::run::u32 num_scheduled = parse_task->num_tasks_scheduled_;
+    HLOG(kInfo, "ParseOmni result_code={} num_tasks_scheduled={}", result_code,
+         num_scheduled);
+    if (result_code != 0 || num_scheduled == 0) {
+      HLOG(kError, "ParseOmni failed for S3 source");
       exit_code = 1;
     }
 
-    // Teardown the seeded object (best effort).
-    Aws::S3::Model::DeleteObjectRequest del;
-    del.SetBucket(Aws::String(bucket.c_str()));
-    del.SetKey(Aws::String(key.c_str()));
-    s3.DeleteObject(del);
+    // Verify the bytes landed in CTE.
+    auto cte_client = CLIO_CTE_CLIENT;
+    auto tag_task = cte_client->AsyncGetOrCreateTag(kTagName);
+    tag_task.Wait();
+    clio::cte::core::TagId tag_id = tag_task->tag_id_;
+    if (tag_id.IsNull()) {
+      HLOG(kError, "Tag not found in CTE: {}", kTagName);
+      exit_code = 1;
+    } else {
+      auto size_task = cte_client->AsyncGetTagSize(tag_id);
+      size_task.Wait();
+      size_t tag_size = size_task->tag_size_;
+      HLOG(kInfo, "CTE tag size={} (expected {})", tag_size, kObjectSize);
+      if (tag_size != kObjectSize) {
+        HLOG(kError, "Tag size mismatch: got {}, expected {}", tag_size,
+             kObjectSize);
+        exit_code = 1;
+      } else {
+        HLOG(kSuccess, "S3 object bytes verified in CTE");
+      }
+    }
+  } catch (const std::exception& e) {
+    HLOG(kError, "Exception: {}", e.what());
+    exit_code = 1;
   }
-  Aws::ShutdownAPI(options);
+
+  // Teardown the seeded object (best effort).
+  RunProcess({s3_tool, "del", bucket, key});
 
   HLOG(kInfo, "========================================");
   HLOG(kInfo, exit_code == 0 ? "TEST PASSED" : "TEST FAILED");

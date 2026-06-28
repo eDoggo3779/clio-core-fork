@@ -245,16 +245,22 @@ set_tests_properties(cae_cloud_factory_guard PROPERTIES LABELS "cloud;factory;ms
 #------------------------------------------------------------------------------
 # Test: S3 (s3://) Assimilation (Conditional, self-skips without S3_ENDPOINT)
 #------------------------------------------------------------------------------
-# Seeds an object into an S3-compatible store (MinIO) via the AWS SDK, imports
-# it through ParseOmni, and verifies the bytes landed in CTE. Requires
+# Seeds an object into an S3-compatible store (MinIO) and imports it through
+# ParseOmni, verifying the bytes landed in CTE. Both seeding and the import run
+# the AWS SDK out-of-process via the cae_s3_tool helper, so the test binary links
+# NO AWS SDK (linking it would corrupt CLIO runtime startup). Requires
 # -DCAE_ENABLE_S3=ON; the test self-skips at runtime unless S3_ENDPOINT is set.
 #------------------------------------------------------------------------------
 if(CAE_ENABLE_S3)
   add_cae_unit_test(cae_s3_assim
     ${CMAKE_CURRENT_SOURCE_DIR}/s3_assim/test_s3_assim.cc
-    EXTRA_LIBS aws-cpp-sdk-s3 aws-cpp-sdk-core
   )
   set_tests_properties(cae_s3_assim PROPERTIES LABELS "cloud;s3;msan_skip")
+  # Build the helper before the test, and point both the test (seeding) and the
+  # in-process assimilator (import) at the build-tree helper binary.
+  add_dependencies(cae_s3_assim cae_s3_tool)
+  set_property(TEST cae_s3_assim APPEND PROPERTY
+    ENVIRONMENT "CAE_S3_TOOL=$<TARGET_FILE:cae_s3_tool>")
 
   install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/s3_assim/s3_assim_omni.yaml
