@@ -213,10 +213,19 @@ int main(int /*argc*/, char* /*argv*/[]) {
       auto size_task = cte_client->AsyncGetTagSize(tag_id);
       size_task.Wait();
       size_t tag_size = size_task->tag_size_;
-      HLOG(kInfo, "CTE tag size={} (expected {})", tag_size, kObjectSize);
-      if (tag_size != kObjectSize) {
+      // The assimilator stores a "description" metadata blob alongside the data
+      // chunks (mirrors BinaryFileAssimilator), so the tag holds the object
+      // bytes PLUS that blob. Reconstruct the exact description string the
+      // assimilator writes (offset 0 for a whole-object, non-range import) to
+      // get its byte count, and expect the tag to equal data + metadata.
+      std::string description =
+          "binary<size=" + std::to_string(kObjectSize) + ", offset=0>";
+      size_t expected_size = kObjectSize + description.size();
+      HLOG(kInfo, "CTE tag size={} (expected {} = {} object + {} description)",
+           tag_size, expected_size, kObjectSize, description.size());
+      if (tag_size != expected_size) {
         HLOG(kError, "Tag size mismatch: got {}, expected {}", tag_size,
-             kObjectSize);
+             expected_size);
         exit_code = 1;
       } else {
         HLOG(kSuccess, "S3 object bytes verified in CTE");
