@@ -95,16 +95,21 @@ int main(int /*argc*/, char* /*argv*/[]) {
   HLOG(kInfo, "GCS (gs://) Assimilation Test");
   HLOG(kInfo, "========================================");
 
-  // Self-skip when no GCS endpoint is configured.
+  // Self-skip unless a GCS target is configured. GCS_ENDPOINT selects an
+  // emulator (e.g. fake-gcs-server) with anonymous creds; GCS_TEST_BUCKET (with
+  // GCS_ENDPOINT unset) selects real GCS via Application Default Credentials.
   const char* endpoint = std::getenv("GCS_ENDPOINT");
-  if (!endpoint || !*endpoint) {
-    HLOG(kInfo, "GCS_ENDPOINT not set -> skipping GCS assimilation test");
+  const char* bucket_env = std::getenv("GCS_TEST_BUCKET");
+  if ((!endpoint || !*endpoint) && (!bucket_env || !*bucket_env)) {
+    HLOG(kInfo,
+         "Neither GCS_ENDPOINT nor GCS_TEST_BUCKET set -> skipping GCS "
+         "assimilation test");
     return 0;
   }
 
   std::string bucket = "clio-cae-test";
-  if (const char* b = std::getenv("GCS_TEST_BUCKET"); b && *b) {
-    bucket = b;
+  if (bucket_env && *bucket_env) {
+    bucket = bucket_env;
   }
   std::string project = "clio-prototype";
   if (const char* p = std::getenv("GCS_PROJECT_ID"); p && *p) {
@@ -114,10 +119,14 @@ int main(int /*argc*/, char* /*argv*/[]) {
       "cae_gcs_test/obj_" + std::to_string(static_cast<long>(::getpid()));
   const std::string data = MakePatternedData(kObjectSize);
 
-  // Build a GCS client pointed at the (emulator) endpoint with anonymous creds.
+  // Build a GCS client. Mirror the assimilator's credential logic: an emulator
+  // endpoint (GCS_ENDPOINT) uses that endpoint with anonymous creds, otherwise
+  // fall through to Application Default Credentials for real GCS.
   gc::Options options;
-  options.set<gcs::RestEndpointOption>(endpoint);
-  options.set<gc::UnifiedCredentialsOption>(gc::MakeInsecureCredentials());
+  if (endpoint && *endpoint) {
+    options.set<gcs::RestEndpointOption>(endpoint);
+    options.set<gc::UnifiedCredentialsOption>(gc::MakeInsecureCredentials());
+  }
   auto client = gcs::Client(std::move(options));
 
   // Ensure the bucket exists (best effort; already-exists is fine).
@@ -183,10 +192,18 @@ int main(int /*argc*/, char* /*argv*/[]) {
       auto size_task = cte_client->AsyncGetTagSize(tag_id);
       size_task.Wait();
       size_t tag_size = size_task->tag_size_;
-      HLOG(kInfo, "CTE tag size={} (expected {})", tag_size, kObjectSize);
-      if (tag_size != kObjectSize) {
+      // The assimilator stores the object bytes plus a "binary<size=N,
+      // offset=0>" description blob (mirrors the binary backend), and CTE's
+      // tag size sums all blobs. Account for that 30-byte (for 3 MB) metadata
+      // blob, matching the S3 test fix (commit 4474b83d). Whole-object import
+      // -> offset=0.
+      std::string description =
+          "binary<size=" + std::to_string(kObjectSize) + ", offset=0>";
+      size_t expected_size = kObjectSize + description.size();
+      HLOG(kInfo, "CTE tag size={} (expected {})", tag_size, expected_size);
+      if (tag_size != expected_size) {
         HLOG(kError, "Tag size mismatch: got {}, expected {}", tag_size,
-             kObjectSize);
+             expected_size);
         exit_code = 1;
       } else {
         HLOG(kSuccess, "GCS object bytes verified in CTE");
