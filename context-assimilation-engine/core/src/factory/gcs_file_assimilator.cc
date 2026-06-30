@@ -34,10 +34,29 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/factory/gcs_file_assimilator.h>
 
+// google-cloud-cpp pulls in abseil, whose <absl/base/log_severity.h> declares
+//   enum class LogSeverity : int { kInfo, kWarning, kError, kFatal };
+// CLIO's logging.h defines those same names as object-like macros
+// (kInfo=1, kWarning=3, kError=4, kFatal=5), which textually mangle the enum and
+// produce a cascade of syntax errors. Neutralize the macros across just the
+// google-cloud includes, then restore them so HLOG(kInfo, ...) keeps working in
+// the rest of this translation unit. (S3 never hit this — the AWS SDK has no abseil.)
+#pragma push_macro("kInfo")
+#pragma push_macro("kWarning")
+#pragma push_macro("kError")
+#pragma push_macro("kFatal")
+#undef kInfo
+#undef kWarning
+#undef kError
+#undef kFatal
 #include <google/cloud/credentials.h>
 #include <google/cloud/options.h>
 #include <google/cloud/storage/client.h>
 #include <google/cloud/storage/options.h>
+#pragma pop_macro("kFatal")
+#pragma pop_macro("kError")
+#pragma pop_macro("kWarning")
+#pragma pop_macro("kInfo")
 
 #include <algorithm>
 #include <cstdint>
