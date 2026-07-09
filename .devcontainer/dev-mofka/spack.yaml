@@ -1,0 +1,13 @@
+spack:
+  specs:
+    - mofka+python
+  repos:
+    - /opt/mochi-spack-packages
+  packages:
+    python:
+      require: "@3.11"
+  concretizer:
+    unify: true
+  config:
+    install_tree:
+      root: /opt/spack-env/install
