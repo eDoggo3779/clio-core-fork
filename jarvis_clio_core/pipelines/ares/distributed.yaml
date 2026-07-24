@@ -147,7 +147,7 @@ scheduler:
         exit 1
       fi
     # 6) experiment dirs + repo registration + clean-slate results
-    - 'mkdir -p "$HOME/distributed_nfs" "$HOME/cte_libfuse_526" "$HOME/juicefs_data" "$HOME/distributed_results"'
+    - 'mkdir -p "$HOME/526_scratch/distributed/nfs" "$HOME/526_scratch/distributed/jfs_data" "$HOME/cte_libfuse_526" "$HOME/distributed_results"'
     - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core-fork}/jarvis_clio_core" 2>/dev/null || true'
     - 'rm -f "$HOME/distributed_results/results.csv"'
   post_cmds:
@@ -176,7 +176,8 @@ config:
   # iowarp-regression-526-v3.sif (shared FS, visible on every allocated node —
   # ONE SIF serves all nodes). container_uri UNSET => no pull/build. NOT
   # env-expanded, so keep it a bare basename. See single_node.yaml for the
-  # full rationale on container_fakeroot / tmp_bind_root / no container_binds.
+  # full rationale on container_fakeroot / tmp_bind_root / the shared-scratch
+  # container_binds.
   base_deploy_mode: container
   container_engine: apptainer
   container_image: "iowarp-regression-526-v3"
@@ -187,6 +188,13 @@ config:
   # Overlay upper on node-local /tmp (a shared-NFS overlay upper is a
   # multi-node corruption hazard; jarvis errors without a node-local root).
   container_overlay_root: "/tmp"
+  # Shared-FS scratch bound at instance start on EVERY node (see
+  # single_node.yaml). Critical here: it puts the JuiceFS object store on real
+  # shared NFS at an IDENTICAL host path on all nodes, so under meta_use_head
+  # the distributed filesystem is genuinely shared (an unbound $HOME data_dir
+  # would be per-node overlay — not shared). Same for the nfs_ior baseline.
+  container_binds:
+    - ${HOME}/526_scratch:${HOME}/526_scratch
   env:
     CLIO_MEMFD_DIR: "/tmp/iowarp_chimaera"
 
@@ -245,15 +253,16 @@ config:
     # JuiceFS: format + FUSE mount on EVERY node (v3: scales with the sweep).
     # meta_use_head rewrites the meta host to hostfile[0] at start(), where
     # the single_instance redis lives — all nodes share ONE filesystem
-    # namespace (head-node meta + shared-$HOME object store), mounted locally
-    # on each node's /tmp. FALLBACK if this misbehaves: single_instance: true
-    # here + on jfs_ior (v2's head-pinned baseline).
+    # namespace (head-node meta + shared-NFS object store on the bound
+    # 526_scratch, identical path on every node), mounted locally on each
+    # node's /tmp. FALLBACK if this misbehaves: single_instance: true here +
+    # on jfs_ior (v2's head-pinned baseline).
     - pkg_type: builtin.juicefs
       pkg_name: juicefs
       meta_use_head: true
       meta_url: "redis://127.0.0.1:6379/1"
       storage: file
-      data_dir: ${HOME}/juicefs_data
+      data_dir: ${HOME}/526_scratch/distributed/jfs_data
       mountpoint: /tmp/jfs_mnt
       cache_dir: /tmp/juicefs_cache
       name: jfsbench
@@ -269,7 +278,8 @@ config:
     # explicit ${HOME} log lands in the fakeroot overlay and loses every stat.
     # num_nodes/nprocs are swept below (nprocs = num_nodes x ppn, zipped
     # explicitly).
-    # 1) NFS: ior against the shared NFS home, scaling with node count.
+    # 1) NFS: ior against shared NFS via the bound 526_scratch (identical host
+    #    path on every node), scaling with node count.
     - pkg_type: builtin.ior
       pkg_name: nfs_ior
       api: posix
@@ -282,7 +292,7 @@ config:
       nprocs: 4
       num_nodes: 1
       stonewall: 120
-      out: ${HOME}/distributed_nfs/ior_nfs.bin
+      out: ${HOME}/526_scratch/distributed/nfs/ior_nfs.bin
 
     # 2) CTE + libfuse: ior through each node's local CTE FUSE mount.
     - pkg_type: builtin.ior

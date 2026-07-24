@@ -50,7 +50,7 @@ scheduler:
     - 'find /tmp -maxdepth 1 \( -name "single_node_smoke_run*" -o -name "single_node_smoke" \) -mmin +10 -exec rm -rf {} + 2>/dev/null || true'
     - 'rm -rf /tmp/iowarp_chi* 2>/dev/null || true'
     # 5) experiment dirs + repo registration + clean-slate results.
-    - 'mkdir -p "$HOME/single_node_smoke_nfs" "$HOME/juicefs_smoke_data" "$HOME/single_node_smoke_results"'
+    - 'mkdir -p "$HOME/526_scratch/single_node_smoke/nfs" "$HOME/526_scratch/single_node_smoke/jfs_data" "$HOME/single_node_smoke_results"'
     - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core-fork}/jarvis_clio_core" 2>/dev/null || true'
     - 'rm -f "$HOME/single_node_smoke_results/results.csv"'
   post_cmds:
@@ -67,6 +67,10 @@ config:
   container_image: "iowarp-regression-526-v3"
   container_fakeroot: true
   tmp_bind_root: "/tmp"
+  # Shared-FS scratch bound at instance start (see single_node.yaml): puts
+  # nfs_ior out + juicefs data_dir on real NFS instead of the fakeroot overlay.
+  container_binds:
+    - ${HOME}/526_scratch:${HOME}/526_scratch
 
   env:
     CLIO_MEMFD_DIR: "/tmp/iowarp_chimaera"
@@ -108,7 +112,7 @@ config:
       pkg_name: juicefs
       meta_url: "redis://127.0.0.1:6379/1"
       storage: file
-      data_dir: ${HOME}/juicefs_smoke_data
+      data_dir: ${HOME}/526_scratch/single_node_smoke/jfs_data
       mountpoint: /tmp/jfs_mnt
       cache_dir: /tmp/juicefs_cache
       name: jfsbench
@@ -127,7 +131,7 @@ config:
       nprocs: 2
       ppn: 2
       stonewall: 120
-      out: ${HOME}/single_node_smoke_nfs/ior_nfs.bin
+      out: ${HOME}/526_scratch/single_node_smoke/nfs/ior_nfs.bin
 
     - pkg_type: builtin.ior
       pkg_name: cte_ior

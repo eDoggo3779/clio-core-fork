@@ -80,7 +80,7 @@ scheduler:
         exit 1
       fi
     # 6) experiment dirs + repo registration + clean-slate results
-    - 'mkdir -p "$HOME/distributed_smoke_nfs" "$HOME/cte_libfuse_526_smoke" "$HOME/juicefs_smoke_data" "$HOME/distributed_smoke_results"'
+    - 'mkdir -p "$HOME/526_scratch/distributed_smoke/nfs" "$HOME/526_scratch/distributed_smoke/jfs_data" "$HOME/cte_libfuse_526_smoke" "$HOME/distributed_smoke_results"'
     - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core-fork}/jarvis_clio_core" 2>/dev/null || true'
     - 'rm -f "$HOME/distributed_smoke_results/results.csv"'
   post_cmds:
@@ -104,6 +104,11 @@ config:
   container_fakeroot: true
   tmp_bind_root: "/tmp"
   container_overlay_root: "/tmp"
+  # Shared-FS scratch bound at instance start on both nodes (see
+  # distributed.yaml): real-NFS nfs_ior baseline + a genuinely shared JuiceFS
+  # object store under meta_use_head.
+  container_binds:
+    - ${HOME}/526_scratch:${HOME}/526_scratch
   env:
     CLIO_MEMFD_DIR: "/tmp/iowarp_chimaera"
 
@@ -146,7 +151,7 @@ config:
       meta_use_head: true
       meta_url: "redis://127.0.0.1:6379/1"
       storage: file
-      data_dir: ${HOME}/juicefs_smoke_data
+      data_dir: ${HOME}/526_scratch/distributed_smoke/jfs_data
       mountpoint: /tmp/jfs_mnt
       cache_dir: /tmp/juicefs_cache
       name: jfsbench
@@ -166,7 +171,7 @@ config:
       nprocs: 2
       num_nodes: 1
       stonewall: 120
-      out: ${HOME}/distributed_smoke_nfs/ior_nfs.bin
+      out: ${HOME}/526_scratch/distributed_smoke/nfs/ior_nfs.bin
 
     - pkg_type: builtin.ior
       pkg_name: cte_ior

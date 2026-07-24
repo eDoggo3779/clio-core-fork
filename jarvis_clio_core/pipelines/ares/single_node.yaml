@@ -61,11 +61,13 @@
 # aborts the job early when the image was never staged; build it with
 # jarvis-cd's docker/build_regression_image.sh.
 #
-# PATHS: writable experiment dirs live under the auto-mounted $HOME (explicit
-# container_binds did NOT materialize in the per-package `apptainer exec
-# instance://` mount namespace on Ares); the FUSE mountpoints + JuiceFS cache
-# + chimaera memfd/IPC live on NODE-LOCAL /tmp via tmp_bind_root. The runner
-# writes results.csv on the HOST at `output:` below.
+# PATHS: shared-FS experiment targets (nfs_ior out + the JuiceFS object store)
+# live under ${HOME}/526_scratch, bound INTO the instance via container_binds
+# at instance start — inside the --fakeroot instance $HOME ITSELF is the
+# overlay, so an unbound $HOME path hits ephemeral node-local storage, not NFS.
+# The FUSE mountpoints + JuiceFS cache + chimaera memfd/IPC live on NODE-LOCAL
+# /tmp via tmp_bind_root. The runner writes results.csv on the HOST at
+# `output:` below.
 #
 # Output:
 #   ${HOME}/single_node_results/results.csv   (24 rows; per-driver columns:
@@ -140,7 +142,7 @@ scheduler:
     # 5) experiment dirs + repo registration + clean-slate results (the
     #    sweep runner resumes over an existing results.csv and would skip
     #    previously-failed rows)
-    - 'mkdir -p "$HOME/single_node_nfs" "$HOME/juicefs_data" "$HOME/single_node_results"'
+    - 'mkdir -p "$HOME/526_scratch/single_node/nfs" "$HOME/526_scratch/single_node/jfs_data" "$HOME/single_node_results"'
     - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core-fork}/jarvis_clio_core" 2>/dev/null || true'
     - 'rm -f "$HOME/single_node_results/results.csv"'
   post_cmds:
@@ -174,10 +176,19 @@ config:
   # sockets and would put the JuiceFS cache on NFS. tmp_bind_root makes jarvis
   # bind <root>/single_node/tmp -> /tmp from local disk instead.
   tmp_bind_root: "/tmp"
-  # NO container_binds (deliberate): explicit --bind targets did NOT
-  # materialize in the per-package `apptainer exec instance://` namespace on
-  # Ares in v2. We rely on apptainer's AUTOMATIC $HOME bind (verified present
-  # + writable) for experiment dirs, and node-local /tmp for mounts/caches.
+  # container_binds: bind a dedicated shared-FS scratch INTO the instance.
+  # v2's objection was about per-package `apptainer exec instance://` --bind
+  # (which did NOT materialize on Ares); container_binds are applied at
+  # `apptainer instance start` instead — the SAME mechanism as tmp_bind_root —
+  # so they DO take effect. Required because inside the --fakeroot instance
+  # $HOME is the overlay, not a host bind, so nfs_ior's out + juicefs's
+  # data_dir would otherwise land on the ephemeral node-local overlay instead
+  # of real NFS. The bind maps the exact host path through, bypassing the
+  # overlay; it is on shared NFS and identical on every node. jarvis does NOT
+  # create bind sources (instance start --bind fails on a missing source), so
+  # the pre_cmd mkdir above creates ${HOME}/526_scratch/... first.
+  container_binds:
+    - ${HOME}/526_scratch:${HOME}/526_scratch
 
   env:
     # In-container memfd dir for chimaera (container /tmp is private + writable).
@@ -232,13 +243,14 @@ config:
       extra_fuse_args: "-f"
       sleep: 2
 
-    # JuiceFS: format (storage=file) + FUSE mount. Object store under the
-    # auto-mounted $HOME; mount + cache on in-container /tmp.
+    # JuiceFS: format (storage=file) + FUSE mount. Object store on the bound
+    # shared-FS scratch (real NFS, bypasses the overlay); mount + cache on
+    # in-container node-local /tmp (a distributed-FS cache stays node-local).
     - pkg_type: builtin.juicefs
       pkg_name: juicefs
       meta_url: "redis://127.0.0.1:6379/1"
       storage: file
-      data_dir: ${HOME}/juicefs_data
+      data_dir: ${HOME}/526_scratch/single_node/jfs_data
       mountpoint: /tmp/jfs_mnt
       cache_dir: /tmp/juicefs_cache
       name: jfsbench
@@ -256,7 +268,8 @@ config:
     # the --fakeroot instance $HOME is the overlay (not a host bind) and the
     # log parent dir does not exist there, so ior's `tee <log>` failed and the
     # host-side stat parser found nothing.
-    # 1) NFS: ior against the NFS home (a subdir of the auto-mounted $HOME).
+    # 1) NFS: ior against real NFS via the bound 526_scratch (an unbound $HOME
+    #    path would hit the fakeroot overlay, not NFS — see container_binds).
     - pkg_type: builtin.ior
       pkg_name: nfs_ior
       api: posix
@@ -268,7 +281,7 @@ config:
       nprocs: 1
       ppn: 1
       stonewall: 120
-      out: ${HOME}/single_node_nfs/ior_nfs.bin
+      out: ${HOME}/526_scratch/single_node/nfs/ior_nfs.bin
 
     # 2) CTE + libfuse: ior through the CTE FUSE mount.
     - pkg_type: builtin.ior
