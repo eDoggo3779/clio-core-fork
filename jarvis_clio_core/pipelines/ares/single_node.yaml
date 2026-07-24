@@ -100,8 +100,11 @@ scheduler:
   cpus_per_task: 32
   partition: debug
   time: "12:00:00"
-  output: single_node-%j.out
-  error: single_node-%j.err
+  # Absolute paths so slurm's own stdout/stderr are easy to find (a relative
+  # path lands in the sbatch CWD). Written by slurm on the HOST, outside any
+  # container, so $HOME is the real host home (not the fakeroot overlay).
+  output: ${HOME}/single_node-%j.out
+  error: ${HOME}/single_node-%j.err
   # Known bad fakeroot nodes (surveyed): uncomment to steer clear. Unknown
   # scheduler keys pass through as --<key>=<value> sbatch directives.
   # exclude: "ares-comp-15,ares-comp-17"
@@ -246,8 +249,13 @@ config:
     # builtin.ior (v3 container path). Shared keys: api posix, write+read,
     # fpp (file-per-process — REQUIRED through per-node FUSE mounts), fixed
     # block 64m per rank (data-bounded runtime; the xfer sweep below is the
-    # I/O-size axis), stonewall 120 (ior -D: phase runtime cap), distinct
-    # log: per package (default <shared_dir>/ior.log would collide).
+    # I/O-size axis), stonewall 120 (ior -D: phase runtime cap). log: is left
+    # UNSET on purpose — builtin.ior then defaults it to each package's own
+    # shared_dir/ior.log, which is host-bound and auto-distinct per package.
+    # An explicit ${HOME}/..._results/*.log silently lost every stat: inside
+    # the --fakeroot instance $HOME is the overlay (not a host bind) and the
+    # log parent dir does not exist there, so ior's `tee <log>` failed and the
+    # host-side stat parser found nothing.
     # 1) NFS: ior against the NFS home (a subdir of the auto-mounted $HOME).
     - pkg_type: builtin.ior
       pkg_name: nfs_ior
@@ -261,7 +269,6 @@ config:
       ppn: 1
       stonewall: 120
       out: ${HOME}/single_node_nfs/ior_nfs.bin
-      log: ${HOME}/single_node_results/nfs_ior.log
 
     # 2) CTE + libfuse: ior through the CTE FUSE mount.
     - pkg_type: builtin.ior
@@ -276,7 +283,6 @@ config:
       ppn: 1
       stonewall: 120
       out: /tmp/cte_mnt/ior_cte.bin
-      log: ${HOME}/single_node_results/cte_ior.log
 
     # 3) redis: builtin.redis-benchmark (SET/GET -> -t set,get; --csv stats).
     #    The "threads" axis drives clients (-c) AND nthreads (--threads),
@@ -306,7 +312,6 @@ config:
       ppn: 1
       stonewall: 120
       out: /tmp/jfs_mnt/ior_jfs.bin
-      log: ${HOME}/single_node_results/jfs_ior.log
 
 vars:
   # I/O size, applied to all four drivers at once (zipped, length 4). 1m = the

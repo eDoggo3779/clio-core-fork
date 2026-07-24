@@ -92,8 +92,10 @@ scheduler:
   cpus_per_task: 32
   partition: debug
   time: "04:00:00"
-  output: distributed-%j.out
-  error: distributed-%j.err
+  # Absolute paths (host-side slurm log; relative would land in the sbatch
+  # CWD). $HOME here is the real host home, outside any container.
+  output: ${HOME}/distributed-%j.out
+  error: ${HOME}/distributed-%j.err
   # Known bad fakeroot nodes (surveyed): uncomment to steer clear; the
   # preflight below re-detects per job and prints an updated list.
   # exclude: "ares-comp-15,ares-comp-17"
@@ -262,8 +264,11 @@ config:
     # builtin.ior (v3 container path + num_nodes subset knob). Shared keys:
     # api posix, write+read, fpp (per-node mounts make shared-file impossible
     # for the CTE/jfs stacks), block 256m x ppn 4 = 1 GiB per node per phase,
-    # stonewall 120 runtime cap, distinct log: per package. num_nodes/nprocs
-    # are swept below (nprocs = num_nodes x ppn, zipped explicitly).
+    # stonewall 120 runtime cap. log: is left UNSET so builtin.ior defaults it
+    # to each package's own host-bound shared_dir/ior.log (auto-distinct); an
+    # explicit ${HOME} log lands in the fakeroot overlay and loses every stat.
+    # num_nodes/nprocs are swept below (nprocs = num_nodes x ppn, zipped
+    # explicitly).
     # 1) NFS: ior against the shared NFS home, scaling with node count.
     - pkg_type: builtin.ior
       pkg_name: nfs_ior
@@ -278,7 +283,6 @@ config:
       num_nodes: 1
       stonewall: 120
       out: ${HOME}/distributed_nfs/ior_nfs.bin
-      log: ${HOME}/distributed_results/nfs_ior.log
 
     # 2) CTE + libfuse: ior through each node's local CTE FUSE mount.
     - pkg_type: builtin.ior
@@ -294,7 +298,6 @@ config:
       num_nodes: 1
       stonewall: 120
       out: ${HOME}/cte_libfuse_526/ior_cte.bin
-      log: ${HOME}/distributed_results/cte_ior.log
 
     # 3) juicefs: ior through each node's local JuiceFS mount (one shared
     #    filesystem namespace; fpp keeps per-rank files distinct).
@@ -311,7 +314,6 @@ config:
       num_nodes: 1
       stonewall: 120
       out: /tmp/jfs_mnt/ior_jfs.bin
-      log: ${HOME}/distributed_results/jfs_ior.log
 
 # Node-count sweep within the single 4-node allocation: jarvis subsets the
 # hostfile to the FIRST num_nodes hosts for each ior; nprocs is zipped

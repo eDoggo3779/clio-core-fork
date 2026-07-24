@@ -33,8 +33,9 @@ scheduler:
   cpus_per_task: 32
   partition: debug
   time: "01:00:00"
-  output: distributed_smoke-%j.out
-  error: distributed_smoke-%j.err
+  # Absolute (host-side slurm log; relative would land in the sbatch CWD).
+  output: ${HOME}/distributed_smoke-%j.out
+  error: ${HOME}/distributed_smoke-%j.err
   # exclude: "ares-comp-15,ares-comp-17"
   # MUST stay literally identical to config.hostfile below.
   hostfile: "${HOME}/.jarvis-526/distributed_smoke_hostfile.txt"
@@ -166,7 +167,6 @@ config:
       num_nodes: 1
       stonewall: 120
       out: ${HOME}/distributed_smoke_nfs/ior_nfs.bin
-      log: ${HOME}/distributed_smoke_results/nfs_ior.log
 
     - pkg_type: builtin.ior
       pkg_name: cte_ior
@@ -181,7 +181,6 @@ config:
       num_nodes: 1
       stonewall: 120
       out: ${HOME}/cte_libfuse_526_smoke/ior_cte.bin
-      log: ${HOME}/distributed_smoke_results/cte_ior.log
 
     - pkg_type: builtin.ior
       pkg_name: jfs_ior
@@ -196,7 +195,6 @@ config:
       num_nodes: 1
       stonewall: 120
       out: /tmp/jfs_mnt/ior_jfs.bin
-      log: ${HOME}/distributed_smoke_results/jfs_ior.log
 
 # {1,2}-client-node sweep: row 1 = all-local MPI (isolates the container
 # stack), row 2 = the cross-node spawn proof.

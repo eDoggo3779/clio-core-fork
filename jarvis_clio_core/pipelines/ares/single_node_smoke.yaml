@@ -26,8 +26,9 @@ scheduler:
   cpus_per_task: 32
   partition: debug
   time: "01:00:00"
-  output: single_node_smoke-%j.out
-  error: single_node_smoke-%j.err
+  # Absolute (host-side slurm log; relative would land in the sbatch CWD).
+  output: ${HOME}/single_node_smoke-%j.out
+  error: ${HOME}/single_node_smoke-%j.err
   # exclude: "ares-comp-15,ares-comp-17"
   hostfile: "${HOME}/.jarvis-526/single_node_smoke_hostfile.txt"
   pre_cmds:
@@ -127,7 +128,6 @@ config:
       ppn: 2
       stonewall: 120
       out: ${HOME}/single_node_smoke_nfs/ior_nfs.bin
-      log: ${HOME}/single_node_smoke_results/nfs_ior.log
 
     - pkg_type: builtin.ior
       pkg_name: cte_ior
@@ -141,7 +141,6 @@ config:
       ppn: 2
       stonewall: 120
       out: /tmp/cte_mnt/ior_cte.bin
-      log: ${HOME}/single_node_smoke_results/cte_ior.log
 
     - pkg_type: builtin.redis-benchmark
       pkg_name: redis_bench
@@ -165,7 +164,6 @@ config:
       ppn: 2
       stonewall: 120
       out: /tmp/jfs_mnt/ior_jfs.bin
-      log: ${HOME}/single_node_smoke_results/jfs_ior.log
 
 vars:
   # Both I/O-size extremes; request budget scaled down for smoke speed.
