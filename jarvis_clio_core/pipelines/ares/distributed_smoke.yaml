@@ -91,8 +91,11 @@ config:
 
   hostfile: "${HOME}/.jarvis-526/distributed_smoke_hostfile.txt"
 
-  # Host-level Pssh hop + mpiexec plm_rsh_agent (see distributed.yaml).
-  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+  # Host-level Pssh hop + mpiexec plm_rsh_agent (see distributed.yaml). The
+  # StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null are REQUIRED for the
+  # in-instance ssh -p 2222 prted spawn — without them the num_nodes>=2 rows die
+  # with "Host key verification failed" / "PRTE has lost communication".
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
   # Fabric tuning prefix (identical to distributed.yaml; must start "mpiexec ").
   mpi_cmd: 'mpiexec --mca btl_tcp_if_include enp47s0np0 --mca oob_tcp_if_include eno1 --prtemca prte_if_include eno1 --prtemca prte_tmpdir_base /tmp/iowarp_prte_tmp'

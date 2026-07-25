@@ -160,12 +160,18 @@ config:
   # wrote (keep literally identical to scheduler.hostfile above).
   hostfile: "${HOME}/.jarvis-526/distributed_hostfile.txt"
 
-  # The OUTER jarvis Pssh's between nodes to bring up the per-node containers;
-  # strip the conda LD_LIBRARY_PATH for that ssh hop so /usr/bin/ssh doesn't
-  # abort on an OpenSSL mismatch. This ALSO becomes mpiexec's
-  # --mca plm_rsh_agent (jarvis-verified benign: env -u only affects the ssh
-  # client process; -p 2222 arrives via plm_rsh_args).
-  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+  # The OUTER jarvis Pssh between nodes brings up the per-node containers, and
+  # this string ALSO becomes mpiexec's --mca plm_rsh_agent: the ssh that spawns
+  # prted INSIDE the remote node's instance sshd on -p 2222 (jarvis appends the
+  # port via plm_rsh_args). env -u LD_LIBRARY_PATH strips the conda
+  # LD_LIBRARY_PATH so /usr/bin/ssh doesn't abort on an OpenSSL mismatch.
+  # StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null are REQUIRED for the
+  # -p 2222 hop: the remote instance's sshd presents a host key never seen for
+  # that host:port, so a strict client aborts with "Host key verification
+  # failed" and PRTE loses the remote daemon (the SIF's ssh_config drop-in did
+  # not take effect on Ares). They also cover the outer host->host hop
+  # harmlessly (those keys are already trusted).
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
   # Fabric tuning prefix for the in-instance mpiexec, carried from the
   # VALIDATED host-mode yaml (see header). MUST begin with "mpiexec ".
