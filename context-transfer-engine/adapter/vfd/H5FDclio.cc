@@ -119,11 +119,7 @@ unsigned long H5FDclio_cache_truncate_failures_g = 0;
  * This is the same degradation the driver already applies at run time when the
  * CLIO runtime is unreachable (see H5FD__clio_cache_available below); on
  * Windows the answer is simply known at compile time. */
-#if defined(_WIN32)
-#define H5FD_CLIO_HAVE_CACHE_TIER 0
-#else
 #define H5FD_CLIO_HAVE_CACHE_TIER 1
-#endif
 
 #define MAXADDR (((haddr_t)1 << (8 * sizeof(clio_vfd_off_t) - 1)) - 1)
 #define SUCCEED 0
@@ -443,15 +439,6 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   // broke even the native-only path. If attach fails we degrade to native-only
   // for this file rather than failing the open: the authoritative store is
   // unaffected, and the cache is a performance tier, not a correctness one.
-#if !H5FD_CLIO_HAVE_CACHE_TIER
-  if (fa.cache_enabled) {
-    HLOG(kWarning,
-         "CLIO cache tier is not available on this platform; opening {} "
-         "native-only",
-         name);
-    fa.cache_enabled = 0;
-  }
-#endif
   if (fa.cache_enabled && !H5FD__clio_cache_available()) {
     HLOG(kWarning,
          "CLIO runtime unavailable; opening {} native-only (cache disabled)",

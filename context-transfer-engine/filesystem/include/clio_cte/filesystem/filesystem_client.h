@@ -7,75 +7,10 @@
 
 #include <clio_cte/core/core_client.h>
 #include <atomic>
+#include "clio_cte/filesystem/posix_compat.h"
+
 #include <chrono>
 #include <cstdlib>
-#if !defined(_WIN32)
-// The descriptor layer below is POSIX-shaped (ssize_t/off_t/O_SYNC/S_IFREG)
-// and has no Windows port -- this is the same constraint that kept the old
-// adapter/cfs out of Windows builds at the CMake level. The rest of this
-// client (tasks, deferred writes, the SHM caches) is portable and still
-// compiles there, so guard the descriptor layer rather than the whole header.
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-#include <cerrno>
-#include <unordered_map>
-#include <vector>
-#include <mutex>
-#include <clio_cte/filesystem/filesystem_tasks.h>
-#include <clio_cte/filesystem/shm_fs_cache.h>
-
-namespace clio::cte::filesystem {
-
-// ---- clio:: path marker (opt-in interception) -----------------------------
-//
-// Interception is opt-in by a "clio::" path component; the marker is stripped
-// before the path is used as a CTE tag name. This lived in the POSIX adapter,
-// which meant every other interceptor (STDIO, MPI-IO, libfuse, the HDF5 VFD)
-// had to link that adapter to ask "is this path mine?" -- a question about the
-// filesystem, not about POSIX.
-
-static constexpr char kClioPrefix[] = "clio::";
-static constexpr size_t kClioPrefixLen = sizeof(kClioPrefix) - 1;  // 6
-
-/** Byte offset where "clio::" appears as a path-component prefix, or npos. */
-inline size_t FindClioPrefix(const std::string &path) {
-  if (path.size() >= kClioPrefixLen &&
-      path.compare(0, kClioPrefixLen, kClioPrefix) == 0) {
-    return 0;
-  }
-  for (size_t cur = 0; cur < path.size(); ++cur) {
-    if (path[cur] != '/') continue;
-    if (cur + 1 + kClioPrefixLen <= path.size() &&
-        path.compare(cur + 1, kClioPrefixLen, kClioPrefix) == 0) {
-      return cur + 1;
-    }
-  }
-  return std::string::npos;
-}
-
-inline bool HasClioPrefix(const std::string &path) {
-  return FindClioPrefix(path) != std::string::npos;
-}
-
-/** Remove the first "clio::" marker, yielding the bare backend path. */
-inline std::string StripClioPrefix(const std::string &path) {
-  size_t pos = FindClioPrefix(path);
-  if (pos == std::string::npos) {
-    return path;
-  }
-  return path.substr(0, pos) + path.substr(pos + kClioPrefixLen);
-}
-
-#if !defined(_WIN32)
-/** CTE-issued descriptors start here so they never collide with kernel fds. */
-static constexpr int kCfsFdBase = 8192;
-/** Preferred block size reported by stat (matches the chimod page size). */
-static constexpr size_t kCfsBlkSize = 1024 * 1024;
-/** Synthetic device id -- same for every clio:: file. */
-static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
-#endif  // !_WIN32
 
 /**
  * Filesystem client — the single API every interceptor (POSIX, STDIO,
@@ -89,7 +24,7 @@ class Client : public clio::cte::core::Client {
   Client() = default;
   explicit Client(const clio::run::PoolId &fs_pool_id) { Init(fs_pool_id); }
 
-#if CTP_IS_HOST && !defined(_WIN32)
+#if CTP_IS_HOST
   // Copyable by hand, because the descriptor table below carries a std::mutex
   // and the compiler-generated copies would be deleted. The base client is
   // copyable by contract (its deferred-write registry is process-wide for
@@ -441,14 +376,16 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-#if !defined(_WIN32)
   // =========================================================================
   // Byte-oriented filesystem I/O with POSIX semantics (issues #817, #862).
   //
-  // POSIX-only: these return ssize_t and the descriptor layer below adds
-  // off_t/O_SYNC/S_IFREG. Windows builds get the task API (AsyncRead/
-  // AsyncWrite/...) which is portable; the old adapter/cfs was excluded from
-  // Windows at the CMake level for exactly this reason.
+  // POSIX-SHAPED, but not POSIX-only: nothing here makes a system call. The
+  // layer is a descriptor table and a set of seek offsets over the task API,
+  // so what tied it to POSIX was its vocabulary -- ssize_t, off_t, O_SYNC --
+  // rather than its behaviour. That vocabulary now comes from
+  // posix_compat.h (FsSsize/FsOff), and the layer builds on Windows too.
+  // Offsets are deliberately FsOff and not off_t: MSVC's off_t is 32 bits and
+  // would cap every offset here at 2 GiB.
   //
   // THIS is the interface an interceptor calls. An adapter (POSIX, STDIO,
   // MPI-IO, libfuse) should own nothing but its handle table and its seek
@@ -551,7 +488,7 @@ class Client : public clio::cte::core::Client {
    *        durability over latency and honouring that is the point of the flag.
    * @return bytes accepted, or -1 with errno set.
    */
-  ssize_t Write(clio::run::u64 handle, const std::string &path,
+  FsSsize Write(clio::run::u64 handle, const std::string &path,
                 clio::run::u64 off, const void *buf, size_t count,
                 bool sync = false) {
     if (count == 0) {
@@ -597,9 +534,9 @@ class Client : public clio::cte::core::Client {
     auto t3 = prof ? tick() : std::chrono::steady_clock::time_point{};
     if (blocking) {
       fut.Wait();
-      ssize_t ret;
+      FsSsize ret;
       if (fut->GetReturnCode() == 0) {
-        ret = static_cast<ssize_t>(fut->bytes_written_);
+        ret = static_cast<FsSsize>(fut->bytes_written_);
       } else {
         errno = EIO;
         ret = -1;
@@ -641,7 +578,7 @@ class Client : public clio::cte::core::Client {
       p.window_ns.fetch_add(std::chrono::duration_cast<ns>(t5 - t4).count(),
                             std::memory_order_relaxed);
     }
-    return static_cast<ssize_t>(count);
+    return static_cast<FsSsize>(count);
   }
 
   /**
@@ -653,7 +590,7 @@ class Client : public clio::cte::core::Client {
    *
    * @return bytes read (possibly 0 at EOF), or -1 with errno set.
    */
-  ssize_t Read(clio::run::u64 handle, const std::string &path,
+  FsSsize Read(clio::run::u64 handle, const std::string &path,
                clio::run::u64 off, void *buf, size_t count) {
     if (count == 0) {
       return 0;
@@ -663,7 +600,7 @@ class Client : public clio::cte::core::Client {
     if (served > 0) {
       // Fully covered by in-flight writes: those bytes ARE the current value,
       // and the file is necessarily at least this long.
-      return static_cast<ssize_t>(count);
+      return static_cast<FsSsize>(count);
     }
     if (served == -1) {
       // PARTIAL coverage: the bytes outside the in-flight writes are stale in
@@ -674,7 +611,7 @@ class Client : public clio::cte::core::Client {
       // of the same file.
       DeferAwaitKey(key);
     }
-    ssize_t fast = TryReadShm(path, off, buf, count);
+    FsSsize fast = TryReadShm(path, off, buf, count);
     if (fast >= 0) {
       return fast;
     }
@@ -686,13 +623,13 @@ class Client : public clio::cte::core::Client {
     }
     auto t = AsyncRead(handle, off, count, ctp::ipc::ShmPtr<>(shm.shm_));
     t.Wait();
-    ssize_t ret;
+    FsSsize ret;
     if (t->GetReturnCode() == 0) {
       size_t got = static_cast<size_t>(t->bytes_read_);
       if (got > 0) {
         std::memcpy(buf, shm.ptr_, got);
       }
-      ret = static_cast<ssize_t>(got);
+      ret = static_cast<FsSsize>(got);
     } else {
       errno = EIO;
       ret = -1;
@@ -839,7 +776,13 @@ class Client : public clio::cte::core::Client {
 #ifdef O_DSYNC
     if (flags & O_DSYNC) return true;
 #endif
+#ifdef O_SYNC
     return (flags & O_SYNC) != 0;
+#else
+    /* MSVC defines neither, so no caller there can have requested it. */
+    (void)flags;
+    return false;
+#endif
   }
 
   /** Whether fd was issued by us (and is still open). */
@@ -883,19 +826,19 @@ class Client : public clio::cte::core::Client {
   static bool EnsureInit();
 
   int OpenFd(const std::string &raw_path, int flags, int mode);
-  ssize_t ReadFd(int fd, void *buf, size_t count);
-  ssize_t WriteFd(int fd, const void *buf, size_t count);
-  ssize_t PreadFd(int fd, void *buf, size_t count, off_t offset);
-  ssize_t PwriteFd(int fd, const void *buf, size_t count, off_t offset);
-  off_t SeekFd(int fd, off_t offset, int whence);
-  off_t TellFd(int fd);
-  off_t SizeFd(int fd);
+  FsSsize ReadFd(int fd, void *buf, size_t count);
+  FsSsize WriteFd(int fd, const void *buf, size_t count);
+  FsSsize PreadFd(int fd, void *buf, size_t count, FsOff offset);
+  FsSsize PwriteFd(int fd, const void *buf, size_t count, FsOff offset);
+  FsOff SeekFd(int fd, FsOff offset, int whence);
+  FsOff TellFd(int fd);
+  FsOff SizeFd(int fd);
   int CloseFd(int fd);
   /** fsync(2): drain this file's deferred writes, reporting a latched
    *  failure exactly once. */
   int SyncFd(int fd);
-  int FtruncateFd(int fd, off_t length);
-  int TruncatePath(const std::string &raw_path, off_t length);
+  int FtruncateFd(int fd, FsOff length);
+  int TruncatePath(const std::string &raw_path, FsOff length);
   int RemovePath(const std::string &raw_path);
   int RenamePath(const std::string &raw_src, const std::string &raw_dst);
   int ReaddirPath(const std::string &raw_path, std::vector<std::string> *out);
@@ -916,10 +859,12 @@ class Client : public clio::cte::core::Client {
     buf->st_nlink = 1;
     buf->st_uid = CTP_SYSTEM_INFO->uid_;
     buf->st_gid = CTP_SYSTEM_INFO->gid_;
-    buf->st_size = static_cast<off_t>(size);
-    buf->st_blksize = static_cast<blksize_t>(kCfsBlkSize);
+    // Cast to whatever the platform's struct declares rather than to a fixed
+    // POSIX type: this template is instantiated with the caller's stat struct.
+    buf->st_size = static_cast<decltype(buf->st_size)>(size);
+    buf->st_blksize = static_cast<decltype(buf->st_blksize)>(kCfsBlkSize);
     // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
-    buf->st_blocks = static_cast<blkcnt_t>((size + 511) / 512);
+    buf->st_blocks = static_cast<decltype(buf->st_blocks)>((size + 511) / 512);
   }
 
   /** fstat(2): fill *buf from the fd's chimod metadata. */
@@ -955,7 +900,7 @@ class Client : public clio::cte::core::Client {
     return 0;
   }
 
-  ssize_t TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
+  FsSsize TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
     // Attach lazily, and RETRY when not yet attached, rather than latching
     // the result of one attempt at init. A client can legitimately come up
@@ -1032,7 +977,7 @@ class Client : public clio::cte::core::Client {
            "active)");
     });
     ShmReadHits().fetch_add(1, std::memory_order_relaxed);
-    return static_cast<ssize_t>(done);
+    return static_cast<FsSsize>(done);
   }
 
   // Zero-IPC read accounting. A silently-disabled fast path and a working one
@@ -1080,7 +1025,6 @@ class Client : public clio::cte::core::Client {
     }();
     return v;
   }
-#endif  // !_WIN32
 #endif  // CTP_IS_HOST
 
 #if CTP_IS_HOST
@@ -1090,7 +1034,6 @@ class Client : public clio::cte::core::Client {
   // may drop the cache at any time, which is why every read is validated.
   ShmFsCacheRoot *shm_fs_root_ = nullptr;
 
-#if !defined(_WIN32)
   // ---- POSIX descriptor table ----
   // Guarded by fd_mu_. Held only around map lookups and insertions -- never
   // across a task Wait, so a slow chimod call cannot block an unrelated
@@ -1098,7 +1041,6 @@ class Client : public clio::cte::core::Client {
   mutable std::mutex fd_mu_;
   std::unordered_map<int, OpenFile> fds_;
   int next_fd_ = kCfsFdBase;
-#endif  // !_WIN32
 #endif
 };
 
