@@ -7,10 +7,70 @@
 
 #include <clio_cte/core/core_client.h>
 #include <atomic>
-#include "clio_cte/filesystem/posix_compat.h"
-
 #include <chrono>
 #include <cstdlib>
+// The descriptor layer below is POSIX-SHAPED but not POSIX-only: nothing
+// in it makes a system call. posix_compat.h supplies the vocabulary it is
+// written in (FsSsize/FsOff/FsSsize) on every platform.
+#include "clio_cte/filesystem/posix_compat.h"
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+#include <cerrno>
+#include <unordered_map>
+#include <vector>
+#include <mutex>
+#include <clio_cte/filesystem/filesystem_tasks.h>
+#include <clio_cte/filesystem/shm_fs_cache.h>
+
+namespace clio::cte::filesystem {
+
+// ---- clio:: path marker (opt-in interception) -----------------------------
+//
+// Interception is opt-in by a "clio::" path component; the marker is stripped
+// before the path is used as a CTE tag name. This lived in the POSIX adapter,
+// which meant every other interceptor (STDIO, MPI-IO, libfuse, the HDF5 VFD)
+// had to link that adapter to ask "is this path mine?" -- a question about the
+// filesystem, not about POSIX.
+
+static constexpr char kClioPrefix[] = "clio::";
+static constexpr size_t kClioPrefixLen = sizeof(kClioPrefix) - 1;  // 6
+
+/** Byte offset where "clio::" appears as a path-component prefix, or npos. */
+inline size_t FindClioPrefix(const std::string &path) {
+  if (path.size() >= kClioPrefixLen &&
+      path.compare(0, kClioPrefixLen, kClioPrefix) == 0) {
+    return 0;
+  }
+  for (size_t cur = 0; cur < path.size(); ++cur) {
+    if (path[cur] != '/') continue;
+    if (cur + 1 + kClioPrefixLen <= path.size() &&
+        path.compare(cur + 1, kClioPrefixLen, kClioPrefix) == 0) {
+      return cur + 1;
+    }
+  }
+  return std::string::npos;
+}
+
+inline bool HasClioPrefix(const std::string &path) {
+  return FindClioPrefix(path) != std::string::npos;
+}
+
+/** Remove the first "clio::" marker, yielding the bare backend path. */
+inline std::string StripClioPrefix(const std::string &path) {
+  size_t pos = FindClioPrefix(path);
+  if (pos == std::string::npos) {
+    return path;
+  }
+  return path.substr(0, pos) + path.substr(pos + kClioPrefixLen);
+}
+
+/** CTE-issued descriptors start here so they never collide with kernel fds. */
+static constexpr int kCfsFdBase = 8192;
+/** Preferred block size reported by stat (matches the chimod page size). */
+static constexpr size_t kCfsBlkSize = 1024 * 1024;
+/** Synthetic device id -- same for every clio:: file. */
+static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
 
 /**
  * Filesystem client — the single API every interceptor (POSIX, STDIO,
@@ -382,10 +442,10 @@ class Client : public clio::cte::core::Client {
   // POSIX-SHAPED, but not POSIX-only: nothing here makes a system call. The
   // layer is a descriptor table and a set of seek offsets over the task API,
   // so what tied it to POSIX was its vocabulary -- ssize_t, off_t, O_SYNC --
-  // rather than its behaviour. That vocabulary now comes from
-  // posix_compat.h (FsSsize/FsOff), and the layer builds on Windows too.
-  // Offsets are deliberately FsOff and not off_t: MSVC's off_t is 32 bits and
-  // would cap every offset here at 2 GiB.
+  // rather than its behaviour. That vocabulary comes from posix_compat.h now
+  // (FsSsize/FsOff), and the layer builds on Windows too. Offsets are FsOff
+  // and deliberately not off_t: MSVC's off_t is 32 bits and would cap every
+  // offset here at 2 GiB.
   //
   // THIS is the interface an interceptor calls. An adapter (POSIX, STDIO,
   // MPI-IO, libfuse) should own nothing but its handle table and its seek
@@ -859,8 +919,8 @@ class Client : public clio::cte::core::Client {
     buf->st_nlink = 1;
     buf->st_uid = CTP_SYSTEM_INFO->uid_;
     buf->st_gid = CTP_SYSTEM_INFO->gid_;
-    // Cast to whatever the platform's struct declares rather than to a fixed
-    // POSIX type: this template is instantiated with the caller's stat struct.
+    // Cast to whatever the caller's own struct declares rather than to fixed
+    // POSIX types: this is a template instantiated with their stat struct.
     buf->st_size = static_cast<decltype(buf->st_size)>(size);
     buf->st_blksize = static_cast<decltype(buf->st_blksize)>(kCfsBlkSize);
     // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
