@@ -596,6 +596,7 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
     CLIO_CFS_CLIENT->CloseFd(file->fd);
     HLOG(kDebug, "");
   }
+#endif
   if (file->filename_) {
     free(file->filename_);
   }
