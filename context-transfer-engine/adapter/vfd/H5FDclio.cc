@@ -1187,8 +1187,13 @@ static herr_t H5FD__clio_del(const char *name, hid_t fapl) {
 /*
  * Entry points for dynamic plugin loading.
  */
-H5PL_type_t H5PLget_plugin_type(void) { return H5PL_TYPE_VFD; }
+/* H5PLUGIN_DLL, not a bare definition: H5PLextern.h declares both entry points
+ * with it, which is __declspec(dllexport) on Windows, so defining them without
+ * it is a linkage mismatch (MSVC C2375) -- and an unexported entry point is one
+ * HDF5's plugin loader cannot find. Elsewhere it expands to default visibility,
+ * which is what a plugin entry point wants in any case. */
+H5PLUGIN_DLL H5PL_type_t H5PLget_plugin_type(void) { return H5PL_TYPE_VFD; }
 
-const void *H5PLget_plugin_info(void) { return &H5FD_clio_g; }
+H5PLUGIN_DLL const void *H5PLget_plugin_info(void) { return &H5FD_clio_g; }
 
 } // extern C
