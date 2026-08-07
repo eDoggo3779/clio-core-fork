@@ -49,13 +49,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
 
 /* HDF5 header for dynamic plugin loading */
 #include "H5FDclio.h" /* Clio file driver     */
+#include "H5FDclio_compat.h" /* POSIX/Win32 platform layer */
 #include "H5PLextern.h"
 #include <clio_cte/filesystem/filesystem_client.h>
 #include "clio_cte/core/core_client.h"
@@ -107,7 +106,7 @@ unsigned long H5FDclio_cache_truncate_failures_g = 0;
 #define H5FD_CLIO_POSIX_CREATE_MODE_RW 0666
 #endif
 
-#define MAXADDR (((haddr_t)1 << (8 * sizeof(off_t) - 1)) - 1)
+#define MAXADDR (((haddr_t)1 << (8 * sizeof(clio_vfd_off_t) - 1)) - 1)
 #define SUCCEED 0
 #define FAIL (-1)
 
@@ -221,8 +220,9 @@ typedef struct H5FD_clio_t {
    * one path (relative vs absolute, symlink vs target, with vs without the
    * clio:: marker) must compare equal or the library opens the same file twice
    * with two independent metadata caches, which corrupts it. sec2 parity. */
-  dev_t st_dev;       /* device id of the authoritative native file */
-  ino_t st_ino;       /* inode number of the authoritative native file */
+  /* Opaque per-platform identity: dev/ino on POSIX, volume serial + file
+   * index on Windows, where st_ino is always 0. See H5FDclio_compat.h. */
+  clio_vfd_file_id_t file_id;
 } H5FD_clio_t;
 
 /* Prototypes */
@@ -447,8 +447,8 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   // path (clio::/tmp/foo.h5 -> /tmp/foo.h5), so standard tools (h5dump/h5ls)
   // read it live.
   std::string native_path = clio::cte::filesystem::StripClioPrefix(name);
-  int posix_fd =
-      open(native_path.c_str(), o_flags, H5FD_CLIO_POSIX_CREATE_MODE_RW);
+  int posix_fd = clio_vfd_open(native_path.c_str(), o_flags,
+                              H5FD_CLIO_POSIX_CREATE_MODE_RW);
   if (posix_fd < 0) {
     // Fail-closed: no authoritative file => the open fails. We do not proceed
     // with a cache-only file. Record errno on the driver error stack.
@@ -477,7 +477,7 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     // so set it explicitly for an accurate error message.
     errno = ENOMEM;
     H5FD_CLIO_ERROR("calloc() of VFD file struct failed");
-    close(posix_fd);
+    clio_vfd_close(posix_fd);
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
@@ -487,10 +487,11 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   // Identity + size from ONE fstat of the authoritative file. cmp() depends on
   // dev/ino, so a failed fstat is fail-closed: without identity the library
   // could not tell this file apart from another and might open it twice.
-  struct stat st;
-  if (fstat(posix_fd, &st) < 0) {
+  clio_vfd_file_id_t file_id;
+  clio_vfd_off_t file_size = 0;
+  if (clio_vfd_fstat(posix_fd, &file_id, &file_size) < 0) {
     H5FD_CLIO_ERROR("fstat() of authoritative native file failed");
-    close(posix_fd);
+    clio_vfd_close(posix_fd);
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
@@ -503,7 +504,7 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   if (!file->filename_) {
     errno = ENOMEM;
     H5FD_CLIO_ERROR("strdup() of file name failed");
-    close(posix_fd);
+    clio_vfd_close(posix_fd);
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
@@ -514,12 +515,11 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   file->posix_fd = posix_fd;
   file->flags = flags;
   file->fa = fa;
-  file->st_dev = st.st_dev;
-  file->st_ino = st.st_ino;
+  file->file_id = file_id;
 
   // EOF is the authoritative on-disk size (durable across reopen/append), not a
   // session-local counter or the cache's logical size.
-  file->eof = (haddr_t)st.st_size;
+  file->eof = (haddr_t)file_size;
 
   return (H5FD_t *)file;
 } /* end H5FD__clio_open() */
@@ -542,14 +542,14 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
   // a durability barrier (no pending dirty state), and the on-disk file is a
   // complete valid native HDF5 image afterward.
   if (file->posix_fd >= 0) {
-    if (fsync(file->posix_fd) < 0) {
+    if (clio_vfd_fsync(file->posix_fd) < 0) {
       H5FD_CLIO_ERROR("fsync() on close failed");
       ret_value = FAIL; /* fail-closed: a close that did not persist fails */
     }
     // close() itself can fail (EIO, and notably deferred write errors on NFS).
     // A close that reports an error has not necessarily persisted, so it is
     // fail-closed too -- the whole point of the barrier.
-    if (close(file->posix_fd) < 0) {
+    if (clio_vfd_close(file->posix_fd) < 0) {
       H5FD_CLIO_ERROR("close() of authoritative native file failed");
       ret_value = FAIL;
     }
@@ -587,11 +587,7 @@ static int H5FD__clio_cmp(const H5FD_t *_f1, const H5FD_t *_f2) {
   // to any of them look like four different files, so the library could open
   // one file several times with independent metadata caches and corrupt it.
   // sec2 compares dev/ino for exactly this reason.
-  if (f1->st_dev < f2->st_dev) return -1;
-  if (f1->st_dev > f2->st_dev) return 1;
-  if (f1->st_ino < f2->st_ino) return -1;
-  if (f1->st_ino > f2->st_ino) return 1;
-  return 0;
+  return clio_vfd_cmp_file_id(&f1->file_id, &f2->file_id);
 } /* end H5FD__clio_cmp() */
 
 /*-------------------------------------------------------------------------
@@ -717,7 +713,7 @@ static herr_t H5FD__clio_do_read(H5FD_clio_t *file, haddr_t addr, size_t size,
   }
   char *dst = static_cast<char *>(buf);
   size_t remaining = size;
-  off_t off = static_cast<off_t>(addr);
+  clio_vfd_off_t off = static_cast<clio_vfd_off_t>(addr);
 
   // Loop rather than issue one pread. A short return is NOT proof of EOF: the
   // kernel caps a single transfer (0x7ffff000 on Linux) and a signal can cut
@@ -729,7 +725,7 @@ static herr_t H5FD__clio_do_read(H5FD_clio_t *file, haddr_t addr, size_t size,
   while (remaining > 0) {
     const size_t cap = H5FD__clio_max_io_bytes();
     size_t want = (remaining > cap) ? cap : remaining;
-    ssize_t got = pread(file->posix_fd, dst, want, off);
+    clio_vfd_ssize_t got = clio_vfd_pread(file->posix_fd, dst, want, off);
     if (got < 0) {
       if (errno == EINTR) {
         continue; /* interrupted before transferring anything: retry */
@@ -760,7 +756,7 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
   }
   const char *src = static_cast<const char *>(buf);
   size_t remaining = size;
-  off_t off = static_cast<off_t>(addr);
+  clio_vfd_off_t off = static_cast<clio_vfd_off_t>(addr);
 
   // Same loop as the read path: chunk to stay under the kernel's per-call cap
   // and retry on EINTR. A short pwrite is a partial transfer to be continued,
@@ -768,7 +764,7 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
   while (remaining > 0) {
     const size_t cap = H5FD__clio_max_io_bytes();
     size_t want = (remaining > cap) ? cap : remaining;
-    ssize_t put = pwrite(file->posix_fd, src, want, off);
+    clio_vfd_ssize_t put = clio_vfd_pwrite(file->posix_fd, src, want, off);
     if (put < 0) {
       if (errno == EINTR) {
         continue;
@@ -963,7 +959,7 @@ static herr_t H5FD__clio_flush(H5FD_t *_file, hid_t dxpl_id, bool closing) {
   // Persist the authoritative native file; fail-closed so a flush that did not
   // reach disk never reports success. Writes are write-through, so the native
   // file is the only store holding data to flush.
-  if (file->posix_fd >= 0 && fsync(file->posix_fd) < 0) {
+  if (file->posix_fd >= 0 && clio_vfd_fsync(file->posix_fd) < 0) {
     H5FD_CLIO_ERROR("fsync() in flush failed");
     return FAIL;
   }
@@ -987,7 +983,7 @@ static herr_t H5FD__clio_truncate(H5FD_t *_file, hid_t dxpl_id, bool closing) {
   H5FD_clio_t *file = (H5FD_clio_t *)_file;
   if (file->eof != file->eoa) {
     if (file->posix_fd >= 0 &&
-        ftruncate(file->posix_fd, (off_t)file->eoa) < 0) {
+        clio_vfd_ftruncate(file->posix_fd, (clio_vfd_off_t)file->eoa) < 0) {
       H5FD_CLIO_ERROR("ftruncate() of authoritative native file failed");
       return FAIL;
     }
@@ -1025,8 +1021,7 @@ static herr_t H5FD__clio_lock(H5FD_t *_file, bool rw) {
   if (file->posix_fd < 0) {
     return SUCCEED;
   }
-  int lock_flags = (rw ? LOCK_EX : LOCK_SH) | LOCK_NB;
-  if (flock(file->posix_fd, lock_flags) < 0) {
+  if (clio_vfd_lock(file->posix_fd, rw ? 1 : 0) < 0) {
     if (errno == ENOSYS) {
       return SUCCEED; /* locking unsupported here: not an error (sec2 parity) */
     }
@@ -1044,7 +1039,7 @@ static herr_t H5FD__clio_unlock(H5FD_t *_file) {
   if (file->posix_fd < 0) {
     return SUCCEED;
   }
-  if (flock(file->posix_fd, LOCK_UN) < 0) {
+  if (clio_vfd_unlock(file->posix_fd) < 0) {
     if (errno == ENOSYS) {
       return SUCCEED;
     }
@@ -1182,7 +1177,7 @@ static herr_t H5FD__clio_del(const char *name, hid_t fapl) {
   // Remove the authoritative native file at the stripped path. Fail-closed on
   // error (sec2 parity) so a failed delete is reported, not masked.
   std::string native_path = clio::cte::filesystem::StripClioPrefix(name);
-  if (unlink(native_path.c_str()) < 0) {
+  if (clio_vfd_unlink(native_path.c_str()) < 0) {
     H5FD_CLIO_ERROR("unlink() of authoritative native file failed");
     return FAIL;
   }
