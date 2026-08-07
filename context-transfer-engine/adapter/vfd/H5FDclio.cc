@@ -106,6 +106,25 @@ unsigned long H5FDclio_cache_truncate_failures_g = 0;
 #define H5FD_CLIO_POSIX_CREATE_MODE_RW 0666
 #endif
 
+/* Whether the CTE cache tier can be compiled at all.
+ *
+ * The tier is driven through clio::cte::filesystem::Client's descriptor API
+ * (OpenFd/PwriteFd/CloseFd/FtruncateFd/RemovePath), and that API is POSIX-only
+ * upstream -- filesystem_client.h puts it inside `#if !defined(_WIN32)`
+ * because it is specified in terms of ssize_t/off_t and POSIX descriptor
+ * semantics. Until it is ported, the Windows build is native-only: the
+ * authoritative on-disk file is written exactly as on every other platform,
+ * and the cache tier is off.
+ *
+ * This is the same degradation the driver already applies at run time when the
+ * CLIO runtime is unreachable (see H5FD__clio_cache_available below); on
+ * Windows the answer is simply known at compile time. */
+#if defined(_WIN32)
+#define H5FD_CLIO_HAVE_CACHE_TIER 0
+#else
+#define H5FD_CLIO_HAVE_CACHE_TIER 1
+#endif
+
 #define MAXADDR (((haddr_t)1 << (8 * sizeof(clio_vfd_off_t) - 1)) - 1)
 #define SUCCEED 0
 #define FAIL (-1)
@@ -424,6 +443,15 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   // broke even the native-only path. If attach fails we degrade to native-only
   // for this file rather than failing the open: the authoritative store is
   // unaffected, and the cache is a performance tier, not a correctness one.
+#if !H5FD_CLIO_HAVE_CACHE_TIER
+  if (fa.cache_enabled) {
+    HLOG(kWarning,
+         "CLIO cache tier is not available on this platform; opening {} "
+         "native-only",
+         name);
+    fa.cache_enabled = 0;
+  }
+#endif
   if (fa.cache_enabled && !H5FD__clio_cache_available()) {
     HLOG(kWarning,
          "CLIO runtime unavailable; opening {} native-only (cache disabled)",
@@ -464,10 +492,12 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   // cache this session". Skipped entirely when the FAPL disables the cache
   // (which avoids the current write-amplification of the populate-only tier).
   int fd = -1;
+#if H5FD_CLIO_HAVE_CACHE_TIER
   if (fa.cache_enabled) {
     fd = CLIO_CFS_CLIENT->OpenFd(name, o_flags, H5FD_CLIO_POSIX_CREATE_MODE_RW);
     HLOG(kDebug, "");
   }
+#endif
 
   /* Create the new file struct */
   H5FD_clio_t *file = (H5FD_clio_t *)calloc(1, sizeof(H5FD_clio_t));
@@ -478,9 +508,11 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     errno = ENOMEM;
     H5FD_CLIO_ERROR("calloc() of VFD file struct failed");
     clio_vfd_close(posix_fd);
+#if H5FD_CLIO_HAVE_CACHE_TIER
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
+#endif
     return nullptr;
   }
 
@@ -492,9 +524,11 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   if (clio_vfd_fstat(posix_fd, &file_id, &file_size) < 0) {
     H5FD_CLIO_ERROR("fstat() of authoritative native file failed");
     clio_vfd_close(posix_fd);
+#if H5FD_CLIO_HAVE_CACHE_TIER
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
+#endif
     free(file);
     return nullptr;
   }
@@ -505,9 +539,11 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     errno = ENOMEM;
     H5FD_CLIO_ERROR("strdup() of file name failed");
     clio_vfd_close(posix_fd);
+#if H5FD_CLIO_HAVE_CACHE_TIER
     if (fd >= 0) {
       CLIO_CFS_CLIENT->CloseFd(fd);
     }
+#endif
     free(file);
     return nullptr;
   }
@@ -555,6 +591,7 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
     }
   }
   // Release the CTE cache handle, if this session had one.
+#if H5FD_CLIO_HAVE_CACHE_TIER
   if (file->fd >= 0) {
     CLIO_CFS_CLIENT->CloseFd(file->fd);
     HLOG(kDebug, "");
@@ -791,6 +828,7 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
   // does not hold, which the future read tier must not mistake for resident
   // data. Count it and log once per failure so residency work has a signal.
   if (file->fd >= 0) {
+#if H5FD_CLIO_HAVE_CACHE_TIER
     if (CLIO_CFS_CLIENT->PwriteFd(file->fd, buf, size, static_cast<off_t>(addr)) < 0) {
       H5FDclio_cache_write_failures_g++;
       HLOG(kWarning,
@@ -798,6 +836,7 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
            "unaffected and remains authoritative)",
            (unsigned long long)addr, (unsigned long long)size);
     }
+#endif
   }
   if ((haddr_t)(addr + size) > file->eof) {
     file->eof = (haddr_t)(addr + size);
@@ -991,6 +1030,7 @@ static herr_t H5FD__clio_truncate(H5FD_t *_file, hid_t dxpl_id, bool closing) {
     // tier, see the write callback). Counted on failure for the same reason:
     // a tier that did not shrink still holds bytes past the new EOF.
     if (file->fd >= 0) {
+#if H5FD_CLIO_HAVE_CACHE_TIER
       if (CLIO_CFS_CLIENT->FtruncateFd(file->fd, (off_t)file->eoa) < 0) {
         H5FDclio_cache_truncate_failures_g++;
         HLOG(kWarning,
@@ -998,6 +1038,7 @@ static herr_t H5FD__clio_truncate(H5FD_t *_file, hid_t dxpl_id, bool closing) {
              "remains authoritative)",
              (unsigned long long)file->eoa);
       }
+#endif
     }
     file->eof = file->eoa;
   }
@@ -1171,7 +1212,9 @@ static herr_t H5FD__clio_del(const char *name, hid_t fapl) {
   // file alone is still correct -- the delete must not fail just because CLIO
   // is down (same reasoning as open()).
   if (H5FD__clio_cache_available()) {
+#if H5FD_CLIO_HAVE_CACHE_TIER
     CLIO_CFS_CLIENT->RemovePath(name);
+#endif
   }
 
   // Remove the authoritative native file at the stripped path. Fail-closed on
