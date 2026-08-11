@@ -277,6 +277,20 @@ std::string ConfigManager::GetServerConfigPath() const {
     return std::string(env_path);
   }
 
+  // Unit tests are hermetic: never fall back to the developer's per-user
+  // config. Whatever happens to be in ~/.clio/clio.yaml would otherwise leak
+  // into every test -- a real cluster hostfile makes each test come up as a
+  // peer of that cluster and block on nodes that aren't running, and a
+  // `capacity: 0g` RAM bdev sizes itself at 80% of DRAM, fails to map, and
+  // falls back to the slow private-heap path. Both show up as tests that time
+  // out on a developer machine while passing in CI, which has no such file.
+  // A test that wants a specific config sets CLIO_SERVER_CONF, handled above.
+  if (const char *tm = clio::run::env::GetCompat("TEST_MODE")) {
+    if (*tm && std::string(tm) != "0") {
+      return std::string();
+    }
+  }
+
   // Fall back to a per-user config file. Lookup order, first hit wins:
   //   1. ~/.clio/clio.yaml      (new canonical name)
   //   2. ~/.clio/clio.yaml  (legacy filename in the new dir)
