@@ -30,7 +30,7 @@
 #endif
 
 #include <sys/stat.h>       /* stat() -- coherence stamp */
-#include <time.h>           /* clock_gettime() -- stamp granularity check */
+#include <time.h>           /* time_t, for struct stat's mtime members */
 
 #include <cstdint>
 #include <cstdlib>
@@ -802,6 +802,47 @@ static void clio_resolve_config(hid_t fapl_id, size_t *chunk_size,
    which HDF5 always renders with a leading '/'. */
 static constexpr const char *kStampBlobName = "__clio_coherence_stamp";
 
+/* The file's modification time, split into whole seconds and nanoseconds.
+ *
+ * `struct stat` does not agree across the platforms this connector builds on:
+ * POSIX-2008 (and glibc) names the timespec member st_mtim, Darwin predates
+ * that name and calls the same member st_mtimespec, and MSVC's struct stat has
+ * no sub-second member at all -- only st_mtime, in whole seconds. Reading
+ * st_mtim unconditionally is what stopped this file compiling anywhere but
+ * glibc; every use goes through here instead.
+ *
+ * Callers keep the two halves separate rather than taking a single nanosecond
+ * count, because the stamp string embeds them as "<sec>.<nsec>" and that text
+ * is compared against stamps already stored in a tier. */
+static void clio_stat_mtime(const struct stat &st, long long *sec,
+                            long long *nsec) {
+#if defined(_WIN32)
+  /* No sub-second field exists; see clio_stamp_granularity_ns, which widens the
+     ambiguity window to match this coarser clock. */
+  *sec = static_cast<long long>(st.st_mtime);
+  *nsec = 0;
+#elif defined(__APPLE__)
+  *sec = static_cast<long long>(st.st_mtimespec.tv_sec);
+  *nsec = static_cast<long long>(st.st_mtimespec.tv_nsec);
+#else
+  *sec = static_cast<long long>(st.st_mtim.tv_sec);
+  *nsec = static_cast<long long>(st.st_mtim.tv_nsec);
+#endif
+}
+
+/* Wall-clock now, in nanoseconds since the epoch.
+ *
+ * std::chrono::system_clock rather than clock_gettime(CLOCK_REALTIME): MSVC has
+ * neither the function nor the macro, and system_clock is the same wall clock
+ * on every implementation this builds against. It is also unfailing, which
+ * removes the "cannot read the clock" arm the caller used to need. */
+static long long clio_realtime_now_ns() {
+  return static_cast<long long>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
 /* Identity + state of the native file, as a string. dev/ino catch the file
    being replaced (a new inode at the same path -- h5repack, rsync, mv); size
    and mtime catch it being modified in place.
@@ -815,12 +856,14 @@ static constexpr const char *kStampBlobName = "__clio_coherence_stamp";
 static std::string clio_file_stamp(const char *path) {
   struct stat st;
   if (!path || stat(path, &st) != 0) return std::string();
+  long long mtime_sec = 0, mtime_nsec = 0;
+  clio_stat_mtime(st, &mtime_sec, &mtime_nsec);
   return std::string("2:") +
          std::to_string(static_cast<unsigned long long>(st.st_dev)) + ":" +
          std::to_string(static_cast<unsigned long long>(st.st_ino)) + ":" +
          std::to_string(static_cast<unsigned long long>(st.st_size)) + ":" +
-         std::to_string(static_cast<long long>(st.st_mtim.tv_sec)) + "." +
-         std::to_string(static_cast<long long>(st.st_mtim.tv_nsec));
+         std::to_string(mtime_sec) + "." +
+         std::to_string(mtime_nsec);
 }
 
 /* Does the stored stamp still describe this file? Anything but kMatched means
@@ -879,7 +922,16 @@ static uint64_t clio_stamp_granularity_ns() {
         if (end != e && *end == '\0') return static_cast<uint64_t>(v);
       }
     }
+#if defined(_WIN32)
+    /* Windows' stat() reports mtime in whole seconds (and only to two on a
+       FAT-formatted volume), so a 10 ms granule would call a file unambiguous
+       whose very next write lands in the same reported second -- exactly the
+       case this check exists to refuse. One second is the smallest default that
+       still fails closed there. */
+    return 1000ull * 1000ull * 1000ull;  /* 1 s */
+#else
     return 10ull * 1000ull * 1000ull;  /* 10 ms */
+#endif
   }();
   return g;
 }
@@ -901,12 +953,11 @@ static uint64_t clio_stamp_granularity_ns() {
 static bool clio_stamp_ambiguous(const char *path) {
   struct stat st;
   if (!path || stat(path, &st) != 0) return true;
-  struct timespec now;
-  if (clock_gettime(CLOCK_REALTIME, &now) != 0) return true;
-  const int64_t now_ns = static_cast<int64_t>(now.tv_sec) * 1000000000LL +
-                         static_cast<int64_t>(now.tv_nsec);
-  const int64_t mtime_ns = static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000LL +
-                           static_cast<int64_t>(st.st_mtim.tv_nsec);
+  long long mtime_sec = 0, mtime_nsec = 0;
+  clio_stat_mtime(st, &mtime_sec, &mtime_nsec);
+  const int64_t now_ns = static_cast<int64_t>(clio_realtime_now_ns());
+  const int64_t mtime_ns = static_cast<int64_t>(mtime_sec) * 1000000000LL +
+                           static_cast<int64_t>(mtime_nsec);
   /* A negative age means the mtime is in the future (clock skew, or a network
      filesystem stamping from a different host). Nothing can be concluded from
      it, so it is ambiguous too. */
