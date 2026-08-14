@@ -64,7 +64,10 @@
 #include "clio_cte/core/core_client.h"
 #include <clio_ctp/util/logging.h>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <map>
+#include <vector>
 
 /* The driver identification number, initialized at runtime */
 static hid_t H5FD_CLIO_g = H5I_INVALID_HID;
@@ -185,11 +188,18 @@ extern "C" {
  * read tier makes them meaningful. */
 typedef struct H5FD_clio_fapl_t {
   hbool_t cache_enabled; /* populate the CTE cache tier (default on) */
+  size_t sieve_max;      /* vector-I/O coalescing window, bytes (0 = off) */
 } H5FD_clio_fapl_t;
 
+/* Coalescing window for vector I/O. 64 KiB matches HDF5's own default sieve
+ * buffer (H5Pset_sieve_buf_size), which is the mechanism this replaces for
+ * drivers that implement vector I/O -- see H5FD__clio_write_vector. */
+#define H5FD_CLIO_SIEVE_MAX_DEF ((size_t)(64 * 1024))
+
 /* Default policy when a file is opened without a driver-specific FAPL
- * (e.g. H5Pset_driver(fapl, driver, NULL)): cache on. */
-static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {/*cache_enabled*/ 1};
+ * (e.g. H5Pset_driver(fapl, driver, NULL)): cache on, coalescing on. */
+static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {
+    /*cache_enabled*/ 1, /*sieve_max*/ H5FD_CLIO_SIEVE_MAX_DEF};
 
 /*
  * Apply the driver config string, if the FAPL carries one.
@@ -201,6 +211,8 @@ static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {/*cache_enabled*/ 1};
  *
  * Recognised keys:
  *   cache=0|1|on|off|true|false|yes|no   the CTE tier
+ *   sieve=<bytes>                        vector-I/O coalescing window
+ *                                        (0 disables; default 65536)
  *
  * An unrecognised key is an ERROR, not a shrug. A config string is something a
  * person typed, and a parser that ignores what it does not understand converts
@@ -234,9 +246,20 @@ static bool H5FD__clio_apply_config_str(hid_t fapl_id, H5FD_clio_fapl_t *fa) {
         return false;
       }
       fa->cache_enabled = on ? 1 : 0;
+    } else if (e.first == "sieve") {
+      errno = 0;
+      char *endp = nullptr;
+      const unsigned long long v = strtoull(e.second.c_str(), &endp, 0);
+      if (errno != 0 || endp == e.second.c_str() || (endp && *endp != '\0')) {
+        H5FD_CLIO_ERROR(("driver config: sieve='" + e.second +
+                         "' is not a byte count")
+                            .c_str());
+        return false;
+      }
+      fa->sieve_max = (size_t)v;
     } else {
       H5FD_CLIO_ERROR(("driver config: unknown key '" + e.first +
-                       "' (this driver accepts: cache)")
+                       "' (this driver accepts: cache, sieve)")
                           .c_str());
       return false;
     }
@@ -977,6 +1000,116 @@ static herr_t H5FD__clio_write(H5FD_t *_file, H5FD_mem_t type, hid_t dxpl_id,
  *
  *-------------------------------------------------------------------------
  */
+/* Shorthand state for a vector's sizes[]/types[] arrays.
+ *
+ * Both arrays may be "shortened": a 0 size (H5FD_MEM_NOLIST type) at i > 0
+ * means this and every later element reuse the last explicit value. The rule is
+ * monotone -- once shortened, always shortened -- so the state can be
+ * snapshotted at the first element of a group and replayed over that group,
+ * which is what the coalescing loops below need in order to walk a group twice
+ * (once to size it, once to copy it). */
+typedef struct H5FD_clio_vecst_t {
+  size_t size;
+  bool size_fixed;
+  H5FD_mem_t type;
+  bool type_fixed;
+} H5FD_clio_vecst_t;
+
+static inline void H5FD__clio_vecst_init(H5FD_clio_vecst_t *st,
+                                         const size_t sizes[],
+                                         const H5FD_mem_t types[]) {
+  st->size = sizes[0];
+  st->size_fixed = false;
+  st->type = types ? types[0] : H5FD_MEM_DEFAULT;
+  st->type_fixed = false;
+}
+
+/* Advance the state to element k; afterwards st->size/st->type are k's. */
+static inline void H5FD__clio_vecst_step(H5FD_clio_vecst_t *st, uint32_t k,
+                                         const size_t sizes[],
+                                         const H5FD_mem_t types[]) {
+  if (!st->size_fixed) {
+    if (k > 0 && sizes[k] == 0)
+      st->size_fixed = true;
+    else
+      st->size = sizes[k];
+  }
+  if (types && !st->type_fixed) {
+    if (k > 0 && types[k] == H5FD_MEM_NOLIST)
+      st->type_fixed = true;
+    else
+      st->type = types[k];
+  }
+}
+
+/* Find the longest run of elements starting at `i` whose spanning region stays
+ * within `cap` bytes. Returns the element index one past the run, and stores
+ * the span end and the sum of the elements' sizes.
+ *
+ * Elements must be ascending for a run to form; HDF5's vectors are, but a
+ * non-monotone entry simply closes the group rather than being mishandled. */
+static uint32_t H5FD__clio_vec_group(uint32_t i, uint32_t count,
+                                     const haddr_t addrs[],
+                                     const size_t sizes[],
+                                     const H5FD_mem_t types[],
+                                     H5FD_clio_vecst_t st, size_t cap,
+                                     haddr_t *end_out, size_t *payload_out) {
+  haddr_t end = addrs[i] + st.size;
+  size_t payload = st.size;
+  uint32_t j = i + 1;
+  if (cap > 0) {
+    while (j < count) {
+      H5FD_clio_vecst_t nxt = st;
+      H5FD__clio_vecst_step(&nxt, j, sizes, types);
+      if (addrs[j] < addrs[i]) break;                 /* not ascending */
+      const haddr_t e = addrs[j] + nxt.size;
+      if (e <= addrs[i]) break;                       /* degenerate */
+      if ((uint64_t)(e - addrs[i]) > (uint64_t)cap) break;
+      st = nxt;
+      if (e > end) end = e;
+      payload += nxt.size;
+      j++;
+    }
+  }
+  *end_out = end;
+  *payload_out = payload;
+  return j;
+}
+
+/* Scratch for one coalesced group. Bounded by the sieve window, so this is a
+ * 64 KiB allocation by default and it is reused for the whole vector call. */
+static herr_t H5FD__clio_vec_scratch(std::vector<char> *buf, size_t need) {
+  if (buf->size() < need) {
+    buf->resize(need);
+  }
+  return SUCCEED;
+}
+
+/*-------------------------------------------------------------------------
+ * Coalescing vector I/O.
+ *
+ * HDF5 hands a driver that implements these callbacks the WHOLE selection in
+ * one call -- for a strided slab of a contiguous dataset that is tens of
+ * thousands of 4-byte elements (measured: count=65536, size=4, stride 1024).
+ * Servicing them one at a time costs one pread/pwrite AND one CTE populate
+ * round-trip per element, which made such writes ~200x slower than sec2
+ * (iowarp/clio-core#980).
+ *
+ * The library's own answer to this pattern is the data sieve buffer, but
+ * implementing vector I/O is exactly what turns selection I/O on and takes the
+ * sieve path away (H5Dio.c, H5D__ioinfo_adjust) -- so the driver has to do it
+ * itself. Consecutive elements are grouped while their spanning region stays
+ * within the sieve window and serviced as one I/O:
+ *
+ *   - a group whose elements exactly tile the span needs no read: gather and
+ *     write once;
+ *   - otherwise read the span, patch the elements in, write the span back.
+ *     The span ends at the last element's end, so nothing outside the range the
+ *     unmerged path would have written is touched.
+ *
+ * `sieve=0` in the driver config restores the element-at-a-time behaviour.
+ *-------------------------------------------------------------------------
+ */
 static herr_t H5FD__clio_read_vector(H5FD_t *_file, hid_t dxpl, uint32_t count,
                                      H5FD_mem_t types[], haddr_t addrs[],
                                      size_t sizes[], void *bufs[]) {
@@ -986,34 +1119,45 @@ static herr_t H5FD__clio_read_vector(H5FD_t *_file, hid_t dxpl, uint32_t count,
   if (count == 0) {
     return SUCCEED;
   }
-  size_t size = sizes[0];
-  bool size_fixed = false; /* once a 0 size is seen, reuse the last explicit */
-  /* types[] uses the same shorthand with H5FD_MEM_NOLIST as the terminator,
-     and the array may genuinely be that short -- reading past the terminator
-     is out of bounds, not just wrong. */
-  H5FD_mem_t type = types ? types[0] : H5FD_MEM_DEFAULT;
-  bool type_fixed = false;
-  for (uint32_t i = 0; i < count; i++) {
-    if (!size_fixed) {
-      if (i > 0 && sizes[i] == 0) {
-        size_fixed = true; /* size stays = the last explicit size */
-      } else {
-        size = sizes[i];
+  const size_t cap = file->fa.sieve_max;
+  H5FD_clio_vecst_t st;
+  H5FD__clio_vecst_init(&st, sizes, types);
+  std::vector<char> scratch;
+
+  uint32_t i = 0;
+  while (i < count) {
+    H5FD_clio_vecst_t gst = st;
+    H5FD__clio_vecst_step(&gst, i, sizes, types);
+    haddr_t end;
+    size_t payload;
+    const uint32_t j = H5FD__clio_vec_group(i, count, addrs, sizes, types, gst,
+                                            cap, &end, &payload);
+    if (j == i + 1) {
+      if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead, (int)gst.type,
+                            addrs[i], gst.size, [&] {
+                              return H5FD__clio_do_read(file, addrs[i],
+                                                        gst.size, bufs[i]);
+                            }) < 0) {
+        return FAIL;
+      }
+    } else {
+      const size_t span = (size_t)(end - addrs[i]);
+      if (H5FD__clio_vec_scratch(&scratch, span) < 0) return FAIL;
+      if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead, (int)gst.type,
+                            addrs[i], span, [&] {
+                              return H5FD__clio_do_read(file, addrs[i], span,
+                                                        scratch.data());
+                            }) < 0) {
+        return FAIL;
+      }
+      H5FD_clio_vecst_t cp = gst;
+      for (uint32_t k = i; k < j; k++) {
+        if (k > i) H5FD__clio_vecst_step(&cp, k, sizes, types);
+        memcpy(bufs[k], scratch.data() + (size_t)(addrs[k] - addrs[i]), cp.size);
       }
     }
-    if (types && !type_fixed) {
-      if (i > 0 && types[i] == H5FD_MEM_NOLIST) {
-        type_fixed = true;
-      } else {
-        type = types[i];
-      }
-    }
-    if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead,
-                          (int)type, addrs[i], size,
-                          [&] { return H5FD__clio_do_read(file, addrs[i], size,
-                                                          bufs[i]); }) < 0) {
-      return FAIL;
-    }
+    for (uint32_t k = i; k < j; k++) H5FD__clio_vecst_step(&st, k, sizes, types);
+    i = j;
   }
   return SUCCEED;
 } /* end H5FD__clio_read_vector() */
@@ -1027,31 +1171,56 @@ static herr_t H5FD__clio_write_vector(H5FD_t *_file, hid_t dxpl, uint32_t count,
   if (count == 0) {
     return SUCCEED;
   }
-  size_t size = sizes[0];
-  bool size_fixed = false;
-  H5FD_mem_t type = types ? types[0] : H5FD_MEM_DEFAULT; /* see read_vector */
-  bool type_fixed = false;
-  for (uint32_t i = 0; i < count; i++) {
-    if (!size_fixed) {
-      if (i > 0 && sizes[i] == 0) {
-        size_fixed = true;
-      } else {
-        size = sizes[i];
+  const size_t cap = file->fa.sieve_max;
+  H5FD_clio_vecst_t st;
+  H5FD__clio_vecst_init(&st, sizes, types);
+  std::vector<char> scratch;
+
+  uint32_t i = 0;
+  while (i < count) {
+    H5FD_clio_vecst_t gst = st;
+    H5FD__clio_vecst_step(&gst, i, sizes, types);
+    haddr_t end;
+    size_t payload;
+    const uint32_t j = H5FD__clio_vec_group(i, count, addrs, sizes, types, gst,
+                                            cap, &end, &payload);
+    if (j == i + 1) {
+      if (H5FD__clio_traced(file, clio::vfdtrace::Op::kWrite, (int)gst.type,
+                            addrs[i], gst.size, [&] {
+                              return H5FD__clio_do_write(file, addrs[i],
+                                                         gst.size, bufs[i]);
+                            }) < 0) {
+        return FAIL;
+      }
+    } else {
+      const size_t span = (size_t)(end - addrs[i]);
+      if (H5FD__clio_vec_scratch(&scratch, span) < 0) return FAIL;
+      /* Elements that exactly tile the span leave no bytes to preserve, so the
+         read-modify part is skipped and this is a pure gather. */
+      if (payload < span) {
+        if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead, (int)gst.type,
+                              addrs[i], span, [&] {
+                                return H5FD__clio_do_read(file, addrs[i], span,
+                                                          scratch.data());
+                              }) < 0) {
+          return FAIL;
+        }
+      }
+      H5FD_clio_vecst_t cp = gst;
+      for (uint32_t k = i; k < j; k++) {
+        if (k > i) H5FD__clio_vecst_step(&cp, k, sizes, types);
+        memcpy(scratch.data() + (size_t)(addrs[k] - addrs[i]), bufs[k], cp.size);
+      }
+      if (H5FD__clio_traced(file, clio::vfdtrace::Op::kWrite, (int)gst.type,
+                            addrs[i], span, [&] {
+                              return H5FD__clio_do_write(file, addrs[i], span,
+                                                         scratch.data());
+                            }) < 0) {
+        return FAIL;
       }
     }
-    if (types && !type_fixed) {
-      if (i > 0 && types[i] == H5FD_MEM_NOLIST) {
-        type_fixed = true;
-      } else {
-        type = types[i];
-      }
-    }
-    if (H5FD__clio_traced(file, clio::vfdtrace::Op::kWrite,
-                          (int)type, addrs[i], size,
-                          [&] { return H5FD__clio_do_write(file, addrs[i], size,
-                                                           bufs[i]); }) < 0) {
-      return FAIL;
-    }
+    for (uint32_t k = i; k < j; k++) H5FD__clio_vecst_step(&st, k, sizes, types);
+    i = j;
   }
   return SUCCEED;
 } /* end H5FD__clio_write_vector() */
