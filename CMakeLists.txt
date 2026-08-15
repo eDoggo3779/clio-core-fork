@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.1.0 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.2.0 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -62,6 +62,7 @@ option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(CLIO_CORE_ENABLE_DEB_PACKAGE "Build Debian .deb package via CPack" OFF)
 option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
 option(CLIO_CORE_ENABLE_APPIMAGE "Build portable AppImage via appimagetool" OFF)
+option(CLIO_CORE_ENABLE_WINDOWS_PACKAGE "Build Windows ZIP archive + NSIS installer .exe via CPack" OFF)
 option(CLIO_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(CLIO_CORE_ENABLE_DOCKER_CI "Enable Docker-based integration tests (requires Docker)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
@@ -177,10 +178,24 @@ option(CLIO_CTE_ENABLE_ADIOS2_ADAPTER "Enable ADIOS2 adapter" OFF)
 option(CLIO_CTE_ENABLE_FUSE_ADAPTER "Enable FUSE3 adapter" OFF)
 option(CLIO_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 1.14)" OFF)
 
+# Link libhdf5 into components that READ or WRITE real .h5 files but are not the
+# VOL connector -- today that is CAE (the HDF5 assimilator, and ExportData, which
+# exports a CTE tag as an .h5).
+#
+# This option is what context-assimilation-engine/CMakeLists.txt has always
+# derived CLIO_CAE_ENABLE_HDF5 from, but it was never actually DECLARED anywhere,
+# so it silently evaluated as empty/false and CAE's entire HDF5 path -- including
+# the pre-existing ExportData -- compiled out to "HDF5 support not compiled in".
+# Declaring it makes that code reachable. It stays OFF by default: HDF5 is an
+# optional system dependency and nothing in the default build needs it.
+option(CLIO_CORE_ENABLE_HDF5 "Enable HDF5 support in CAE (assimilator + .h5 export)" OFF)
+
 #------------------------------------------------------------------------------
 # CAE (context-assimilation-engine) Options
 #------------------------------------------------------------------------------
 option(CAE_ENABLE_GLOBUS "Enable Globus transfer support in CAE" OFF)
+option(CAE_ENABLE_S3 "Enable Amazon S3 (s3://) import in CAE" OFF)
+option(CAE_ENABLE_GCS "Enable Google Cloud Storage (gs://) import in CAE" OFF)
 # LLM labeling/summary + semantic-search features and their integration tests
 # require a running Ollama service. OFF by default so default builds don't
 # build or run them without Ollama.
@@ -219,6 +234,15 @@ set(CLIO_CTP_ENABLE_OPENMP ${CLIO_CORE_ENABLE_OPENMP} CACHE BOOL "Enable OpenMP 
 set(CLIO_CTP_ENABLE_CEREAL ${CLIO_CORE_ENABLE_CEREAL} CACHE BOOL "Enable Cereal (controlled by CLIO_CORE_ENABLE_CEREAL)" FORCE)
 set(CLIO_CTP_ENABLE_DOXYGEN ${CLIO_CORE_ENABLE_DOXYGEN} CACHE BOOL "Enable Doxygen (controlled by CLIO_CORE_ENABLE_DOXYGEN)" FORCE)
 set(CLIO_CTP_ENABLE_COMPRESS ${CLIO_CTE_ENABLE_COMPRESS} CACHE BOOL "Enable Compress (controlled by CLIO_CTE_ENABLE_COMPRESS)" FORCE)
+# CTP_ENABLE_COMPRESS changes clio::cte::core::Context's LAYOUT (and with it
+# every Put/Get task). It must therefore be a TREE-WIDE definition: when only
+# the targets linking ctp::compress saw it, the compressor module compiled a
+# 440-byte PutBlobTask against a core/client world using the 344-byte one —
+# tasks silently misparse and puts vanish (the ABI-skew hazard documented in
+# core_tasks.h; previously bit the llama.cpp weight work the same way).
+if(CLIO_CTE_ENABLE_COMPRESS)
+    add_compile_definitions(CTP_ENABLE_COMPRESS=1)
+endif()
 set(CLIO_CTP_ENABLE_ENCRYPT ${CLIO_CORE_ENABLE_ENCRYPT} CACHE BOOL "Enable Encrypt (controlled by CLIO_CORE_ENABLE_ENCRYPT)" FORCE)
 set(CLIO_CTP_ENABLE_ELF ${CLIO_CORE_ENABLE_ELF} CACHE BOOL "Enable ELF (controlled by CLIO_CORE_ENABLE_ELF)" FORCE)
 set(CLIO_CTP_ENABLE_CUDA ${CLIO_CORE_ENABLE_CUDA} CACHE BOOL "Enable CUDA (controlled by CLIO_CORE_ENABLE_CUDA)" FORCE)
@@ -284,7 +308,7 @@ if(CLIO_CORE_ENABLE_DOXYGEN)
     message(STATUS "found doxygen at ${DOXYGEN_EXECUTABLE}")
 endif()
 
-# YAML-CPP - find from system or install.sh installation
+# YAML-CPP - find from system or CI/ci-deps.sh installation
 find_package(yaml-cpp REQUIRED)
 if(yaml-cpp_FOUND)
     message(STATUS "found yaml-cpp at ${yaml-cpp_DIR}")
@@ -319,7 +343,7 @@ if(CLIO_CORE_STATIC_DEPS AND NOT WIN32 AND NOT APPLE)
     endif()
 endif()
 
-# Cereal - find from system or install.sh installation
+# Cereal - find from system or CI/ci-deps.sh installation
 find_package(cereal REQUIRED)
 if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
@@ -549,6 +573,90 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "SYCL libzfp not found under ${CLIO_ZFP_SYCL_ROOT} - zfp-sycl compression disabled")
     endif()
 
+    # cuSZ (https://github.com/szcompressor/cuSZ) - GPU error-bounded lossy
+    # compressor for floating-point data. Optional, requires CUDA. Auto-detected
+    # via its CMake config (target CUSZ::cusz) with a raw find_library fallback.
+    set(CLIO_CTP_ENABLE_CUSZ OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_package(CUSZ QUIET)
+        if(CUSZ_FOUND)
+            set(cusz_LIBRARIES CUSZ::cusz)
+            set(cusz_INCLUDE_DIRS ${CUSZ_INCLUDE_DIRS})
+            set(CLIO_CTP_ENABLE_CUSZ ON)
+            message(STATUS "found cuSZ via CMake config (GPU lossy compression)")
+        else()
+            find_path(cusz_INCLUDE_DIR cusz.h PATH_SUFFIXES cusz)
+            find_library(cusz_LIBRARY NAMES cusz pszcuda cuszapi)
+            if(cusz_INCLUDE_DIR AND cusz_LIBRARY)
+                set(cusz_LIBRARIES ${cusz_LIBRARY})
+                set(cusz_INCLUDE_DIRS ${cusz_INCLUDE_DIR})
+                set(CLIO_CTP_ENABLE_CUSZ ON)
+                message(STATUS "found cusz.h at ${cusz_INCLUDE_DIRS}")
+            else()
+                message(STATUS "cuSZ not found - cuSZ GPU compression disabled")
+            endif()
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - cuSZ GPU compression disabled")
+    endif()
+
+    # ndzip (https://github.com/celerity/ndzip) - GPU high-throughput lossless
+    # compressor for floating-point data. Optional, requires CUDA and an ndzip
+    # built with NDZIP_WITH_CUDA=ON (provides the ndzip-cuda library). Auto-
+    # detected via its CMake config (ndzip::ndzip-cuda) with a find_library
+    # fallback.
+    set(CLIO_CTP_ENABLE_NDZIP OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_package(ndzip QUIET)
+        if(ndzip_FOUND AND TARGET ndzip::ndzip-cuda)
+            set(ndzip_LIBRARIES ndzip::ndzip ndzip::ndzip-cuda)
+            set(ndzip_INCLUDE_DIRS "")
+            set(CLIO_CTP_ENABLE_NDZIP ON)
+            message(STATUS "found ndzip via CMake config (GPU lossless compression)")
+        else()
+            find_path(ndzip_INCLUDE_DIR ndzip/ndzip.hh)
+            find_library(ndzip_LIBRARY NAMES ndzip)
+            find_library(ndzip_cuda_LIBRARY NAMES ndzip-cuda)
+            if(ndzip_INCLUDE_DIR AND ndzip_LIBRARY AND ndzip_cuda_LIBRARY)
+                set(ndzip_LIBRARIES ${ndzip_cuda_LIBRARY} ${ndzip_LIBRARY})
+                set(ndzip_INCLUDE_DIRS ${ndzip_INCLUDE_DIR})
+                set(CLIO_CTP_ENABLE_NDZIP ON)
+                message(STATUS "found ndzip.hh at ${ndzip_INCLUDE_DIRS}")
+            else()
+                message(STATUS "ndzip not found - ndzip GPU compression disabled")
+            endif()
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - ndzip GPU compression disabled")
+    endif()
+
+    # cuSZp (https://github.com/szcompressor/cuSZp) - GPU ultra-fast error-bounded
+    # lossy compressor for floating-point data. Optional, requires CUDA. Auto-
+    # detected via its CMake config (cuSZp::cuSZp) with a find_library fallback.
+    set(CLIO_CTP_ENABLE_CUSZP OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_package(cuSZp QUIET)
+        if(cuSZp_FOUND AND TARGET cuSZp::cuSZp)
+            set(cuszp_LIBRARIES cuSZp::cuSZp)
+            set(cuszp_INCLUDE_DIRS "")
+            set(CLIO_CTP_ENABLE_CUSZP ON)
+            message(STATUS "found cuSZp via CMake config (GPU lossy compression)")
+        else()
+            find_path(cuszp_INCLUDE_DIR cuSZp.h)
+            find_library(cuszp_LIBRARY NAMES cuSZp)
+            if(cuszp_INCLUDE_DIR AND cuszp_LIBRARY)
+                set(cuszp_LIBRARIES ${cuszp_LIBRARY})
+                set(cuszp_INCLUDE_DIRS ${cuszp_INCLUDE_DIR})
+                set(CLIO_CTP_ENABLE_CUSZP ON)
+                message(STATUS "found cuSZp.h at ${cuszp_INCLUDE_DIRS}")
+            else()
+                message(STATUS "cuSZp not found - cuSZp GPU compression disabled")
+            endif()
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - cuSZp GPU compression disabled")
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -600,6 +708,24 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_INCLUDES ${ZFP_SYCL_INCLUDE_DIR})
     endif()
 
+    # Only add cuSZ if found
+    if(CLIO_CTP_ENABLE_CUSZ)
+        list(APPEND COMPRESS_LIBS ${cusz_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${cusz_INCLUDE_DIRS})
+    endif()
+
+    # Only add ndzip if found
+    if(CLIO_CTP_ENABLE_NDZIP)
+        list(APPEND COMPRESS_LIBS ${ndzip_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${ndzip_INCLUDE_DIRS})
+    endif()
+
+    # Only add cuSZp if found
+    if(CLIO_CTP_ENABLE_CUSZP)
+        list(APPEND COMPRESS_LIBS ${cuszp_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${cuszp_INCLUDE_DIRS})
+    endif()
+
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
     # Make CTP_ENABLE_NVCOMP available to subdirectories (CTP)
@@ -607,6 +733,10 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # Make CLIO_CTP_ENABLE_ZFP_SYCL available to subdirectories (CTP). Distinct
     # from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch) -- do not conflate.
     set(CLIO_CTP_ENABLE_ZFP_SYCL ${CLIO_CTP_ENABLE_ZFP_SYCL} CACHE BOOL "Enable zfp-sycl GPU compression (auto-detected)" FORCE)
+    # Make CLIO_CTP_ENABLE_CUSZ / CLIO_CTP_ENABLE_NDZIP available to subdirs (CTP)
+    set(CLIO_CTP_ENABLE_CUSZ ${CLIO_CTP_ENABLE_CUSZ} CACHE BOOL "Enable cuSZ GPU compression (auto-detected)" FORCE)
+    set(CLIO_CTP_ENABLE_NDZIP ${CLIO_CTP_ENABLE_NDZIP} CACHE BOOL "Enable ndzip GPU compression (auto-detected)" FORCE)
+    set(CLIO_CTP_ENABLE_CUSZP ${CLIO_CTP_ENABLE_CUSZP} CACHE BOOL "Enable cuSZp GPU compression (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)
@@ -670,7 +800,7 @@ if(CLIO_CORE_ENABLE_ZMQ)
         endif()
     endif()
     if(NOT _ZMQ_FOUND)
-        message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run install.sh to build from submodules.")
+        message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run CI/ci-deps.sh to build from submodules.")
     endif()
 endif()
 
@@ -684,7 +814,7 @@ if(CLIO_CORE_ENABLE_LIBFABRIC)
 endif()
 
 # HDF5 (optional - for CAE HDF5 assimilator and CTE HDF5 VOL connector)
-if(CLIO_CTE_ENABLE_HDF5_VOL)
+if(CLIO_CTE_ENABLE_HDF5_VOL OR CLIO_CORE_ENABLE_HDF5)
     # Try CONFIG mode first (for HDF5 installed to non-standard cmake/ directory)
     find_package(HDF5 COMPONENTS C QUIET CONFIG)
     if(NOT HDF5_FOUND)
@@ -733,7 +863,7 @@ if(CLIO_CTE_ENABLE_HDF5_VOL)
             list(APPEND HDF5_LIBRARIES CURL::libcurl)
         endif()
     else()
-        message(FATAL_ERROR "HDF5 not found. Please install HDF5 or run install.sh to build from submodules.")
+        message(FATAL_ERROR "HDF5 not found. Please install HDF5 or run CI/ci-deps.sh to build from submodules.")
     endif()
 else()
     message(STATUS "HDF5 support disabled")
@@ -766,6 +896,37 @@ if(CLIO_ENABLE_GOOGLE_CLOUD AND NOT Poco_FOUND)
 endif()
 if(CLIO_ENABLE_GOOGLE_CLOUD)
   message(STATUS "Google Cloud Storage bdev support: ENABLED (Poco found)")
+endif()
+
+# AWS SDK for C++ (optional - for the CAE S3 assimilator, s3://). Reuses the
+# same dependency the bdev S3 transport links (aws-cpp-sdk-s3/-core). If the
+# option is requested but the SDK isn't found, warn and disable rather than
+# fail the configure (mirrors the CAE Globus dependency check).
+if(CAE_ENABLE_S3)
+  find_package(AWSSDK COMPONENTS s3 QUIET)
+  if(AWSSDK_FOUND)
+    message(STATUS "found AWS SDK for C++ (CAE S3 support: ENABLED)")
+  else()
+    message(WARNING "CAE_ENABLE_S3 is ON but the AWS SDK for C++ (component s3) "
+                    "was not found. S3 import will be disabled. "
+                    "Install aws-sdk-cpp to enable it.")
+    set(CAE_ENABLE_S3 OFF)
+  endif()
+endif()
+
+# google-cloud-cpp (optional - for the CAE GCS assimilator, gs://). A new
+# optional dependency (the storage component). If requested but not found,
+# warn and disable rather than fail the configure.
+if(CAE_ENABLE_GCS)
+  find_package(google_cloud_cpp_storage QUIET)
+  if(google_cloud_cpp_storage_FOUND)
+    message(STATUS "found google-cloud-cpp storage (CAE GCS support: ENABLED)")
+  else()
+    message(WARNING "CAE_ENABLE_GCS is ON but google-cloud-cpp (storage "
+                    "component) was not found. GCS import will be disabled. "
+                    "Install google-cloud-cpp to enable it.")
+    set(CAE_ENABLE_GCS OFF)
+  endif()
 endif()
 
 if (CLIO_CTE_ENABLE_ADIOS2_ADAPTER OR CLIO_CORE_ENABLE_GRAY_SCOTT)
@@ -983,6 +1144,12 @@ if(NOT CLIO_CORE_MSVC_LIKE)
         message(STATUS "AddressSanitizer + LeakSanitizer (ASan/LSan) enabled for iowarp-core")
         add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address)
+        # issue #856: annotate Boost.Context stack switches. Without these ASan
+        # keeps shadow state for the stack it believes is current, so the first
+        # fault on a fiber stack aborts with "DEADLYSIGNAL / nested bug in the
+        # same thread" and reports NOTHING — which makes ASan useless across
+        # most of the runtime, where tasks run on fibers.
+        add_compile_definitions(CLIO_ASAN_FIBERS)
     endif()
 
     # UndefinedBehaviorSanitizer configuration
@@ -1014,6 +1181,10 @@ if(NOT CLIO_CORE_MSVC_LIKE)
                             $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-fprofile-arcs>
                             $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-ftest-coverage>)
         add_link_options(--coverage)
+        # Lets tests that must exit via _exit() (skipping a crash-prone global
+        # teardown) still flush gcov counters explicitly via __gcov_dump(); the
+        # symbol only exists in coverage builds, so it is gated on this define.
+        add_compile_definitions(CLIO_COVERAGE_ENABLED)
     endif()
 else()
     # MSVC compiler flags
@@ -1023,6 +1194,10 @@ else()
     # file ("nvcc fatal : A single input file is required ...").
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/FS>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/FS>)
+    # Template/coroutine-heavy TUs (core_runtime.cc) exceed the COFF 65k
+    # section limit at default settings (C1128); raise it everywhere.
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/bigobj>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     # CUDA 13.x CCCL headers (cuda/std/*) require MSVC's conformant
     # preprocessor and #error out on the traditional one. Enable it for the
     # CUDA host compile only, so the existing CXX build is unaffected.
@@ -1081,6 +1256,17 @@ if(CLIO_CORE_ENABLE_TESTS)
     enable_testing()
     include(CTest)
 
+    # CTest coverage exclusions (honoured by ctest_coverage(), which drives the
+    # CDash coverage submission — unlike lcov it has no per-line exclusion, so
+    # untestable whole files are dropped here by filename regex). Keep this in
+    # sync with the lcov --remove list in CI/calculate_coverage.sh and the
+    # codecov.yml ignore list.
+    #   * fuse_cte_main.cc — FUSE process entry / mount glue (fuse_main + the
+    #     apptainer --fusemount fd-injection path); not unit-testable.
+    file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
+         "set(CTEST_CUSTOM_COVERAGE_EXCLUDE \${CTEST_CUSTOM_COVERAGE_EXCLUDE}\n"
+         "    \".*/fuse_cte_main\\\\.cc\")\n")
+
     # -----------------------------------------------------------------------
     # Test cleanup fixture (pre + post)
     # Kills any orphaned CLIO Runtime server processes and removes leftover shared
@@ -1090,12 +1276,55 @@ if(CLIO_CORE_ENABLE_TESTS)
     # after every test that requires the fixture, even if those tests fail
     # or crash, ensuring temp files do not persist between runs.
     # -----------------------------------------------------------------------
+    # Freeing the runtime ports is the load-bearing half of this fixture, and it
+    # was a silent no-op wherever `fuser` is absent -- which includes the
+    # project's own dev container. `2>/dev/null` swallowed "command not found"
+    # and the trailing `exit 0` made the fixture report success regardless, so
+    # the next test to start an embedded runtime hit
+    #   Failed to start main server on 127.0.0.1:9413 - Address already in use
+    # and died in ~0.02 s. Reproduced at 4 failures in 5 consecutive runs of
+    # `ctest -R "vfd|cte_hdf5_vol_io_"`, while the same tests pass 12/12 in
+    # isolation -- i.e. it presents as a flaky test and is actually a
+    # deterministic missing dependency.
+    #
+    # Try fuser, then ss, then lsof, and say so when none of them exists rather
+    # than pretending the port is clear.
+    #
+    # The per-user IPC dir below is expanded by the SHELL, not by CMake. It was
+    # `${USER}` -- a bare CMake variable, which CMake does not define -- so the
+    # generated command was literally `rm -rf /tmp/clio_`, and the directory it
+    # was meant to clear was never touched on any platform. The spelling here
+    # mirrors SystemInfo::GetMemfdDir exactly, fallback included: CLIO_MEMFD_DIR
+    # override, else /tmp/clio_$USER, else the literal "unknown" that the
+    # runtime itself uses when USER is unset. Guessing a different fallback (the
+    # real uid, say) would clean a directory the runtime never writes to.
+    set(_clio_port_kill
+        # 10620 is the HDF5 VOL I/O suite. Any test moved off the default port
+        # has to be listed here too, or it silently loses the stray-listener
+        # sweep that moving off the default was meant to make unnecessary.
+        # Still missing: 10500/10613/10615/10617 and the 10596-10599 range,
+        # whose suites moved off 9413 without being added here.
+        "_clio_ports='5555 5558 9413 9414 9416 10620'; \
+         if command -v fuser >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do fuser -k \$_p/tcp >/dev/null 2>&1; done; \
+         elif command -v ss >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do \
+             ss -tlnpH \"sport = :\$_p\" 2>/dev/null \
+               | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u \
+               | while read -r _pid; do [ -n \"\$_pid\" ] && kill -9 \"\$_pid\" 2>/dev/null; done; \
+           done; \
+         elif command -v lsof >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do lsof -ti tcp:\$_p 2>/dev/null | xargs -r kill -9 2>/dev/null; done; \
+         else \
+           echo 'clio cleanup: no fuser/ss/lsof; cannot free runtime ports -- back-to-back embedded-runtime tests may fail to bind' >&2; \
+         fi")
+
     set(_clio_cleanup_cmd
-        "fuser -k 5555/tcp 5558/tcp 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
+        "${_clio_port_kill}; \
          rm -f /tmp/clio_*.ipc 2>/dev/null; \
          rm -f /tmp/clio_server_timing.log 2>/dev/null; \
          rm -rf /tmp/clio_memfd 2>/dev/null; \
-         rm -rf /tmp/clio_${USER} 2>/dev/null; \
+         rm -rf \"\${CLIO_MEMFD_DIR:-/tmp/clio_\${USER:-unknown}}\" 2>/dev/null; \
          rm -f /dev/shm/sm_segment.* 2>/dev/null; \
          rm -f /dev/shm/test_buddy_bench_* 2>/dev/null; \
          rm -f \"${CMAKE_BINARY_DIR}\"/cte_*.dat* \"${CMAKE_BINARY_DIR}\"/cte_*.yaml \"${CMAKE_BINARY_DIR}\"/*stress*.bin* \"${CMAKE_BINARY_DIR}\"/*reorganize*.bin* \"${CMAKE_BINARY_DIR}\"/*reorganize*.yaml \"${CMAKE_BINARY_DIR}\"/temp_unregister_test.dat 2>/dev/null; \
@@ -1209,7 +1438,7 @@ endif()
 
 # yaml-cpp is already found by ClioCoreCommon (line 202)
 if(NOT TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
-  message(FATAL_ERROR "yaml-cpp was not found. Please run install.sh to install dependencies.")
+  message(FATAL_ERROR "yaml-cpp was not found. Please run CI/ci-deps.sh to install dependencies.")
 endif()
 message(STATUS "yaml-cpp already found by ClioCoreCommon")
 
@@ -1358,22 +1587,56 @@ if(CLIO_CORE_ENABLE_TESTS)
     endforeach()
 
     # -----------------------------------------------------------------------
-    # Apply the cleanup fixture to every component test so that the
-    # cr_post_test_cleanup hook runs after the whole suite, even when
-    # individual tests fail. Excludes the cleanup fixtures themselves.
+    # Per-test DEFAULTS: what every test gets unless it opts out.
+    #
+    # Two things. The cleanup fixture, so cr_post_test_cleanup runs after the
+    # suite even when individual tests fail. And isolation from process-global
+    # CLIO state, because the default was the other way round and that is the
+    # expensive half of this tree's debugging cost.
+    #
+    # The specific case: RuntimeManager replays ~/.clio/restart_log.bin on EVERY
+    # startup (manager.cc), re-composing whatever is registered there through the
+    # admin client. That file is HOME-scoped and shared by every test, every
+    # local `clio_run compose start`, and every previous session. 61 test files
+    # stand up a runtime; 7 isolated the WAL by hand. The other 54 inherited
+    # whatever the machine happened to be carrying -- and a foreign entry
+    # composes pool 512.0 with create-params that are not theirs.
+    #
+    # Isolating it per test here rather than per test file means a NEW test is
+    # isolated by default and sharing is what you opt into, which is the way
+    # round it should have been. Tests that genuinely want shared state can
+    # still set the variable themselves.
+    #
+    # PREPENDED, not appended: ctest applies ENVIRONMENT entries in order and the
+    # last assignment wins, so a test that sets the same variable keeps its own
+    # value. (Tests that setenv() in C++ override the process env regardless.)
+    #
+    # Not stamped here, deliberately:
+    #   CLIO_PORT -- would override the port in a test's own CLIO_SERVER_CONF
+    #     yaml (env beats yaml in ConfigManager), pointing the client at a
+    #     different port than the runtime it just started. Isolation that breaks
+    #     working tests is not isolation.
+    #   CLIO_REQUIRE_RUNTIME -- plenty of tests legitimately run with no runtime
+    #     (the *_no_runtime binaries exist to prove the connectors survive that).
+    #     It belongs on suites that mean to measure a live tier, not on all.
     # -----------------------------------------------------------------------
-    function(_clio_require_cleanup_fixture_recursive dir)
+    function(_clio_apply_test_defaults_recursive dir)
         get_directory_property(_tests DIRECTORY "${dir}" TESTS)
         foreach(_t ${_tests})
             if(NOT _t STREQUAL "cr_pre_test_cleanup" AND
                NOT _t STREQUAL "cr_post_test_cleanup")
                 set_property(TEST ${_t} DIRECTORY "${dir}" APPEND PROPERTY
                     FIXTURES_REQUIRED clio_test_cleanup_fixture)
+                get_property(_env TEST ${_t} DIRECTORY "${dir}"
+                             PROPERTY ENVIRONMENT)
+                set_property(TEST ${_t} DIRECTORY "${dir}" PROPERTY ENVIRONMENT
+                    "CLIO_RESTART_LOG=${CMAKE_BINARY_DIR}/test_isolation/${_t}.restart.bin"
+                    ${_env})
             endif()
         endforeach()
         get_directory_property(_subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
         foreach(_sub ${_subdirs})
-            _clio_require_cleanup_fixture_recursive("${_sub}")
+            _clio_apply_test_defaults_recursive("${_sub}")
         endforeach()
     endfunction()
 
@@ -1387,7 +1650,7 @@ if(CLIO_CORE_ENABLE_TESTS)
         list(GET _pair 0 _component_dir)
         list(GET _pair 1 _component_flag)
         if(${_component_flag} AND IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
-            _clio_require_cleanup_fixture_recursive(
+            _clio_apply_test_defaults_recursive(
                 "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
         endif()
     endforeach()
@@ -1612,6 +1875,21 @@ endif()
 if(CLIO_CORE_ENABLE_CTE AND TARGET clio_cte_core_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_core_client clio_cte_core_runtime)
 endif()
+# Cache + replication chimods (#886) build ON by default and ship in the
+# deb/rpm/AppImage via the module macros' default-component installs — but
+# the wheel filters to COMPONENT pip_package, so without these entries
+# `pip install iowarp-core` silently lacks both modules (#899).
+if(TARGET clio_cte_cache_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_cache_client clio_cte_cache_runtime)
+endif()
+if(TARGET clio_cte_replication_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_replication_client clio_cte_replication_runtime)
+endif()
+# Filesystem chimod: NEEDED by the clio_cte_fuse adapter binary that ships
+# in the wheel when CLIO_CTE_ENABLE_FUSE_ADAPTER is ON (#899).
+if(TARGET clio_cte_filesystem_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_filesystem_client clio_cte_filesystem_runtime)
+endif()
 if(CLIO_CORE_ENABLE_CAE AND TARGET clio_cae_core_client)
   list(APPEND PIP_LIB_TARGETS clio_cae_core_client clio_cae_core_runtime)
 endif()
@@ -1750,6 +2028,11 @@ if(WIN32 AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
     if(_vcpkg_dlls)
       install(FILES ${_vcpkg_dlls}
         COMPONENT pip_package
+        DESTINATION bin)
+      # Mirror into the default component so the native Windows package
+      # (CPack ZIP/NSIS filters to Unspecified, like DEB/RPM) also ships
+      # the third-party DLLs its exes need (#899).
+      install(FILES ${_vcpkg_dlls}
         DESTINATION bin)
     endif()
   endif()

@@ -349,6 +349,43 @@ TEST_CASE("Autogen - Admin AggregateOut", "[autogen][admin][aggregate]") {
     replica_task.reset();
   }
 
+  // issue #856: AggregateOut merges a REPLICA's OUT fields into the origin. It
+  // must NOT whole-task-copy: Task::Copy overwrites the ORIGIN's identity
+  // (task_id_, pool_query_, completer_) with the replica's while send_map_ and
+  // the completion path still reference it, and re-assigns IN priv::strings
+  // across shared-memory segments. These assert the contract directly.
+  SECTION("AggregateOut preserves origin identity (RecoverContainers)") {
+    std::vector<clio::run::RecoveryAssignment> plan;
+    std::string data;
+    auto origin_task =
+        ipc_manager->NewTask<clio::run::admin::RecoverContainersTask>(
+            clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+            clio::run::PoolQuery::Broadcast(0), data, /*dead_node_id=*/7);
+    auto replica_task =
+        ipc_manager->NewTask<clio::run::admin::RecoverContainersTask>(
+            clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+            clio::run::PoolQuery::Local(), data, /*dead_node_id=*/9);
+    if (origin_task.IsNull() || replica_task.IsNull()) {
+      INFO("Failed to create tasks - skipping test");
+      if (!origin_task.IsNull()) origin_task.reset();
+      if (!replica_task.IsNull()) replica_task.reset();
+      return;
+    }
+    const clio::run::TaskId origin_id = origin_task->task_id_;
+    origin_task->num_recovered_ = 2;
+    replica_task->num_recovered_ = 3;
+
+    origin_task->AggregateOut(replica_task.template Cast<clio::run::Task>());
+
+    // Identity survives (the whole-task copy destroyed exactly this).
+    REQUIRE(origin_task->task_id_ == origin_id);
+    // Recovery is partitioned per node, so counts SUM rather than being
+    // clobbered by whichever replica answered last.
+    REQUIRE(origin_task->num_recovered_ == 5);
+    origin_task.reset();
+    replica_task.reset();
+  }
+
   SECTION("AggregateOut for MonitorTask") {
     auto origin_task = ipc_manager->NewTask<clio::run::admin::MonitorTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(), std::string("status"));
@@ -1629,6 +1666,65 @@ TEST_CASE("Autogen - CTE Task AggregateOut operations", "[autogen][cte][aggregat
       REQUIRE(origin_task->tag_size_ == 300);
       origin_task.reset();
       replica_task.reset();
+    }
+  }
+
+  // GetTagSize is a Broadcast SUM whose replicas are per-container: a container
+  // holding none of the tag's blobs returns rc=1 (no local TagInfo), which is a
+  // zero contribution, NOT an error. The aggregate must be "found if ANY" — rc=0
+  // (and the summed size preserved) if any replica found the tag, and rc=1 only
+  // if every container missed. Regression guard for the cross-node 0-byte read
+  // in #714, where a not-found replica's rc=1 poisoned the aggregate and the
+  // filesystem adapter then discarded the correctly-summed size.
+  SECTION("AggregateOut for GetTagSizeTask is found-if-any") {
+    // Both constructors seed the accumulator "not found" (rc=1) so the aggregate
+    // reports rc=1 only when every replica missed. Cover the emplace ctor too
+    // (NewTask below exercises the default ctor).
+    clio::cte::core::GetTagSizeTask emplaced(
+        clio::run::TaskId(1, 2, 3), clio::run::PoolId(560, 0),
+        clio::run::PoolQuery::Local(), clio::cte::core::TagId::GetNull());
+    REQUIRE(emplaced.GetReturnCode() != 0);
+
+    // A freshly constructed GetTagSizeTask is seeded "not found" (rc=1) so the
+    // aggregate reports rc=1 only when every replica missed.
+    auto origin = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
+    auto missing = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
+    auto found = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
+    if (!origin.IsNull() && !missing.IsNull() && !found.IsNull()) {
+      REQUIRE(origin->GetReturnCode() != 0);  // seeded not-found
+
+      // A replica that holds none of the tag's blobs: rc=1, size 0.
+      missing->SetReturnCode(1);
+      missing->tag_size_ = 0;
+      // A replica that holds the tag's bytes: rc=0, real share.
+      found->SetReturnCode(0);
+      found->tag_size_ = 28;
+
+      // Aggregating the not-found replica first must NOT flip the aggregate to
+      // "found", and must not poison a later found result.
+      origin->AggregateOut(missing.template Cast<clio::run::Task>());
+      REQUIRE(origin->GetReturnCode() != 0);  // still not found
+      REQUIRE(origin->tag_size_ == 0);
+
+      // Aggregating the found replica makes the whole query succeed with the
+      // real size, regardless of the earlier not-found replica.
+      origin->AggregateOut(found.template Cast<clio::run::Task>());
+      REQUIRE(origin->GetReturnCode() == 0);  // found-if-any
+      REQUIRE(origin->tag_size_ == 28);
+
+      // A subsequent not-found replica must not re-poison the found aggregate.
+      auto missing2 = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
+      if (!missing2.IsNull()) {
+        missing2->SetReturnCode(1);
+        missing2->tag_size_ = 0;
+        origin->AggregateOut(missing2.template Cast<clio::run::Task>());
+        REQUIRE(origin->GetReturnCode() == 0);
+        REQUIRE(origin->tag_size_ == 28);
+        missing2.reset();
+      }
+      origin.reset();
+      missing.reset();
+      found.reset();
     }
   }
 
@@ -12243,6 +12339,12 @@ TEST_CASE("Autogen - CTE Context struct GlobalSerialize", "[autogen][cte][contex
     ctx.persistence_target_ = 1;
     ctx.min_persistence_level_ = 2;
     ctx.preallocate_ = 4096;
+    // issue #818: the transform bit is serialized UNCONDITIONALLY, outside the
+    // compression guard below -- a safety flag that vanishes with a compile
+    // flag is worse than no flag, and a conditionally-present member changes
+    // Context's wire layout between TUs built with different flags.
+    ctx.transform_flags_ = clio::cte::core::kBlobTransformed |
+                           clio::cte::core::kBlobTransformCompressed;
 #ifdef CLIO_CTE_ENABLE_COMPRESSION
     ctx.dynamic_compress_ = 2;
     ctx.compress_lib_ = 3;
@@ -12271,6 +12373,9 @@ TEST_CASE("Autogen - CTE Context struct GlobalSerialize", "[autogen][cte][contex
     REQUIRE(loaded.persistence_target_ == 1);
     REQUIRE(loaded.min_persistence_level_ == 2);
     REQUIRE(loaded.preallocate_ == 4096);
+    REQUIRE(loaded.transform_flags_ ==
+            (clio::cte::core::kBlobTransformed |
+             clio::cte::core::kBlobTransformCompressed));
 #ifdef CLIO_CTE_ENABLE_COMPRESSION
     REQUIRE(loaded.dynamic_compress_ == 2);
     REQUIRE(loaded.compress_lib_ == 3);
@@ -13815,10 +13920,10 @@ TEST_CASE("Autogen - DefaultScheduler AdjustPolling", "[autogen][scheduler][adju
     INFO("AdjustPolling(nullptr) did not crash");
   }
 
-  SECTION("RebalanceWorker noop") {
+  SECTION("LoadBalance noop") {  // issue #781: replaced RebalanceWorker
     clio::run::DefaultScheduler sched;
-    sched.RebalanceWorker(nullptr);  // Should not crash
-    INFO("RebalanceWorker(nullptr) did not crash");
+    sched.LoadBalance();  // Should not crash (stub today)
+    INFO("LoadBalance() did not crash");
   }
 
   SECTION("RuntimeMapTask with null worker") {

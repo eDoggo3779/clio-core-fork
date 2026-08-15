@@ -5,15 +5,18 @@
 # CTE adapter singleton implementation - moved to filesystem directory
 # to leverage existing working build configuration
 
+# The HDF5 VFD is a plugin the library dlopen's, not an interceptor: it
+# never touches real_api.h, so it does not need ELF support. Gate it on
+# UNIX -- H5FDclio.cc uses <sys/file.h>, <unistd.h> and flock, so Windows
+# needs porting work rather than a gate change.
+if(UNIX AND CLIO_CTE_ENABLE_VFD)
+    add_subdirectory(vfd)
+endif()
+
 # Adapters require ELF support (for real_api.h)
 # Disable all adapters when ELF is disabled
 if(CLIO_CORE_ENABLE_ELF)
     message(STATUS "CTE Adapters: ENABLED (ELF support available)")
-
-    # Shared cfs-backed I/O core the interceptors delegate to (replaces the
-    # old clio_cte_fs_base filesystem layer; backed by the context-filesystem
-    # chimod via clio::cte::filesystem::Client).
-    add_subdirectory(cfs)
 
     # Optional adapters - controlled by root CMakeLists.txt options
     if (CLIO_CTE_ENABLE_POSIX_ADAPTER)
@@ -24,9 +27,6 @@ if(CLIO_CORE_ENABLE_ELF)
     endif()
     if (CLIO_CTE_ENABLE_MPIIO_ADAPTER)
         add_subdirectory(mpiio)
-    endif()
-    if (CLIO_CTE_ENABLE_VFD)
-        add_subdirectory(vfd)
     endif()
     if (CLIO_CTE_ENABLE_NVIDIA_GDS_ADAPTER)
         add_subdirectory(nvidia_gds)
@@ -54,6 +54,11 @@ endif()
 # GPU Vector adapter (CUDA/ROCm only; producer-only kernel API)
 if (CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
     add_subdirectory(gpu_vector)
+endif()
+
+# kvhdf5 adapter (CUDA only; HDF5-like producer surface over the CTE KV store)
+if (CLIO_CORE_ENABLE_CUDA)
+    add_subdirectory(kvhdf5)
 endif()
 
 #-----------------------------------------------------------------------------

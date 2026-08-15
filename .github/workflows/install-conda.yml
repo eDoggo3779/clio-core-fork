@@ -31,9 +31,18 @@ jobs:
       - name: Setup Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
-          auto-update-conda: true
+          # Pin a py312-base Miniconda and do NOT auto-update conda: the
+          # runner's bundled conda moved its base to Python 3.14
+          # (2026-07-30), which crashes conda-build
+          # (execute_download_actions IndexError). See CI/ci-deps.sh.
+          auto-update-conda: false
+          miniconda-version: 'py312_26.5.3-2'
           python-version: '3.12'
-          channels: conda-forge,defaults
+          # conda-forge only. The Anaconda `defaults` channels (pkgs/main,
+          # pkgs/r behind repo.anaconda.com) now 403 for CI use without a
+          # license and were an intermittent dependency-install flake. See
+          # CI/ci-deps.sh for the same change and the full explanation.
+          channels: conda-forge
           channel-priority: strict
 
       - name: Install conda-build
@@ -97,6 +106,25 @@ jobs:
             -c conda-forge \
             --no-anaconda-upload \
             --output-folder build/conda-output
+
+      # Guard for #973. Nothing in `conda build` verifies that the binaries
+      # it produced can actually run on the glibc floor the recipe declares
+      # (c_stdlib_version), and the failure mode is silent: 2.2.0 shipped
+      # linking GLIBC_2.38 -- the runner host glibc -- so it installed fine
+      # on Rocky 8 and then died at import. Check the built package before
+      # it can be uploaded.
+      - name: Verify package glibc floor
+        shell: bash -l {0}
+        run: |
+          set -e
+          shopt -s nullglob
+          PKGS=(build/conda-output/linux-64/*.conda build/conda-output/linux-64/*.tar.bz2)
+          if [ ${#PKGS[@]} -eq 0 ]; then
+            echo "::error::conda build produced no linux-64 package to verify"
+            exit 1
+          fi
+          # Must match c_stdlib_version in installers/conda/conda_build_config.yaml
+          python3 installers/pip/check_wheel_glibc.py --max-glibc 2.28 "${PKGS[@]}"
 
       - name: Upload to Anaconda.org
         if: startsWith(github.ref, 'refs/tags/v')

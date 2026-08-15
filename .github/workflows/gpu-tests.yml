@@ -1,16 +1,21 @@
 name: GPU Tests (CUDA)
 
 on:
+  # Push to main/dev runs UNCONDITIONALLY -- no path filter. A merge is the
+  # gate that decides what lands, so it must exercise everything; a path
+  # filter here meant a merge touching only, say, CI or docs skipped the CUDA
+  # compile entirely, and the next unrelated merge inherited the breakage.
+  # PRs keep the path filter (below): breadth on every PR commit costs queue
+  # time for little signal, and the merge sweep still gates the branch.
   push:
     branches: [main, dev]
-    paths:
-      - 'context-runtime/**'
-      - 'context-transfer-engine/**'
-      - 'context-transport-primitives/**'
-      - 'CMakeLists.txt'
-      - 'CMakePresets.json'
-      - 'installers/conda/**'
-      - '.github/workflows/gpu-tests.yml'
+  # Also run on PRs touching the same paths. Previously this workflow fired
+  # ONLY on push to main/dev, so a change that broke the CUDA device compile
+  # was invisible in PR review and only surfaced after merge, on dev — which
+  # is exactly how the shm_metadata_cache.h device-pass break (#812, from
+  # #788) landed. Running the same compile-only build on PRs catches these
+  # before merge. Same path filter, so PRs that don't touch buildable source
+  # still skip it.
   pull_request:
     branches: [main, dev]
     paths:
@@ -22,6 +27,18 @@ on:
       - 'installers/conda/**'
       - '.github/workflows/gpu-tests.yml'
   workflow_dispatch:
+
+# One in-flight run per ref; a new push to a PR branch cancels the previous
+# GPU build rather than piling them up (the CUDA toolchain install + conda
+# build is ~15 min).
+concurrency:
+  group: gpu-tests-${{ github.ref }}
+  # Cancel superseded runs on PR branches only. On a SHARED branch (main/dev)
+  # github.ref is identical for every merge, so `true` here made each merge
+  # cancel the PREVIOUS merge's validation mid-flight -- which is exactly the
+  # "lots of skipped tests after merging" symptom, and it silently drops the
+  # coverage that decides what is on dev. A merge's run must always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-cuda-conda:
@@ -55,19 +72,29 @@ jobs:
       uses: conda-incubator/setup-miniconda@v3
       with:
         auto-update-conda: false
+        # Pin a py312-base Miniconda: the runner's bundled conda moved its
+        # base to Python 3.14 (2026-07-30), which crashes conda-build
+        # (execute_download_actions IndexError). See CI/ci-deps.sh.
+        miniconda-version: 'py312_26.5.3-2'
         python-version: '3.12'
         activate-environment: iowarp
 
+    # conda-build is a plugin registered against the BASE env's conda CLI and
+    # must be installed there (see installers/conda + CI/ci-deps.sh). Without
+    # `-n base` this installs conda-build into the active `iowarp` env, leaving
+    # an `iowarp/bin/conda` ahead of base on PATH that can't import the `conda`
+    # module — so conda-build's build-env activation crashes the recipe with
+    # "ModuleNotFoundError: No module named 'conda'".
     - name: Install conda-build
       shell: bash -el {0}
-      run: conda install -y conda-build -c conda-forge
+      run: conda install -n base -y conda-build -c conda-forge
 
-    # ── Build CUDA conda package via install.sh ──────────────────────
+    # ── Build CUDA conda package via CI/ci-deps.sh ──────────────────────
     - name: Build CUDA conda package
       shell: bash -el {0}
       run: |
-        chmod +x install.sh
-        ./install.sh cuda-release
+        chmod +x CI/ci-deps.sh
+        ./CI/ci-deps.sh cuda-release
 
     # ── Verify installation ──────────────────────────────────────────
     - name: Verify CUDA package installed

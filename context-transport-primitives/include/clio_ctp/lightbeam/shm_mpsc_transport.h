@@ -32,13 +32,39 @@
 namespace ctp::lbm {
 
 // --- Tunables ---------------------------------------------------------------
-// Default transfer space when the caller does not specify one (128KB total,
-// minus the header, is available as ring capacity).
-static constexpr size_t kShmMpscDefaultSegmentSize = 128 * 1024;
+// Default transfer space when the caller does not specify one (minus the
+// header, this is the ring capacity).
+//
+// Sizing note (issue #768 deadlock): the ring holds
+// (segment / kShmMpscChunkSize) fixed slots, which bounds the number of
+// in-flight messages per direction. SendBytes()/WaitSlotFree() BLOCK when the
+// ring is full (they only bail if the peer process dies). A client that issues
+// N async ops before waiting (e.g. cr_cli_cfs fires 16 AsyncAppend, cr_cli_cfs
+// rename fires 12 renames + 12 readdirs) needs the ring to hold ~N messages in
+// EACH direction: with too few slots the client blocks in SendIn (request ring
+// full) while the worker blocks in SendOut (response ring full) and neither
+// drains the other -> a bidirectional deadlock (reproduced under boost
+// coroutines in the deps-cpu container). 128KB gave only 4 slots. 1MB gives 32
+// slots, comfortably above the runtime's realistic per-thread async fan-out
+// (>=16-24 outstanding), which restores forward progress. (A fully
+// deadlock-proof design would make SendOut non-blocking/deferred; tracked
+// separately.)
+static constexpr size_t kShmMpscDefaultSegmentSize = 1024 * 1024;
 // Per-chunk cap: SendBytes/RecvBytes move at most this many bytes per xfer slot.
 static constexpr size_t kShmMpscChunkSize = 32 * 1024;
 // Number of in-flight transfer slots the ring tracks (bounds concurrency).
-static constexpr size_t kShmMpscMaxXfers = 256;
+//
+// This is the fixed descriptor-array size in ShmTransportHeader and the upper
+// bound on max_inflight_ (= min(kShmMpscMaxXfers, num_slots_)). It MUST be >=
+// the ring's slot count for the segment to be fully usable: the runtime's
+// inbound ring is now a single 128MB segment (128MB / 32KB = 4096 slots), so a
+// smaller cap here would pin in-flight capacity far below the ring size (256
+// slots = only 8MB) and waste the rest. 4096 covers the 128MB inbound ring;
+// smaller rings (e.g. the 1MB client response ring, 32 slots) just leave the
+// tail of the descriptor array unused. The array costs ~40 bytes/slot, so the
+// header is ~160KB — carved out of the segment ahead of the ring (see
+// ServerInit), negligible against a 128MB segment and acceptable against 1MB.
+static constexpr size_t kShmMpscMaxXfers = 4096;
 
 // --- Per-chunk transfer descriptor (lives in the SHM header) ----------------
 // One producer fills this in, sets ready_, and the consumer drains it. conn_id_
@@ -46,14 +72,16 @@ static constexpr size_t kShmMpscMaxXfers = 256;
 // connection skipping on the consumer side).
 struct ShmXferHeader {
   ctp::u64 conn_id_;     // Producing connection's id
-  ctp::u32 xfer_off_;    // Byte offset of this chunk within the ring (monotonic)
+  ctp::u64 producer_pid_;  // OS pid of the producing process (liveness check)
+  ctp::u32 xfer_off_;    // Absolute ring byte offset of this chunk's slot
   ctp::u32 xfer_size_;   // Number of bytes in this chunk
   ctp::u32 rem_off_;     // Offset of this chunk within the producer's message
   ctp::u32 rem_size_;    // Total size of the producer's message
   ctp::ipc::atomic<bool> ready_;  // Producer sets after memcpy; consumer clears
 
   CTP_CROSS_FUN ShmXferHeader()
-      : conn_id_(0), xfer_off_(0), xfer_size_(0), rem_off_(0), rem_size_(0) {
+      : conn_id_(0), producer_pid_(0), xfer_off_(0), xfer_size_(0), rem_off_(0),
+        rem_size_(0) {
     ready_.store(false);
   }
 };
@@ -62,25 +90,73 @@ struct ShmXferHeader {
 // Created once by the server; clients attach and read/CAS it. The ring buffer
 // is the segment bytes immediately following this header.
 struct ShmTransportHeader {
-  ctp::ipc::atomic<ctp::u64> head_;          // Bytes the consumer has drained
-  ctp::ipc::atomic<ctp::u64> tail_;          // Bytes producers have reserved
+  // MUST STAY FIRST. This header is a cross-process ABI: producer and consumer
+  // are separate binaries that both compute the ring base as
+  // `data_ + sizeof(ShmTransportHeader)`. If they were built from different
+  // versions of this file, every other field — and the ring itself — lands at a
+  // different offset, and the mismatch shows up as the consumer spinning
+  // forever on a message it can never reassemble rather than as any kind of
+  // error. Keeping the tag at offset 0 means a client can always read it
+  // correctly no matter how badly the rest of the layout disagrees, so
+  // ClientInit can reject the segment outright. (Cost me a 300s "hang" that was
+  // really just a stale test binary.)
+  ctp::u64 abi_tag_;
+
   ctp::ipc::atomic<ctp::u64> connection_id_; // Next client connection id
   ctp::ipc::atomic<ctp::u64> xfer_id_head_;  // Next xfer slot to consume
   ctp::ipc::atomic<ctp::u64> xfer_id_tail_;  // Next xfer slot to reserve
   int pid_;                                  // Server pid (liveness probe)
-  int tid_;                                  // Server tid
+  int tid_;                                  // Server tid (ServerInit caller)
   size_t max_capacity_;                      // Ring capacity (segment - header)
+
+  // --- Park/signal rendezvous (avoids polling an unpollable ring) -----------
+  // The ring has no fd, so a drainer would otherwise have to sleep-poll. These
+  // two fields let it block on its EventManager instead and be woken by a
+  // producer, futex-style:
+  //   consumer_tid_    the OS tid of the thread draining this ring, published
+  //                    by RegisterConsumer(). 0 = nobody is draining (producers
+  //                    then skip the wake entirely).
+  //   consumer_parked_ 1 while that thread is blocked in EventManager::Wait.
+  //                    Producers signal ONLY when this is set, so a drainer
+  //                    that is awake and working through a burst costs the
+  //                    producers no syscalls at all — the wake is paid for once
+  //                    per idle->busy transition, not once per message.
+  // Both are in the SHM header because the ring is already the cross-process
+  // rendezvous; no side-channel RPC is needed to learn who to wake.
+  ctp::ipc::atomic<int> consumer_tid_;
+  ctp::ipc::atomic<ctp::u32> consumer_parked_;
+
   ShmXferHeader xfers_[kShmMpscMaxXfers];    // In-flight chunk descriptors
 
-  CTP_CROSS_FUN ShmTransportHeader() : pid_(0), tid_(0), max_capacity_(0) {
-    head_.store(0);
-    tail_.store(0);
+  // The ring is divided into fixed kShmMpscChunkSize slots; slot id `xfer_id`
+  // owns ring position (xfer_id % num_slots) * kShmMpscChunkSize. Because the
+  // single xfer_id_tail_ counter assigns both the descriptor slot AND the ring
+  // position, slot-id order and ring-offset order can never diverge — which is
+  // what lets the consumer free a slot simply by advancing xfer_id_head_.
+  CTP_CROSS_FUN ShmTransportHeader()
+      : abi_tag_(0), pid_(0), tid_(0), max_capacity_(0) {
     connection_id_.store(0);
     xfer_id_head_.store(0);
     xfer_id_tail_.store(0);
+    consumer_tid_.store(0);
+    consumer_parked_.store(0);
     // xfers_[] are default-constructed (ready_ = false).
   }
 };
+
+/**
+ * Layout fingerprint stamped into ShmTransportHeader::abi_tag_ at ServerInit
+ * and verified by ClientInit. Folds in every constant that moves the ring base
+ * or reinterprets a slot, so a producer and consumer built from different
+ * revisions of this file refuse to talk instead of silently corrupting.
+ */
+CTP_CROSS_FUN inline ctp::u64 ShmMpscAbiTag() {
+  constexpr ctp::u64 kMagic = 0x53484D5053433031ull;  // "SHMPSC01"
+  return kMagic ^ (static_cast<ctp::u64>(sizeof(ShmTransportHeader)) * 1000003ull) ^
+         (static_cast<ctp::u64>(sizeof(ShmXferHeader)) * 31ull) ^
+         (static_cast<ctp::u64>(kShmMpscChunkSize) << 7) ^
+         static_cast<ctp::u64>(kShmMpscMaxXfers);
+}
 
 }  // namespace ctp::lbm
 
@@ -91,6 +167,7 @@ struct ShmTransportHeader {
 
 #include <cerrno>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -101,6 +178,9 @@ struct ShmTransportHeader {
 // lightbeam.h gives the LbmMeta/Bulk/ClientInfo/BULK_* surface used by the
 // high-level Send/Recv below; local_serialize.h serializes the metadata.
 #include "clio_ctp/data_structures/serialization/local_serialize.h"
+// EventManager supplies the cross-process wake (Signal -> signalfd) that lets a
+// drainer block on this fd-less ring instead of sleep-polling it.
+#include "clio_ctp/lightbeam/event_manager.h"
 #include "clio_ctp/lightbeam/lightbeam.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
 #include "clio_ctp/thread/thread_model_manager.h"
@@ -126,10 +206,22 @@ class ShmMpscTransport {
   ShmTransportHeader *hdr_ = nullptr;  // at backend_.data_
   char *ring_ = nullptr;               // backend_.data_ + sizeof(header)
   size_t cap_ = 0;                     // == hdr_->max_capacity_
+  size_t num_slots_ = 0;               // ring capacity in kShmMpscChunkSize slots
+  size_t max_inflight_ = 0;            // min(kShmMpscMaxXfers, num_slots_)
   bool is_server_ = false;
   bool inited_ = false;
   ctp::u64 conn_id_ = 0;  // this client's connection id (server: 0)
   std::string name_;
+
+  // Serializes this connection's producers. A conn_id is one ordered stream at
+  // the consumer (which reassembles a single message per conn_id at a time), so
+  // when one client object is shared by multiple sender threads — as
+  // IpcManager::GetOrCreateShmConn caches and shares one conn per destination —
+  // their messages must not interleave chunks under the shared conn_id. Held
+  // across the whole message; a blocking std::mutex (not a spinlock) because
+  // SendBytes yields waiting for ring capacity. Uncontended when each thread
+  // owns its own client.
+  std::mutex send_mu_;
 
   // Consumer-side per-connection reassembly state (single-threaded: the one
   // Recv consumer owns this map). TODO(#642): swap for mcsp_unordered_map once
@@ -166,6 +258,7 @@ class ShmMpscTransport {
       return false;
     }
     hdr_ = new (backend_.data_) ShmTransportHeader();
+    hdr_->abi_tag_ = ShmMpscAbiTag();
     hdr_->pid_ = ctp::SystemInfo::GetPid();
     hdr_->tid_ = ctp::SystemInfo::GetTid();
     if (xfer_space <= sizeof(ShmTransportHeader)) {
@@ -177,7 +270,13 @@ class ShmMpscTransport {
                        ? backend_.data_capacity_ - sizeof(ShmTransportHeader)
                        : 0;
     if (cap_ > avail) cap_ = avail;
+    // The ring is sliced into fixed kShmMpscChunkSize slots, so it must hold at
+    // least one whole chunk (the backend's >=1MB minimum guarantees the room).
+    if (cap_ < kShmMpscChunkSize && avail >= kShmMpscChunkSize) {
+      cap_ = kShmMpscChunkSize;
+    }
     hdr_->max_capacity_ = cap_;
+    ComputeSlots();
     ring_ = backend_.data_ + sizeof(ShmTransportHeader);
     is_server_ = true;
     inited_ = true;
@@ -191,7 +290,21 @@ class ShmMpscTransport {
       return false;
     }
     hdr_ = reinterpret_cast<ShmTransportHeader *>(backend_.data_);
+    // Reject a segment laid out by a differently-built peer BEFORE touching any
+    // other field — everything below this point (ring base, slot count, the
+    // descriptor array) assumes a layout the tag is what proves we share.
+    if (hdr_->abi_tag_ != ShmMpscAbiTag()) {
+      HLOG(kError,
+           "ShmMpscTransport::ClientInit: ABI mismatch on '{}' — segment tag "
+           "{:#x} != ours {:#x}. Producer and consumer were built from "
+           "different revisions of shm_mpsc_transport.h; rebuild both.",
+           name, hdr_->abi_tag_, ShmMpscAbiTag());
+      hdr_ = nullptr;
+      backend_.shm_detach();
+      return false;
+    }
     cap_ = hdr_->max_capacity_;
+    ComputeSlots();
     ring_ = backend_.data_ + sizeof(ShmTransportHeader);
     conn_id_ = hdr_->connection_id_.fetch_add(1) + 1;  // 0 is reserved
     is_server_ = false;
@@ -217,34 +330,117 @@ class ShmMpscTransport {
    * success, -EPIPE if the server (consumer) process died mid-transfer.
    */
   int SendBytes(const char *data, size_t size) {
+    // One message at a time per connection (see send_mu_): keeps a shared
+    // client's threads from interleaving chunks under the same conn_id.
+    std::lock_guard<std::mutex> lk(send_mu_);
     ctp::u32 rem_off = 0;
     ctp::u32 rem_size = static_cast<ctp::u32>(size);
     while (rem_off < size) {
-      // 1. Reserve an xfer slot; wait until it is within the in-flight window.
+      // 1. Reserve an xfer slot; the SAME id picks both the descriptor and the
+      //    fixed ring slot, so slot-id order == ring-offset order by
+      //    construction. Wait until the slot is inside the in-flight window
+      //    (which also means its ring slot has been drained and is free).
       ctp::u64 xfer_id = hdr_->xfer_id_tail_.fetch_add(1);
       if (!WaitSlotFree(xfer_id)) return -EPIPE;
-      // 2. Chunk size.
+      // Stamp ownership the moment the slot is ours, BEFORE the payload copy:
+      // if this thread is descheduled mid-publish, the consumer's
+      // WaitChunkReady can verify we are alive and keep waiting instead of
+      // abandoning the chunk (issue #774 — a skipped live chunk permanently
+      // orphans this connection's message reassembly).
+      hdr_->xfers_[xfer_id % kShmMpscMaxXfers].producer_pid_ =
+          static_cast<ctp::u64>(ctp::SystemInfo::GetPid());
+      // 2. Chunk size (each chunk fits wholly inside one kShmMpscChunkSize slot,
+      //    so no ring wraparound is possible within a chunk).
       ctp::u32 xfer_size = static_cast<ctp::u32>(
           (size - rem_off) < kShmMpscChunkSize ? (size - rem_off)
                                                : kShmMpscChunkSize);
-      // 3. Reserve ring space (monotonic).
-      ctp::u64 xfer_off = hdr_->tail_.fetch_add(xfer_size);
-      // 4. Wait until the consumer has drained enough that our window fits.
-      if (!WaitRingCapacity(xfer_off, xfer_size)) return -EPIPE;
-      // 5. Copy into the ring (handles wraparound).
-      RingWrite(xfer_off, data + rem_off, xfer_size);
-      // 6. Publish the descriptor, then mark ready (release).
+      // 3. Ring position derived from the slot id — no second counter to drift.
+      size_t ring_pos =
+          static_cast<size_t>(xfer_id % num_slots_) * kShmMpscChunkSize;
+      std::memcpy(ring_ + ring_pos, data + rem_off, xfer_size);
+      // 4. Publish the descriptor, then mark ready (release).
       ShmXferHeader &slot = hdr_->xfers_[xfer_id % kShmMpscMaxXfers];
       slot.conn_id_ = conn_id_;
-      slot.xfer_off_ = static_cast<ctp::u32>(xfer_off % cap_);
+      slot.xfer_off_ = static_cast<ctp::u32>(ring_pos);
       slot.xfer_size_ = xfer_size;
       slot.rem_off_ = rem_off;
       slot.rem_size_ = rem_size;
       slot.ready_.store(true);
-      // 7. Advance.
+      // 5. Advance.
       rem_off += xfer_size;
     }
+    // The whole message is published: wake the drainer if it parked. Done once
+    // per message rather than per chunk, and skipped entirely when the drainer
+    // is already awake.
+    SignalConsumerIfParked();
     return 0;
+  }
+
+  // --- Park / signal rendezvous --------------------------------------------
+  /**
+   * Consumer: publish the calling thread as this ring's drainer, so producers
+   * know whom to wake. Call once from the drain thread before its first Recv.
+   *
+   * The caller MUST have SIGUSR1 blocked and a signalfd registered with an
+   * EventManager (EventManager::AddSignalEvent, which IpcManagerTls does in its
+   * constructor) — otherwise a producer's wake signal takes SIGUSR1's default
+   * disposition and kills the process.
+   */
+  void RegisterConsumer() {
+    if (!inited_ || hdr_ == nullptr) return;
+    hdr_->consumer_tid_.store(static_cast<int>(ctp::SystemInfo::GetTid()));
+  }
+
+  /** Consumer: withdraw as drainer (shutdown). Producers stop signalling —
+   *  important because the tid can be recycled by an unrelated thread that does
+   *  NOT have SIGUSR1 blocked. */
+  void UnregisterConsumer() {
+    if (!inited_ || hdr_ == nullptr) return;
+    hdr_->consumer_parked_.store(0);
+    hdr_->consumer_tid_.store(0);
+  }
+
+  /** Consumer: true iff nothing is reserved and no message is half-received.
+   *  Conservative in the safe direction — a producer reserves its slot
+   *  (xfer_id_tail_) BEFORE copying the payload, so this reports "not empty"
+   *  from the instant a send begins, never after it. */
+  bool IsEmpty() const {
+    if (hdr_ == nullptr) return true;
+    return hdr_->xfer_id_head_.load() == hdr_->xfer_id_tail_.load() &&
+           recv_conns_.empty();
+  }
+
+  /** Consumer: announce that this thread is about to block (or has woken).
+   *  Publish BEFORE the final IsEmpty() re-check — see ParkProtocol below. */
+  void SetConsumerParked(bool parked) {
+    if (hdr_ == nullptr) return;
+    hdr_->consumer_parked_.store(parked ? 1u : 0u);
+  }
+
+  /**
+   * Producer: wake the drainer if it is parked. Called at the end of a
+   * completed message (SendBytes), not per chunk.
+   *
+   * Correctness rests on a Dekker-style handshake against the consumer's park
+   * sequence, with both sides using seq_cst:
+   *
+   *   producer                         consumer
+   *   --------                         --------
+   *   reserve slot (xfer_id_tail_++)   SetConsumerParked(true)
+   *   ...publish payload...            if (IsEmpty()) Wait()
+   *   if (consumer_parked_) Signal()   SetConsumerParked(false)
+   *
+   * Either the producer observes parked_ (and signals), or the consumer
+   * observes the reserved slot in its post-park re-check (and does not block).
+   * Both stores precede both loads in the total order, so the case where the
+   * producer misses the park AND the consumer misses the message cannot occur.
+   */
+  void SignalConsumerIfParked() {
+    if (hdr_ == nullptr) return;
+    if (hdr_->consumer_parked_.load() == 0) return;  // awake: no syscall
+    int tid = hdr_->consumer_tid_.load();
+    if (tid == 0) return;                            // nobody draining
+    EventManager::Signal(hdr_->pid_, tid);
   }
 
   // --- Consumer ------------------------------------------------------------
@@ -289,12 +485,14 @@ class ShmMpscTransport {
         st.received = 0;
       }
       if (static_cast<size_t>(off) + xsize <= st.buf.size()) {
-        RingRead(st.buf.data() + off, xoff, xsize);
+        // Chunk lives wholly within one fixed slot, so a flat copy suffices.
+        std::memcpy(st.buf.data() + off, ring_ + xoff, xsize);
       }
       st.received += xsize;
       slot.ready_.store(false);
-      hdr_->head_.fetch_add(xsize);      // free ring space
-      hdr_->xfer_id_head_.fetch_add(1);  // advance cursor
+      // Advancing the cursor frees the ring slot: the next producer to reuse
+      // this slot id (id + num_slots) waits on xfer_id_head_ via WaitSlotFree.
+      hdr_->xfer_id_head_.fetch_add(1);
       if (st.received >= st.total) {
         out = std::move(st.buf);
         if (conn_out) *conn_out = conn;
@@ -423,11 +621,23 @@ class ShmMpscTransport {
     return true;
   }
 
+  // Derive the ring's fixed-slot geometry from cap_. The in-flight window is
+  // capped by BOTH the descriptor array size and the ring slot count so that a
+  // reserved id never aliases a still-busy descriptor or a still-busy ring slot.
+  void ComputeSlots() {
+    num_slots_ = cap_ / kShmMpscChunkSize;
+    if (num_slots_ == 0) num_slots_ = 1;
+    max_inflight_ =
+        num_slots_ < kShmMpscMaxXfers ? num_slots_ : kShmMpscMaxXfers;
+  }
+
   // Producer: wait until this xfer slot is inside the bounded in-flight window.
+  // Because max_inflight_ <= num_slots_, returning here also guarantees the
+  // ring slot owned by this id (its prior occupant id-num_slots) was consumed.
   bool WaitSlotFree(ctp::u64 xfer_id) {
     ctp::Timepoint start;
     start.Now();
-    while (xfer_id - hdr_->xfer_id_head_.load() >= kShmMpscMaxXfers) {
+    while (xfer_id - hdr_->xfer_id_head_.load() >= max_inflight_) {
       ctp::Timepoint now;
       now.Now();
       if (start.GetUsecFromStart(now) >= kShmMpscLivenessUs) {
@@ -437,25 +647,6 @@ class ShmMpscTransport {
       CTP_THREAD_MODEL->Yield();
     }
     return true;
-  }
-
-  // Producer: wait until the consumer has drained enough for our ring window.
-  bool WaitRingCapacity(ctp::u64 xfer_off, ctp::u32 xfer_size) {
-    ctp::Timepoint start;
-    start.Now();
-    while (true) {
-      ctp::u64 head = hdr_->head_.load();
-      // rem_capacity = cap - (bytes reserved ahead of the drained point)
-      ctp::u64 used = xfer_off - head;
-      if (used + xfer_size <= cap_) return true;
-      ctp::Timepoint now;
-      now.Now();
-      if (start.GetUsecFromStart(now) >= kShmMpscLivenessUs) {
-        if (!ServerAlive()) return false;
-        start.Now();
-      }
-      CTP_THREAD_MODEL->Yield();
-    }
   }
 
   // Consumer: wait for a chunk's ready flag; false => presumed-dead, skip it.
@@ -466,37 +657,26 @@ class ShmMpscTransport {
       ctp::Timepoint now;
       now.Now();
       if (start.GetUsecFromStart(now) >= kShmMpscDeadXferUs) {
-        return false;
+        // Abandon the chunk ONLY if the producing process is actually gone.
+        // A live producer may be descheduled arbitrarily long on a loaded
+        // host; skipping its chunk loses the message and poisons this conn's
+        // reassembly state forever (issue #774: single-victim client hangs).
+        // producer_pid_ is stamped right after the slot is claimed; 0 means
+        // the claim itself has not landed yet — treat as alive and re-arm
+        // (the stamping window is nanoseconds; a dead pre-stamp producer is
+        // caught on the next expiry via the previous occupant's dead pid).
+        ctp::u64 pid = slot.producer_pid_;
+#ifndef _WIN32
+        if (pid != 0 &&
+            !ctp::SystemInfo::IsProcessAlive(static_cast<int>(pid))) {
+          return false;
+        }
+#endif
+        start.Now();  // producer alive (or unstamped): keep waiting
       }
       CTP_THREAD_MODEL->Yield();
     }
     return true;
-  }
-
-  // Copy `size` bytes from src into the ring at monotonic offset xfer_off,
-  // wrapping at cap_.
-  void RingWrite(ctp::u64 xfer_off, const char *src, ctp::u32 size) {
-    size_t pos = static_cast<size_t>(xfer_off % cap_);
-    size_t first = cap_ - pos;
-    if (first >= size) {
-      std::memcpy(ring_ + pos, src, size);
-    } else {
-      std::memcpy(ring_ + pos, src, first);
-      std::memcpy(ring_, src + first, size - first);
-    }
-  }
-
-  // Copy `size` bytes out of the ring (ring offset already modulo cap_) into
-  // dst, wrapping at cap_.
-  void RingRead(char *dst, ctp::u32 ring_off, ctp::u32 size) {
-    size_t pos = static_cast<size_t>(ring_off);
-    size_t first = cap_ - pos;
-    if (first >= size) {
-      std::memcpy(dst, ring_ + pos, size);
-    } else {
-      std::memcpy(dst, ring_ + pos, first);
-      std::memcpy(dst + first, ring_, size - first);
-    }
   }
 };
 

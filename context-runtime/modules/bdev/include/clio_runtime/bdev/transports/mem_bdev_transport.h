@@ -8,8 +8,13 @@
 
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
-#include <mutex>
+// Must follow the runtime headers above: posix_shm_mmap.h needs the memory
+// backend base types they pull in.
+#include <clio_ctp/memory/backend/posix_shm_mmap.h>
+#include <atomic>
 #include <limits>
+#include <mutex>
+#include <string>
 
 namespace clio::run::bdev {
 
@@ -31,17 +36,192 @@ class MemBdevTransport : public BdevTransport {
   clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
   clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
 
+  /**
+   * Whether RAM page `page_idx` has been committed (its backing memory
+   * allocated) yet.
+   *
+   * A pool commits pages either up front, at Init (AllocPolicy::kEager, and
+   * kAuto on a sized pool), or one page at a time on first touch (kLazy, and
+   * any unsized pool). This reports which has happened for a given page without
+   * saying anything about where or how that page is stored. A page_idx past the
+   * end of the pool is simply not committed.
+   *
+   * @param page_idx Index of the page: page i backs pool offsets
+   *                 [i * RamPageSizeBytes(), (i + 1) * RamPageSizeBytes()).
+   * @return true iff that page's memory is currently allocated.
+   */
+  bool IsRamPageCommitted(size_t page_idx) const;
+
+  /**
+   * Host memory this bdev has actually committed so far, in bytes — the sum of
+   * its committed pages.
+   *
+   * This is a pool's true RAM footprint, which the AllocPolicy knob now decides
+   * both the size and the timing of: an eager pool has already taken its whole
+   * declared capacity out of host DRAM by the time Init returns, while a lazy
+   * pool of the identical declared capacity may still be holding nothing and
+   * will grow a page at a time under load. "How much has this pool actually
+   * committed?" is therefore an operational question — the declared capacity no
+   * longer answers it — and this is what answers it.
+   *
+   * Note the value is page-granular: a committed page costs RamPageSizeBytes()
+   * regardless of how much of it is in use, so a sized pool commits its
+   * capacity rounded up to a whole number of pages.
+   *
+   * @return Bytes of host memory currently committed by this bdev.
+   */
+  clio::run::u64 CommittedRamBytes() const;
+
+  /**
+   * Size of one RAM page, in bytes. Pool offset `off` falls in page
+   * `off / RamPageSizeBytes()`.
+   */
+  static constexpr size_t RamPageSizeBytes() { return kRamPageSize; }
+
  private:
   StandardBlockAllocator allocator_;
   clio::run::u64 ram_capacity_{0};
+  BdevType bdev_type_{BdevType::kRam};
+
+  // Benchmark-only knob (env CLIO_BDEV_FORCE_SYNC): when set, the device copy
+  // path blocks the worker on cudaStreamSynchronize right after enqueueing —
+  // reproducing the old synchronous behaviour — instead of yield-polling the
+  // stream. Lets one binary A/B the worker-block-vs-yield change over an
+  // identical device workload. Off in all normal operation.
+  bool force_sync_gpu_{false};
 
   static constexpr size_t kRamPageSize = 1ULL << 30; // 1 GiB pages
 
-  mutable std::mutex ram_pages_mu_;
-  std::vector<std::unique_ptr<char[]>> ram_pages_;
+ public:
+  /**
+   * Header at the start of a RAM bdev's shared-memory segment (issue #783).
+   *
+   * Lets a client sanity-check a segment it attached by NAME before trusting
+   * any offset in it. POD, fixed layout, no pointers.
+   */
+  struct ShmRamHeader {
+    static constexpr clio::run::u32 kVersion = 1;
+    clio::run::u32 version_;
+    clio::run::u32 ready_;      /**< 0 until the mapping is usable */
+    clio::run::u64 capacity_;   /**< bytes of addressable device space */
+    clio::run::u64 data_off_;   /**< offset from header start to byte 0 */
+    clio::run::u64 reserved_[5];
+  };
 
+  /**
+   * Deterministic segment name for a node-local RAM bdev.
+   *
+   * Derived purely from (runtime pid, pool id) so a client can construct it
+   * from information it already has -- the server pid from ClientConnect and
+   * the target pool id carried in each cached block descriptor. That removes
+   * any need to publish a name or a page table separately.
+   */
+  static std::string ShmSegmentName(clio::run::u32 server_pid,
+                                    const clio::run::PoolId &pool_id) {
+    return "clio_rambdev_" + std::to_string(server_pid) + "_" +
+           std::to_string(pool_id.major_) + "_" +
+           std::to_string(pool_id.minor_);
+  }
+
+ private:
+  // issue #783: when this is a node-local kRam device, its bytes live in a
+  // dedicated shared-memory segment so client processes can read blob payloads
+  // directly instead of paying a round-trip.
+  //
+  // The whole capacity is mapped as ONE contiguous sparse region rather than a
+  // page table: these segments are memfd-backed, so an untouched reservation
+  // costs nothing, and a flat mapping means a reader resolves a block offset
+  // with an addition instead of chasing an index. kRamPageSize is retained
+  // only to keep the existing paged call sites unchanged.
+  /** Create the shared-memory backing for a node-local RAM device. */
+  void InitShmBacking(const clio::run::PoolId &pool_id);
+
+  /**
+   * True if this page's START lies inside the shared mapping.
+   *
+   * Deliberately NOT "the whole 1 GiB page fits": a device smaller than one
+   * page has a partial page 0, and requiring the full page rejected it --
+   * which silently pushed every RAM bdev back to the private heap and broke
+   * direct payload reads. Callers clamp their access within the device
+   * capacity, and the mapping is sized to cover it (see kBackendHeaderSlack).
+   */
+  bool ShmPageInBounds(size_t page_idx) const {
+    if (kRamPageSize != 0 && page_idx > shm_usable_ / kRamPageSize) {
+      return false;  // guards the multiply below from overflowing
+    }
+    return page_idx * kRamPageSize < shm_usable_;
+  }
+
+  ctp::ipc::PosixShmMmap shm_backend_;
+  size_t shm_usable_ = 0;  /**< bytes of device space actually mapped */
+  char *shm_base_ = nullptr;       /**< byte 0 of device space, or nullptr */
+  ShmRamHeader *shm_header_ = nullptr;
+  bool shm_backed_ = false;
+  std::string shm_name_;
+
+  // Incremental population of the sparse SHM mapping (SystemInfo::BulkFault).
+  // First-touch demand faulting made cold placement ~20x slower than warm on
+  // WSL2 (one #PF per 4KB of memcpy), so when an allocation crosses this
+  // watermark the NEXT populate-unit of pages is bulk-faulted in. The
+  // watermark advances by CAS — no lock — because population is ADVISORY: a
+  // thread that observes an advanced watermark before the winner's BulkFault
+  // finishes just demand-faults those pages exactly as before. Committed
+  // memory stays <= round_up(allocation high-water mark, unit): capacity that
+  // is never allocated is never touched.
+  clio::run::u64 populate_unit_ = 64ULL << 20;
+  std::atomic<clio::run::u64> populated_bytes_{0};
+  /** Bulk-fault [populated_bytes_, round_up(end, unit)) if end crosses it. */
+  void EnsurePopulated(clio::run::u64 end);
+
+  // A lazily-allocated RAM page. A kPinned pool allocates page-locked host
+  // memory through GpuApi (cudaMallocHost / hipHostMalloc / sycl::malloc_host)
+  // so GPU DMA runs truly asynchronously and concurrent transfers overlap;
+  // every other pool — and any build or host without a usable GPU backend —
+  // uses ordinary pageable `new char[]`. The `pinned` flag records which
+  // allocator owns `data` so it is released through the matching free path.
+  //
+  // A pool created with an explicit total_size_ has every page allocated and
+  // zeroed in Init() (see PreallocateRamPages); a pool created with
+  // total_size_ == 0 falls back to DefaultRamCapacityBytes(), which is too large
+  // to commit eagerly, and allocates lazily in EnsureRamPage instead.
+  struct RamPage {
+    char* data = nullptr;
+    bool pinned = false;
+  };
+
+  mutable std::mutex ram_pages_mu_;
+  std::vector<RamPage> ram_pages_;
+
+  // Allocate every page of a sized pool up front and zero it, so neither the
+  // allocation nor the first-touch page fault lands in the I/O path. For kPinned
+  // this removes a ~550 ms cudaMallocHost stall from the first write to each
+  // 1 GiB page; for kRam it removes the 4 KiB-at-a-time faulting that pins a GPU
+  // D2H to the cold-pageable floor. Zeroing also keeps "never written reads back
+  // as zeros" true now that a live page is no longer distinguishable by a null
+  // pointer. Assumes ram_capacity_ and bdev_type_ are already set.
+  void PreallocateRamPages();
+
+  // Allocate `page` in place if it is empty, choosing pinned vs pageable from
+  // bdev_type_. Caller must hold ram_pages_mu_ (or be Init, pre-publication).
+  char* AllocRamPage(RamPage& page);
   char* EnsureRamPage(size_t page_idx);
   char* GetRamPage(size_t page_idx) const;
+  static void FreeRamPage(RamPage& page);
+
+  // Host-source / host-dest copies: fully synchronous, set the task's result
+  // fields directly. A host->host memcpy cannot be accelerated by a GPU stream.
+  void WriteBlocksCpu(const ctp::ipc::FullPtr<WriteTask>& task, char* data);
+  void ReadBlocksCpu(const ctp::ipc::FullPtr<ReadTask>& task, char* data);
+
+  // Device-source / device-dest copies: enqueue every chunk on `stream` without
+  // waiting, so the caller can yield the worker while the transfers run. Return
+  // the transport return_code_ (0 = ok, 1 = capacity exceeded) and report the
+  // number of bytes actually enqueued via the out-parameter. The caller waits on
+  // the stream before publishing the result.
+  int LaunchWriteBlocksGpu(const ctp::ipc::FullPtr<WriteTask>& task, char* data,
+                           void* stream, clio::run::u64& bytes_written);
+  int LaunchReadBlocksGpu(const ctp::ipc::FullPtr<ReadTask>& task, char* data,
+                          void* stream, clio::run::u64& bytes_read);
 };
 
 } // namespace clio::run::bdev

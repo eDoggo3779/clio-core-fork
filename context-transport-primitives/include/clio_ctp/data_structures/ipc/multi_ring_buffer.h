@@ -258,6 +258,38 @@ using multi_mpsc_ring_buffer =
                       (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
                        RING_BUFFER_WAIT_FOR_SPACE)>;
 
+/**
+ * Typedef for a multi-lane MPSC ring buffer that is PRODUCED INTO BY A GPU
+ * KERNEL AND DRAINED BY THE HOST, living in pinned host memory (the gpu2cpu
+ * lane).
+ *
+ * Identical to multi_mpsc_ring_buffer except for RING_BUFFER_HOST_CONSUMER,
+ * which makes a parked producer re-read head_ with a pure volatile load rather
+ * than a device-scope atomicAdd RMW. See RING_BUFFER_HOST_CONSUMER in
+ * ring_buffer.h: without it, parked GPU producers clobber the CPU consumer's
+ * head_ and the ring deadlocks under backpressure.
+ */
+template <typename T, typename AllocT = ctp::ipc::Allocator>
+using multi_mpsc_host_consumer_ring_buffer =
+    multi_ring_buffer<T, AllocT,
+                      (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
+                       RING_BUFFER_WAIT_FOR_SPACE |
+                       RING_BUFFER_HOST_CONSUMER)>;
+
+/**
+ * Typedef for multi-lane extensible mutex-guarded queues (issue #822).
+ *
+ * Each lane is an ext_spsc_queue: push/pop fully serialized by the lane's
+ * embedded ctp::Mutex, and a full lane GROWS (doubles) instead of
+ * busy-spinning. See the ext_spsc_queue typedef in ring_buffer.h for the
+ * full rationale (producer==consumer WAIT_FOR_SPACE deadlock).
+ */
+template <typename T, typename AllocT = ctp::ipc::Allocator>
+using multi_ext_spsc_queue =
+    multi_ring_buffer<T, AllocT,
+                      (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_DYNAMIC_SIZE |
+                       RING_BUFFER_LOCK_PUSH | RING_BUFFER_LOCK_POP)>;
+
 }  // namespace ctp::ipc
 
 #endif  // CTP_DATA_STRUCTURES_IPC_MULTI_RING_BUFFER_H_

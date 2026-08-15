@@ -39,6 +39,9 @@
 #include <clio_ctp/introspect/system_info.h>
 #include <yaml-cpp/yaml.h>
 
+#include <cctype>
+#include <string>
+
 #include "autogen/bdev_methods.h"
 // Include admin tasks for BaseCreateTask
 #include <clio_runtime/admin/admin_tasks.h>
@@ -89,12 +92,39 @@ enum class BdevType : clio::run::u32 {
 };
 
 /**
+ * When a memory-backed bdev (kRam / kPinned) commits its backing pages.
+ *
+ * Lazy allocation inside the I/O path is expensive, and for kPinned it is
+ * pathological: a cudaMallocHost(1 GiB) executed on the first write to a page
+ * costs ~550 ms, paid by whichever I/O happened to touch that page first. Even
+ * for pageable kRam, a never-touched page faults in 4 KiB at a time under the
+ * writer, which pins a GPU device->host copy to the slowest path the driver
+ * offers (~12 GB/s cold vs ~18 GB/s warm vs ~27 GB/s pinned, measured).
+ * kEager moves that cost to Init(), off the I/O path.
+ *
+ * kLazy is the escape hatch in the other direction: a pool may DECLARE a large
+ * RAM capacity it never actually fills, and eagerly committing the declared
+ * size would waste — or on a shared node, exhaust — physical memory. kLazy
+ * keeps the pre-fix behaviour of allocating pages only on first touch.
+ *
+ * kAuto is the default and preserves existing behaviour: preallocate exactly
+ * when the pool was given an explicit size, since a sized pool is one whose
+ * memory footprint the operator has already agreed to.
+ */
+enum class AllocPolicy : clio::run::u32 {
+  kAuto = 0,   // Preallocate iff total_size_ != 0 (default)
+  kEager = 1,  // Always preallocate + pre-fault in Init() (needs a known size)
+  kLazy = 2,   // Allocate pages on first touch, in the I/O path
+};
+
+/**
  * Block structure for data allocation
  */
 struct Block {
   clio::run::u64 offset_;      // Offset within file
   clio::run::u64 size_;        // Size of block
-  clio::run::u32 block_type_;  // Block size category (0=4KB, 1=64KB, 2=256KB, 3=1MB)
+  clio::run::u32 block_type_;  // Block size category (BlockSizeCategory:
+                               // 512B..1MB; see block_allocator.h)
 
   CTP_GPU_FUN Block() : offset_(0), size_(0), block_type_(0) {}
   CTP_GPU_FUN Block(clio::run::u64 offset, clio::run::u64 size, clio::run::u32 block_type)
@@ -160,6 +190,30 @@ struct CreateParams {
   // Persistence level for this block device
   PersistenceLevel persistence_level_ = PersistenceLevel::kVolatile;
 
+  // When a memory-backed bdev commits its pages (see AllocPolicy). Defaulted
+  // here rather than in each constructor so every existing caller — and every
+  // ctor below — keeps today's behaviour without being touched.
+  AllocPolicy alloc_policy_ = AllocPolicy::kAuto;
+
+  // Path to the persistent allocator-state log (WAL). Empty => logging
+  // disabled (no file created), preserving pre-WAL behavior.
+  std::string alloc_log_path_;
+
+  // #858: file-backed devices grow the backing file lazily in units of this
+  // many bytes instead of truncating the full capacity at compose (on NTFS a
+  // plain SetEndOfFile claims the clusters eagerly, so the old full-capacity
+  // truncate reserved the whole tier up front). Ignored by RAM/GPU
+  // transports. YAML key: growth_unit (size string, e.g. "1GB").
+  clio::run::u64 growth_unit_ = clio::run::u64(1) << 30;  // 1 GiB default
+
+  // Incremental population unit for the RAM bdev's sparse SHM mapping: when
+  // an allocation crosses the populated watermark, the next this-many bytes
+  // are bulk-faulted (SystemInfo::BulkFault) so data memcpys stop paying one
+  // demand fault per 4KB. 0 disables population (pure lazy faulting).
+  // Committed memory stays bounded by the allocation high-water mark plus
+  // one unit. YAML key: populate_unit (size string).
+  clio::run::u64 populate_unit_ = clio::run::u64(64) << 20;  // 64 MiB default
+
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_bdev";
 
@@ -201,11 +255,15 @@ struct CreateParams {
 
   // Constructor with optional performance metrics (as last parameter)
   CreateParams(BdevType bdev_type, clio::run::u64 total_size, clio::run::u32 io_depth,
-               clio::run::u32 alignment, const PerfMetrics *perf_metrics = nullptr)
+               clio::run::u32 alignment, const PerfMetrics *perf_metrics = nullptr,
+               const std::string &alloc_log_path = "",
+               clio::run::u64 growth_unit = clio::run::u64(1) << 30)
       : bdev_type_(bdev_type),
         total_size_(total_size),
         io_depth_(io_depth),
-        alignment_(alignment) {
+        alignment_(alignment),
+        alloc_log_path_(alloc_log_path),
+        growth_unit_(growth_unit) {
     // Set performance metrics (use provided metrics or defaults)
     if (perf_metrics != nullptr) {
       perf_metrics_ = *perf_metrics;
@@ -234,7 +292,9 @@ struct CreateParams {
   // Serialization support for cereal
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_, persistence_level_);
+    ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_,
+       persistence_level_, alloc_policy_, alloc_log_path_, growth_unit_,
+       populate_unit_);
   }
 
   /**
@@ -271,6 +331,32 @@ struct CreateParams {
       total_size_ = ctp::ConfigParse::ParseSize(capacity_str);
     }
 
+    // Load page allocation policy (optional, defaults to auto). Case-insensitive;
+    // an unrecognized value falls back to kAuto with a warning rather than
+    // failing the pool creation.
+    if (config["alloc"]) {
+      std::string alloc_str = config["alloc"].as<std::string>();
+      std::string alloc_lc;
+      alloc_lc.reserve(alloc_str.size());
+      for (char c : alloc_str) {
+        alloc_lc.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+      }
+      if (alloc_lc == "auto") {
+        alloc_policy_ = AllocPolicy::kAuto;
+      } else if (alloc_lc == "eager") {
+        alloc_policy_ = AllocPolicy::kEager;
+      } else if (alloc_lc == "lazy") {
+        alloc_policy_ = AllocPolicy::kLazy;
+      } else {
+        alloc_policy_ = AllocPolicy::kAuto;
+        HLOG(kWarning,
+             "bdev: unknown alloc policy '{}' (expected auto|eager|lazy); "
+             "falling back to auto",
+             alloc_str);
+      }
+    }
+
     // Load io_depth (optional)
     if (config["io_depth"]) {
       io_depth_ = config["io_depth"].as<clio::run::u32>();
@@ -279,6 +365,18 @@ struct CreateParams {
     // Load alignment (optional)
     if (config["alignment"]) {
       alignment_ = config["alignment"].as<clio::run::u32>();
+    }
+
+    // Load lazy-growth unit for file-backed devices (optional, default 1GB)
+    if (config["growth_unit"]) {
+      std::string growth_str = config["growth_unit"].as<std::string>();
+      growth_unit_ = ctp::ConfigParse::ParseSize(growth_str);
+    }
+
+    // Load RAM-bdev incremental population unit (optional, default 64MB)
+    if (config["populate_unit"]) {
+      std::string populate_str = config["populate_unit"].as<std::string>();
+      populate_unit_ = ctp::ConfigParse::ParseSize(populate_str);
     }
 
     // Load performance metrics (optional)
@@ -301,6 +399,11 @@ struct CreateParams {
       if (perf["iops"]) {
         perf_metrics_.iops_ = perf["iops"].as<double>();
       }
+    }
+
+    // Load allocator-state log path (optional). Empty => logging disabled.
+    if (config["alloc_log"]) {
+      alloc_log_path_ = config["alloc_log"].as<std::string>();
     }
 
     if (config["persistence_level"]) {
@@ -340,11 +443,6 @@ struct AllocateBlocksTask : public clio::run::Task {
                               const clio::run::PoolId &pool_id,
                               const clio::run::PoolQuery &pool_query, clio::run::u64 size)
       : clio::run::Task(task_node, pool_id, pool_query, Method::kAllocateBlocks), size_(size), blocks_(CLIO_PRIV_ALLOC) {
-  }
-
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
   }
 
   /** Serialize IN and INOUT parameters */
@@ -433,11 +531,6 @@ struct FreeBlocksTask : public clio::run::Task {
     // No additional output parameters
   }
 
-  /** Fix up SVO pointer after POD copy (e.g., CPU→GPU memcpy) */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
-  }
-
   /**
    * Copy from another FreeBlocksTask (assumes this task is already constructed)
    * @param other Pointer to the source task to copy from
@@ -465,9 +558,10 @@ struct WriteTask : public clio::run::Task {
   IN ctp::ipc::ShmPtr<> data_;              // Data to write (pointer-based)
   IN size_t length_;                    // Size of data to write
   OUT clio::run::u64 bytes_written_;          // Number of bytes actually written
+  OUT clio::run::u32 io_error_;               // ctp::IoError category (0 == kOk)
 
   /** SHM default constructor */
-  CTP_CROSS_FUN WriteTask() : clio::run::Task(), blocks_(CLIO_PRIV_ALLOC), length_(0), bytes_written_(0) {}
+  CTP_CROSS_FUN WriteTask() : clio::run::Task(), blocks_(CLIO_PRIV_ALLOC), length_(0), bytes_written_(0), io_error_(0) {}
 
   /** Emplace constructor */
   CTP_CROSS_FUN explicit WriteTask(const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
@@ -478,7 +572,8 @@ struct WriteTask : public clio::run::Task {
         blocks_(blocks),
         data_(data),
         length_(length),
-        bytes_written_(0) {
+        bytes_written_(0),
+        io_error_(0) {
   }
 
   /** Destructor - free buffer if TASK_DATA_OWNER is set */
@@ -507,12 +602,7 @@ struct WriteTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(bytes_written_);
-  }
-
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
+    ar(bytes_written_, io_error_);
   }
 
   /** AggregateOut */
@@ -533,6 +623,7 @@ struct WriteTask : public clio::run::Task {
     data_ = other->data_;
     length_ = other->length_;
     bytes_written_ = other->bytes_written_;
+    io_error_ = other->io_error_;
   }
 };
 
@@ -546,9 +637,10 @@ struct ReadTask : public clio::run::Task {
   INOUT size_t
       length_;  // Size of data buffer (IN: buffer size, OUT: actual size)
   OUT clio::run::u64 bytes_read_;  // Number of bytes actually read
+  OUT clio::run::u32 io_error_;    // ctp::IoError category (0 == kOk)
 
   /** SHM default constructor */
-  CTP_CROSS_FUN ReadTask() : clio::run::Task(), blocks_(CLIO_PRIV_ALLOC), length_(0), bytes_read_(0) {}
+  CTP_CROSS_FUN ReadTask() : clio::run::Task(), blocks_(CLIO_PRIV_ALLOC), length_(0), bytes_read_(0), io_error_(0) {}
 
   /** Emplace constructor */
   CTP_CROSS_FUN explicit ReadTask(const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
@@ -559,7 +651,8 @@ struct ReadTask : public clio::run::Task {
         blocks_(blocks),
         data_(data),
         length_(length),
-        bytes_read_(0) {
+        bytes_read_(0),
+        io_error_(0) {
   }
 
   /** Destructor - free buffer if TASK_DATA_OWNER is set */
@@ -587,14 +680,9 @@ struct ReadTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(length_, bytes_read_);
+    ar(length_, bytes_read_, io_error_);
     // Use BULK_XFER to actually transfer the read data back
     ar.bulk(data_, length_, BULK_XFER);
-  }
-
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
   }
 
   /** AggregateOut */
@@ -615,6 +703,7 @@ struct ReadTask : public clio::run::Task {
     data_ = other->data_;
     length_ = other->length_;
     bytes_read_ = other->bytes_read_;
+    io_error_ = other->io_error_;
   }
 };
 
@@ -623,17 +712,18 @@ struct ReadTask : public clio::run::Task {
  */
 struct GetStatsTask : public clio::run::Task {
   // Task-specific data (no inputs)
-  OUT PerfMetrics metrics_;      // Performance metrics
+  OUT PerfMetrics metrics_;            // Performance metrics
   OUT clio::run::u64 remaining_size_;  // Remaining allocatable space
+  OUT clio::run::u32 predicted_ttl_days_; // Predicted device TTL in days (999999 = healthy)
 
   /** SHM default constructor */
-  GetStatsTask() : clio::run::Task(), remaining_size_(0) {}
+  GetStatsTask() : clio::run::Task(), remaining_size_(0), predicted_ttl_days_(999999) {}
 
   /** Emplace constructor */
   explicit GetStatsTask(const clio::run::TaskId &task_node,
                         const clio::run::PoolId &pool_id,
                         const clio::run::PoolQuery &pool_query)
-      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0) {
+      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0), predicted_ttl_days_(999999) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -653,7 +743,7 @@ struct GetStatsTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(metrics_, remaining_size_);
+    ar(metrics_, remaining_size_, predicted_ttl_days_);
   }
 
   /**
@@ -666,12 +756,105 @@ struct GetStatsTask : public clio::run::Task {
     // Copy GetStatsTask-specific fields
     metrics_ = other->metrics_;
     remaining_size_ = other->remaining_size_;
+    predicted_ttl_days_ = other->predicted_ttl_days_;
   }
 
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<GetStatsTask>());
+  }
+};
+
+/**
+ * SetLifespanTask - Inject a predicted remaining device lifetime in days.
+ *
+ * This task lets tests and administrative flows override the current health
+ * signal that bdev reports through GetStats/Monitor. A value of 999999 is
+ * treated as healthy, while smaller values are consumed by CTE's TTL filter.
+ */
+struct SetLifespanTask : public clio::run::Task {
+  IN clio::run::u32 lifespan_days_;
+
+  CTP_CROSS_FUN SetLifespanTask()
+      : clio::run::Task(), lifespan_days_(999999) {}
+
+  CTP_CROSS_FUN explicit SetLifespanTask(
+      const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, clio::run::u32 lifespan_days)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kSetLifespan),
+        lifespan_days_(lifespan_days) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSetLifespan;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(lifespan_days_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<SetLifespanTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    lifespan_days_ = other->lifespan_days_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<SetLifespanTask>());
+  }
+};
+
+/**
+ * FlushAllocLogTask - Periodic task that flushes (and compacts) the
+ * persistent allocator-state log. Registered as TASK_PERIODIC from Create
+ * when an alloc_log_path is configured. Carries no I/O parameters.
+ */
+struct FlushAllocLogTask : public clio::run::Task {
+  /** SHM default constructor */
+  CTP_CROSS_FUN FlushAllocLogTask() : clio::run::Task() {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit FlushAllocLogTask(const clio::run::TaskId &task_node,
+                                           const clio::run::PoolId &pool_id,
+                                           const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kFlushAllocLog) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kFlushAllocLog;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  /** Copy from another FlushAllocLogTask */
+  void Copy(const ctp::ipc::FullPtr<FlushAllocLogTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+  }
+
+  /** AggregateOut replica results into this task */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<FlushAllocLogTask>());
   }
 };
 

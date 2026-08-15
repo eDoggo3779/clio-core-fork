@@ -12,6 +12,28 @@ target_link_libraries(allocator_benchmark
         Threads::Threads)
 
 #------------------------------------------------------------------------------
+# Build Lock Latency Benchmark
+#------------------------------------------------------------------------------
+
+add_executable(lock_latency_benchmark
+        lock_latency_benchmark.cc)
+add_dependencies(lock_latency_benchmark clio_ctp_host)
+target_link_libraries(lock_latency_benchmark
+        clio_ctp_host
+        Threads::Threads)
+
+#------------------------------------------------------------------------------
+# Build Regex Search Benchmark (#919)
+#------------------------------------------------------------------------------
+
+add_executable(regex_search_benchmark
+        regex_search_benchmark.cc)
+add_dependencies(regex_search_benchmark clio_ctp_host)
+target_link_libraries(regex_search_benchmark
+        clio_ctp_host
+        Threads::Threads)
+
+#------------------------------------------------------------------------------
 # Build ZMQ IPC Latency Benchmark
 #------------------------------------------------------------------------------
 
@@ -52,6 +74,7 @@ endif()
 #------------------------------------------------------------------------------
 install(TARGETS
         allocator_benchmark
+        lock_latency_benchmark
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)

@@ -17,10 +17,15 @@ void PrintUsage() {
             << "  start           Start the Clio runtime server\n"
             << "  restart         Restart the Clio runtime (WAL replay)\n"
             << "  stop            Stop the Clio runtime server\n"
+            << "                  (--force: immediate ungraceful stop;\n"
+            << "                   --grace-period <ms>: drain budget)\n"
+            << "  status          Report runtime state (running/stopped/stale)\n"
             << "  migrate         Migrate a container to a different node\n"
             << "  monitor         Monitor worker statistics\n"
             << "  compose         Manage pools from a compose config:\n"
             << "                  compose <start|stop|rm|list> (see compose --help)\n"
+            << "  config          Export node configuration:\n"
+            << "                  config export --path <file>\n"
             << "  refresh         Autogenerate ChiMod method files\n"
             << "\n"
             << "Legacy nested forms (still supported):\n"
@@ -65,6 +70,8 @@ int main(int argc, char* argv[]) {
       return RuntimeRestart(new_argc, new_argv);
     } else if (cmd == "stop") {
       return RuntimeStop(new_argc, new_argv);
+    } else if (cmd == "status") {
+      return RuntimeStatus(new_argc, new_argv);
     } else if (cmd == "refresh") {
       return RefreshRepo(new_argc, new_argv);
     } else if (cmd == "migrate") {
@@ -73,6 +80,8 @@ int main(int argc, char* argv[]) {
       return Monitor(new_argc, new_argv);
     } else if (cmd == "compose") {
       return Compose(new_argc, new_argv);
+    } else if (cmd == "config") {
+      return Config(new_argc, new_argv);
     }
   }
 
@@ -99,6 +108,8 @@ int main(int argc, char* argv[]) {
       return RuntimeRestart(new_argc, new_argv);
     } else if (subcmd == "stop") {
       return RuntimeStop(new_argc, new_argv);
+    } else if (subcmd == "status") {
+      return RuntimeStatus(new_argc, new_argv);
     } else {
       std::cerr << "Unknown runtime subcommand: " << subcmd << "\n";
       std::cerr << "Usage: " << g_progname

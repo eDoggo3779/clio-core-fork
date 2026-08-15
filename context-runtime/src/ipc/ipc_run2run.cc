@@ -50,6 +50,36 @@
 
 namespace clio::run {
 
+// TEMP NET TRACE (issue #892 diagnosis): per-stage nanosecond totals for the
+// cross-node task path, dumped every 32 ops when CLIO_NET_TRACE=1.
+namespace nettrace {
+static std::atomic<uint64_t> sendin_ser_ns{0}, sendin_tx_ns{0},
+    sendin_bytes{0}, sendin_n{0};
+static std::atomic<uint64_t> sendout_ser_ns{0}, sendout_tx_ns{0},
+    sendout_n{0};
+static std::atomic<uint64_t> recv_ns{0}, recvin_ns{0}, recvout_ns{0},
+    recv_n{0};
+inline bool On() {
+  static bool on = std::getenv("CLIO_NET_TRACE") != nullptr;
+  return on;
+}
+inline uint64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+inline void Dump(const char *tag, uint64_t n) {
+  if (n % 32 != 0) return;
+  HLOG(kInfo,
+       "[NETTRACE {}] n={} sendin(ser={}us tx={}us bytes={}MB) "
+       "sendout(ser={}us tx={}us n={}) recv(recv={}us in={}us out={}us n={})",
+       tag, n, sendin_ser_ns.load() / 1000, sendin_tx_ns.load() / 1000,
+       sendin_bytes.load() >> 20, sendout_ser_ns.load() / 1000,
+       sendout_tx_ns.load() / 1000, sendout_n.load(), recv_ns.load() / 1000,
+       recvin_ns.load() / 1000, recvout_ns.load() / 1000, recv_n.load());
+}
+}  // namespace nettrace
+
 // =============================================================================
 // Constructor
 // =============================================================================
@@ -132,10 +162,19 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   // for SendOut (see RecvInHandleOne), keyed in the connection cache by
   // return-host + this port.
   archive.client_port_ = static_cast<int>(config_manager->GetPort());
+  const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(task_copy->method_, archive, task_copy);
+  const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
+  if (nettrace::On()) {
+    const uint64_t nt2 = nettrace::NowNs();
+    nettrace::sendin_ser_ns += nt1 - nt0;
+    nettrace::sendin_tx_ns += nt2 - nt1;
+    for (const auto &b : archive.send) nettrace::sendin_bytes += b.size;
+    nettrace::Dump("sendin", ++nettrace::sendin_n);
+  }
 
   if (rc != 0) {
     HLOG(kWarning, "[SendIn] Task {} Lightbeam Send rc={} — re-queueing",
@@ -183,6 +222,11 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
   size_t num_replicas = pool_queries.size();
   origin_task->Subtasks().resize(num_replicas);
 
+  // Per-replica target node, for the #628 task-progress scan. Left as
+  // kInvalidNodeId for replicas that were never dispatched to a live/queued
+  // node (those never wait on a network response, so the scan skips them).
+  std::vector<clio::run::u64> replica_targets(num_replicas, kInvalidNodeId);
+
   HLOG(kDebug, "[SendIn] Task {} to {} replicas", origin_task->task_id_,
        num_replicas);
 
@@ -217,21 +261,44 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
         HLOG(kWarning,
              "[SendIn] Task {} target node {} is dead, net_timeout=0 -> skip",
              origin_task->task_id_, target_node_id);
-        origin_task->CompletedReplicas()++;
+        // Issue #856: if this skip is the LAST replica to be accounted (every
+        // other replica already responded), nobody else will ever observe
+        // completed == size — the origin would never complete and its awaiting
+        // client/fiber parks forever (the 15-minute leader-election step
+        // timeout). Check for completion here like every other counting path.
+        // Reaching size mid-loop is only possible when every replica has
+        // already contributed, so no later iteration touches Subtasks() after
+        // RecvOutCompleteOriginTask clears it.
+        clio::run::u32 completed =
+            origin_task->CompletedReplicas().fetch_add(1) + 1;
+        if (completed == origin_task->Subtasks().size()) {
+          RecvOutCompleteOriginTask(send_map_key, origin_task);
+        }
         continue;
       }
       HLOG(kWarning,
            "[SendIn] Task {} target node {} is dead, queuing for retry",
            origin_task->task_id_, target_node_id);
+      replica_targets[i] = target_node_id;
       std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
       send_in_retry_.push_back(
           {task_copy, target_node_id, std::chrono::steady_clock::now()});
       continue;
     }
 
+    replica_targets[i] = target_node_id;
     SendInTransmitReplica(ipc_manager, task_copy,
                           target_node_id, origin_task);
   }
+
+  // Register EVERY origin: progress_map_ is the authoritative record of which
+  // node each replica was dispatched to, and the dead-node sweep
+  // (ScanSendMapTimeouts) needs it for all routing modes. Admin-pool origins
+  // are registered but NOT probe-eligible: QueryTaskProgress is itself an
+  // admin cross-node task, so probing them would recurse (issue #896).
+  RegisterOriginProgress(send_map_key, replica_targets,
+                         /*probe_eligible=*/
+                         !(origin_task->pool_id_ == clio::run::kAdminPoolId));
 }
 
 // =============================================================================
@@ -261,7 +328,12 @@ int IpcManagerRun2Run::SendOutTransmit(
     }
   }
   if (lbm_transport == nullptr) {
-    lbm_transport = ipc_manager->GetOrCreateClient(target_host->ip_address, port);
+    // Responses ride a DEDICATED connection (lane "resp"), never the bulk
+    // SendIn DEALER: a metadata-only ack queuing behind a 1 MiB task frame
+    // on the shared socket mutex was measured at ~1.2 ms per response —
+    // the dominant term in cross-node round-trip latency (issue #892).
+    lbm_transport =
+        ipc_manager->GetOrCreateClient(target_host->ip_address, port, "resp");
   }
 
   if (lbm_transport == nullptr) {
@@ -275,10 +347,17 @@ int IpcManagerRun2Run::SendOutTransmit(
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeOut, lbm_transport);
+  const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(origin_task->method_, archive, origin_task);
+  const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
+  if (nettrace::On()) {
+    nettrace::sendout_ser_ns += nt1 - nt0;
+    nettrace::sendout_tx_ns += nettrace::NowNs() - nt1;
+    ++nettrace::sendout_n;
+  }
 
   if (rc != 0) {
     HLOG(kWarning, "[SendOut] Task {} Lightbeam Send rc={} — re-queueing",
@@ -356,6 +435,26 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     const clio::run::TaskInfo &task_info,
     clio::run::LoadTaskArchive &archive,
     ctp::lbm::Transport *lbm_transport) {
+  // Receipt is proof of life (issue #774): a task arriving from a node we had
+  // SWIM-marked dead proves it is alive NOW. Without this, a one-sided death
+  // verdict is TERMINAL: our revival probes to the "dead" node are themselves
+  // gated on IsAlive (SendIn queues them for retry, never sends), and nothing
+  // else clears the flag — meanwhile every response we owe that node (data,
+  // probe ACKs, heartbeat replies) parks in send_out_retry_ until the 30s
+  // drop. Observed live: node 2 held node 1 "dead" indefinitely while
+  // ingesting node 1's healthy probe traffic the whole time, wedging the
+  // entire remote half of the workload.
+  {
+    clio::run::u64 sender = task_info.task_id_.node_id_;
+    auto *im = CLIO_IPC;
+    if (im != nullptr && sender != im->GetNodeId() && !im->IsAlive(sender)) {
+      HLOG(kWarning,
+           "[RecvIn] node {} was marked dead but just sent us a task — "
+           "reviving it (receipt is proof of life)",
+           sender);
+      im->SetAlive(sender);
+    }
+  }
   auto container =
       pool_manager->GetStaticContainer(task_info.pool_id_).get();
   if (!container) {
@@ -372,6 +471,14 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   }
 
   clio::run::u64 sender_node = task_ptr->pool_query_.GetReturnNode();
+  // Bytes from a peer are proof it is alive (issue #856). SWIM's probes ride
+  // ordinary admin tasks, so a merely STARVED node can miss its probe window
+  // and get declared dead — destructively, since recovery then redistributes a
+  // live node's containers. Record the evidence; the suspicion-timeout check
+  // consults it before promoting kSuspected -> kDead.
+  if (sender_node != ipc_manager->GetNodeId()) {
+    ipc_manager->NoteInbound(sender_node);
+  }
   if (sender_node != ipc_manager->GetNodeId() &&
       ipc_manager->GetNodeState(sender_node) == clio::run::NodeState::kDead) {
     HLOG(kInfo, "[RecvIn] Received task from dead node {}, marking alive",
@@ -423,8 +530,9 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   task_ptr->SetRouted();
 
   if (ipc_manager->GetScheduler() != nullptr) {
-    clio::run::u32 lane_id =
-        ipc_manager->GetScheduler()->ClientMapTask(ipc_manager, future);
+    // issue #781: ClientMapTask removed. Deposit on the shared ingress lane (0);
+    // the runtime maps to a worker via RuntimeMapTask.
+    clio::run::u32 lane_id = 0;
     auto *worker_queues = ipc_manager->GetTaskQueue();
     if (worker_queues) {
       auto &dest_lane = worker_queues->GetLane(lane_id, 0);
@@ -550,9 +658,38 @@ int IpcManagerRun2Run::RecvOutAggregate(
            origin_task->pool_id_);
       continue;
     }
+    // Contract guard (issue #915). AggregateOut merges a REPLICA's OUT fields
+    // into the origin; it must never touch the origin's IDENTITY. Tasks that
+    // implement it by delegating to Copy() — a whole-task assignment — run
+    // Task::Copy and overwrite task_id_/pool_query_/completer_ with the
+    // replica's while send_map_ and the completion path still reference the
+    // origin, and re-assign IN shm strings across segments. That corrupted the
+    // runtime in production (#856) and ~26 such implementations still exist in
+    // tasks that are currently only routed single-replica. This catches any of
+    // them the instant someone routes that task multi-replica, naming the
+    // method, instead of letting it corrupt memory silently.
+    const clio::run::TaskId id_before = origin_task->task_id_;
     container->AggregateOut(origin_task->method_, origin_task, replica);
+    if (!(origin_task->task_id_ == id_before)) {
+      HLOG(kError,
+           "[AggregateOut CONTRACT VIOLATION] pool={} method={}: the origin's "
+           "task_id_ changed during aggregation ({} -> {}). This task's "
+           "AggregateOut is copying the whole replica (almost certainly "
+           "`Copy(other_base...)`) instead of merging OUT fields only. See "
+           "issue #915. Restoring the origin's identity to avoid corruption.",
+           origin_task->pool_id_, origin_task->method_, id_before,
+           origin_task->task_id_);
+      origin_task->task_id_ = id_before;
+    }
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
+
+    // Count toward completion only if this replica was not already accounted
+    // for by the #628 progress scan (a Gone verdict that raced this response);
+    // untracked (admin) origins always count, preserving prior behaviour.
+    if (!MarkReplicaAccounted(net_key, replica_id)) {
+      continue;
+    }
 
     clio::run::u32 completed =
         origin_task->CompletedReplicas().fetch_add(1) + 1;
@@ -564,13 +701,35 @@ int IpcManagerRun2Run::RecvOutAggregate(
   return 0;
 }
 
+bool IpcManagerRun2Run::ClaimOrigin(size_t net_key) {
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  bool present = (send_map_.find(net_key) != nullptr);
+  if (present) {
+    send_map_.erase(net_key);
+  }
+  progress_map_.erase(net_key);  // #628: drop task-progress tracking
+  return present;
+}
+
 void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     size_t net_key,
     clio::run::shared_ptr<clio::run::Task> origin_task) {
   auto *ipc_manager = CLIO_IPC;
 
+  // Exactly-once (issue #856): completion is legal only for the path that
+  // erases the origin from send_map_. If the dead-node timeout scan (or any
+  // other completer) got here first, this origin is already finalized —
+  // touching it again would EndTask a task whose first completion freed its
+  // RunContext.
+  if (!ClaimOrigin(net_key)) {
+    return;
+  }
+
+  // The origin task is about to be completed through EndTask, which calls the
+  // module's UpdateWork on its ExecContainer — so this must resolve to the real
+  // local container, not the pool's model-only static container (issue #956).
   clio::run::DynamicContainer container =
-      CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
+      CLIO_POOL_MANAGER->GetRealOrStaticContainer(origin_task->pool_id_);
   if (container) {
     origin_task->ExecContainer() = container;
   }
@@ -581,11 +740,6 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
   // Clearing the vector drops the last shared_ptr owner of each replica subtask,
   // freeing them via RAII (replaces the former per-subtask DelTask).
   origin_task->Subtasks().clear();
-
-  {
-    std::lock_guard<std::mutex> lk(send_map_mutex_);
-    send_map_.erase(net_key);
-  }
 
   auto *worker = CLIO_CUR_WORKER;
   if (worker == nullptr) {
@@ -598,6 +752,120 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     HLOG(kError,
          "[RecvOut] No worker available to call EndTask for task {}",
          origin_task->task_id_);
+  }
+}
+
+// =============================================================================
+// Cross-node task-progress tracking (issue #628)
+// =============================================================================
+
+void IpcManagerRun2Run::RegisterOriginProgress(
+    size_t net_key, const std::vector<clio::run::u64> &replica_targets,
+    bool probe_eligible) {
+  OriginProgress prog;
+  prog.enqueue_time = std::chrono::steady_clock::now();
+  prog.probe_eligible = probe_eligible;
+  prog.replicas.resize(replica_targets.size());
+  for (size_t i = 0; i < replica_targets.size(); ++i) {
+    prog.replicas[i].target_node_id = replica_targets[i];
+    // A replica never dispatched to a node has nothing to wait on -> accounted,
+    // so the scan skips it and it never blocks completion.
+    prog.replicas[i].accounted = (replica_targets[i] == kInvalidNodeId);
+  }
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  progress_map_[net_key] = std::move(prog);
+}
+
+bool IpcManagerRun2Run::MarkReplicaAccounted(size_t net_key,
+                                             clio::run::u32 replica_id) {
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  auto it = progress_map_.find(net_key);
+  if (it == progress_map_.end()) {
+    return true;  // untracked (admin) origin -> caller counts unconditionally
+  }
+  if (replica_id >= it->second.replicas.size()) {
+    return true;  // defensive: out-of-range, don't suppress the count
+  }
+  if (it->second.replicas[replica_id].accounted) {
+    return false;  // already accounted -> caller must not double-count
+  }
+  it->second.replicas[replica_id].accounted = true;
+  return true;
+}
+
+std::vector<StuckReplica> IpcManagerRun2Run::CollectStuckReplicas(
+    clio::run::u32 interval_ms) {
+  std::vector<StuckReplica> stuck;
+  if (interval_ms == 0) {
+    return stuck;  // periodic validity check disabled
+  }
+  auto *ipc_manager = CLIO_IPC;
+  auto now = std::chrono::steady_clock::now();
+  auto interval = std::chrono::milliseconds(interval_ms);
+
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  // Throttle: run a scan pass at most once per interval.
+  if (last_progress_scan_.time_since_epoch().count() != 0 &&
+      now - last_progress_scan_ < interval) {
+    return stuck;
+  }
+  last_progress_scan_ = now;
+
+  for (auto &kv : progress_map_) {
+    OriginProgress &prog = kv.second;
+    if (!prog.probe_eligible) {
+      continue;  // admin origin: probing it would recurse (issue #896)
+    }
+    if (now - prog.enqueue_time < interval) {
+      continue;  // give the task at least one interval before probing
+    }
+    for (clio::run::u32 rid = 0; rid < prog.replicas.size(); ++rid) {
+      ReplicaProgress &rp = prog.replicas[rid];
+      if (rp.accounted || rp.target_node_id == kInvalidNodeId) {
+        continue;
+      }
+      // A dead target is handled by the dead-node timeout path; only probe
+      // nodes that are (still / again) alive.
+      if (!ipc_manager->IsAlive(rp.target_node_id)) {
+        continue;
+      }
+      stuck.push_back({static_cast<clio::run::u64>(kv.first), rid,
+                       rp.target_node_id});
+    }
+  }
+  return stuck;
+}
+
+void IpcManagerRun2Run::HandleTaskProgressResult(clio::run::u64 net_key,
+                                                 clio::run::u32 replica_id,
+                                                 bool gone) {
+  if (!gone) {
+    return;  // still running on its node -> keep waiting
+  }
+  // Claim the accounting transition; bail if a real response already took it.
+  if (!MarkReplicaAccounted(static_cast<size_t>(net_key), replica_id)) {
+    return;
+  }
+  clio::run::shared_ptr<clio::run::Task> origin_task;
+  {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    auto sit = send_map_.find(static_cast<size_t>(net_key));
+    if (sit == nullptr) {
+      return;  // origin already completed/erased
+    }
+    origin_task = *sit;
+  }
+  HLOG(kWarning,
+       "[TaskProgress] replica {} of task {} is Gone on its node; completing "
+       "origin with network-timeout RC (#628)",
+       replica_id, origin_task->task_id_);
+  // Preserve partial results already aggregated from replicas that answered;
+  // signal the shortfall with a network-timeout RC.
+  origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+  clio::run::u32 completed =
+      origin_task->CompletedReplicas().fetch_add(1) + 1;
+  if (completed == origin_task->Subtasks().size()) {
+    RecvOutCompleteOriginTask(static_cast<size_t>(net_key), origin_task);
   }
 }
 
@@ -691,6 +959,11 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
 
   std::unique_lock<std::mutex> _rqlk(retry_queues_mutex_);
 
+  // Replicas whose delivery timed out; their ORIGIN tasks must be failed after
+  // the lock is dropped (HandleTaskProgressResult takes send_map_mutex_ and can
+  // complete the origin via EndTask — neither belongs under retry_queues_mutex_).
+  std::vector<std::pair<clio::run::u64, clio::run::u32>> send_in_failures;
+
   for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
     float task_timeout = kRun2RunRetryTimeoutSec;
@@ -702,7 +975,18 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
     if (elapsed >= task_timeout) {
       HLOG(kError, "[RetryQueue] SendIn task timed out after {}s for node {}",
            elapsed, it->target_node_id);
-      it->task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+      // Do NOT just drop the entry: the replica copy's return code is invisible
+      // to anyone, the origin task stays in send_map_ with this replica
+      // unaccounted, and the client's Future::Wait() hangs FOREVER (issue #774
+      // — the gray-scott L=512 writers parked at output 1: a receiver that
+      // grinds >30s under large-payload load looks exactly like an
+      // undeliverable peer). Account the replica as gone via the #628 path so
+      // the origin completes with kRun2RunNetworkTimeoutRC — the client gets a
+      // retryable ERROR instead of an infinite hang. (The task_id_ of the
+      // retry entry's copy carries net_key = send_map key and its replica_id.)
+      send_in_failures.emplace_back(
+          static_cast<clio::run::u64>(it->task->task_id_.net_key_),
+          it->task->task_id_.replica_id_);
       it = send_in_retry_.erase(it);
     } else if (ipc_manager->IsAlive(it->target_node_id)) {
       if (RetrySendToNode(*it, it->target_node_id)) {
@@ -729,6 +1013,16 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
       }
       ++it;
     }
+  }
+
+  // Fail the origins of timed-out SendIn replicas outside the retry lock
+  // (mirrors the unlock dance the SendOut retry below already uses).
+  if (!send_in_failures.empty()) {
+    _rqlk.unlock();
+    for (const auto &f : send_in_failures) {
+      HandleTaskProgressResult(f.first, f.second, /*gone=*/true);
+    }
+    _rqlk.lock();
   }
 
   for (auto it = send_out_retry_.begin(); it != send_out_retry_.end();) {
@@ -774,59 +1068,71 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
     dead_map[entry.node_id] = entry.detected_at;
   }
 
-  std::vector<std::pair<size_t, clio::run::shared_ptr<clio::run::Task>>> to_complete;
+  // Drive off progress_map_, NOT the origin's pool queries (issue #896). The
+  // queries record ROUTING INTENT, and only Physical mode names a node — a
+  // Dynamic or Broadcast task is resolved to DirectId/Range queries whose
+  // node is looked up from the container map at dispatch time. Scanning only
+  // Physical queries therefore missed every replica of the common routing
+  // modes: CollectStuckReplicas skips dead targets ("handled by the dead-node
+  // timeout path") and this scan skipped non-Physical replicas, so NOBODY
+  // completed the origin and its client parked forever (the 15-minute
+  // leader-election step timeout: a post-failover Dynamic CreatePool whose
+  // DirectId replica pointed at the killed leader). progress_map_ holds the
+  // node each replica was ACTUALLY dispatched to, for every mode.
+  struct DeadReplica {
+    size_t net_key;
+    clio::run::u32 replica_id;
+    clio::run::u64 node_id;
+  };
+  std::vector<DeadReplica> to_fail;
   {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
-    send_map_.for_each(
-        [&](const size_t &key, clio::run::shared_ptr<clio::run::Task> &origin_task) {
-          if (origin_task.IsNull()) {
-            return;
-          }
+    for (auto &kv : progress_map_) {
+      auto sit = send_map_.find(kv.first);
+      if (sit == nullptr || (*sit).IsNull()) {
+        continue;  // origin already completed/erased
+      }
+      clio::run::shared_ptr<clio::run::Task> &origin_task = *sit;
 
-          float task_timeout = kRun2RunRetryTimeoutSec;
-          float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
-          if (task_net_timeout >= 0) {
-            task_timeout = task_net_timeout;
-          }
+      float task_timeout = kRun2RunRetryTimeoutSec;
+      float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
+      if (task_net_timeout >= 0) {
+        task_timeout = task_net_timeout;
+      }
 
-          bool any_timed_out = false;
-          for (const auto &pq : origin_task->PoolQueries()) {
-            if (!pq.IsPhysicalMode()) {
-              continue;
-            }
-            auto dit = dead_map.find(pq.GetNodeId());
-            if (dit == dead_map.end()) {
-              continue;
-            }
-            float dead_elapsed =
-                std::chrono::duration<float>(now - dit->second).count();
-            if (dead_elapsed >= task_timeout) {
-              any_timed_out = true;
-              break;
-            }
-          }
-
-          if (any_timed_out) {
-            to_complete.emplace_back(key, origin_task);
-          }
-        });
-  }
-
-  for (auto &entry : to_complete) {
-    auto &origin_task = entry.second;
-    HLOG(kError,
-         "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
-         origin_task->task_id_);
-    origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
-    auto *worker = CLIO_CUR_WORKER;
-    worker->EndTask(origin_task, true);
-  }
-
-  if (!to_complete.empty()) {
-    std::lock_guard<std::mutex> lk(send_map_mutex_);
-    for (auto &entry : to_complete) {
-      send_map_.erase(entry.first);
+      OriginProgress &prog = kv.second;
+      for (clio::run::u32 rid = 0; rid < prog.replicas.size(); ++rid) {
+        ReplicaProgress &rp = prog.replicas[rid];
+        if (rp.accounted || rp.target_node_id == kInvalidNodeId) {
+          continue;
+        }
+        auto dit = dead_map.find(rp.target_node_id);
+        if (dit == dead_map.end()) {
+          continue;  // target still alive: the probe path owns it
+        }
+        float dead_elapsed =
+            std::chrono::duration<float>(now - dit->second).count();
+        if (dead_elapsed >= task_timeout) {
+          to_fail.push_back({kv.first, rid, rp.target_node_id});
+        }
+      }
     }
+  }
+
+  for (const auto &dr : to_fail) {
+    HLOG(kError,
+         "[ScanSendMapTimeouts] replica {} of net_key {} timed out waiting "
+         "for dead node {}; completing with network-timeout RC",
+         dr.replica_id, dr.net_key, dr.node_id);
+    // Exactly-once (issue #856): HandleTaskProgressResult claims the
+    // accounting transition (MarkReplicaAccounted) before counting, and the
+    // final count funnels through RecvOutCompleteOriginTask, whose
+    // ClaimOrigin() erases the send_map_ entry BEFORE completing. A late
+    // replica response therefore cannot aggregate into an already-completed
+    // task and complete it a second time (the double-EndTask heap corruption
+    // behind the earlier leader-election crashes).
+    HandleTaskProgressResult(static_cast<clio::run::u64>(dr.net_key),
+                             dr.replica_id, /*gone=*/true);
   }
 }
 
@@ -835,6 +1141,12 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
 // =============================================================================
 
 void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
+  // Origins whose flushed retry was the last unaccounted replica; completed
+  // OUTSIDE retry_queues_mutex_ (EndTask is heavyweight and must not run
+  // under the retry lock).
+  std::vector<std::pair<size_t, clio::run::shared_ptr<clio::run::Task>>>
+      to_complete;
+  {
   std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
 
   for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
@@ -852,7 +1164,13 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
       }
     }
     if (!origin.IsNull()) {
-      origin->CompletedReplicas()++;
+      // Issue #856: same last-replica rule as the SendIn dead-skip — if this
+      // flush accounts the final replica, the origin must complete here or it
+      // never will.
+      clio::run::u32 completed = origin->CompletedReplicas().fetch_add(1) + 1;
+      if (completed == origin->Subtasks().size()) {
+        to_complete.emplace_back(net_key, origin);
+      }
     }
     HLOG(kInfo,
          "[FlushStale] Discarding SendIn retry for restarted node {}",
@@ -869,6 +1187,11 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
          "[FlushStale] Discarding SendOut retry for restarted node {}",
          node_id);
     it = send_out_retry_.erase(it);
+  }
+  }  // release retry_queues_mutex_ before completing origins
+
+  for (auto &entry : to_complete) {
+    RecvOutCompleteOriginTask(entry.first, entry.second);
   }
 }
 
@@ -915,6 +1238,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
       bool drained_any = false;
       while (!recv_shutdown_.load(std::memory_order_acquire)) {
         clio::run::LoadTaskArchive archive;
+        const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
         auto info = lbm_transport->Recv(archive);
         int rc = info.rc;
         if (rc != 0) {
@@ -926,14 +1250,24 @@ void IpcManagerRun2Run::StartRecvThreads() {
           }
           break;
         }
+        const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
+        if (nettrace::On()) nettrace::recv_ns += nt1 - nt0;
         drained_any = true;
         clio::run::MsgType msg_type = archive.GetMsgType();
         switch (msg_type) {
           case clio::run::MsgType::kSerializeIn:
             RecvIn(archive, lbm_transport);
+            if (nettrace::On()) {
+              nettrace::recvin_ns += nettrace::NowNs() - nt1;
+              nettrace::Dump("recv", ++nettrace::recv_n);
+            }
             break;
           case clio::run::MsgType::kSerializeOut:
             RecvOut(archive, lbm_transport);
+            if (nettrace::On()) {
+              nettrace::recvout_ns += nettrace::NowNs() - nt1;
+              nettrace::Dump("recv", ++nettrace::recv_n);
+            }
             break;
           case clio::run::MsgType::kHeartbeat:
             break;

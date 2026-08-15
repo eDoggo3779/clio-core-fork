@@ -39,12 +39,19 @@
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <zmq.h>
+#include <limits>
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <thread>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -58,6 +65,7 @@
 #include "clio_runtime/container.h"
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/pool_manager.h"
+#include "clio_runtime/runtime_pid_record.h"
 #include "clio_runtime/scheduler/scheduler_factory.h"
 #include "clio_runtime/task_archives.h"
 
@@ -138,13 +146,63 @@ inline std::string LocalZmqIpcPath(u32 port) {
 
 // Constructor and destructor removed - handled by CTP singleton pattern
 
+// Auto-select the fastest client IPC transport that is actually usable, when
+// CLIO_IPC_MODE is unset. Probe order (fastest first, issue #768):
+//
+//   1. SHM  -- a same-host runtime always creates its main shared segment
+//              (ServerInitShm is unconditional), so the segment existing means
+//              a local server is up and the shared-memory data path is usable.
+//   2. IPC  -- a unix-domain (AF_UNIX) socket the server bound for the local
+//              control path; only present when the server itself runs in IPC
+//              mode (or on macOS, issue #482). Probed by the socket file.
+//   3. TCP  -- always available; the cross-host and last-resort fallback.
+//
+// The probes are cheap and side-effect free (an open/close on the segment
+// handle; a filesystem stat on the socket path). An explicit CLIO_IPC_MODE
+// bypasses this entirely.
+IpcMode IpcManager::SelectBestIpcMode() {
+  ConfigManager *config = CLIO_CONFIG_MANAGER;
+
+  // 1. SHM: is the server's main segment present on this host?
+  if (config) {
+    std::string main_seg = config->GetSharedMemorySegmentName(kMainSegment);
+    if (ctp::SystemInfo::SharedMemoryExists(main_seg)) {
+      HLOG(kDebug, "SelectBestIpcMode: SHM segment '{}' present -> SHM",
+           main_seg);
+      return IpcMode::kShm;
+    }
+    HLOG(kDebug, "SelectBestIpcMode: SHM segment '{}' absent", main_seg);
+  }
+
+  // 2. IPC: did the server bind a local unix-domain socket?
+  u32 port = GetEffectivePort();
+  std::string ipc_path =
+      ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) + ".ipc");
+  std::error_code ec;
+  if (std::filesystem::exists(ipc_path, ec) && !ec) {
+    HLOG(kDebug, "SelectBestIpcMode: IPC socket '{}' present -> IPC", ipc_path);
+    return IpcMode::kIpc;
+  }
+  HLOG(kDebug, "SelectBestIpcMode: IPC socket '{}' absent", ipc_path);
+
+  // 3. TCP: always available.
+  HLOG(kDebug, "SelectBestIpcMode: falling back to TCP");
+  return IpcMode::kTcp;
+}
+
 bool IpcManager::ClientInit() {
   HLOG(kDebug, "IpcManager::ClientInit");
   if (is_initialized_) {
     return true;
   }
+  // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
+  ctp::SystemInfo::RequestTimerResolutionFromEnv();
 
-  // Parse CLIO_IPC_MODE environment variable (default: TCP).
+  // Resolve the client IPC mode. An explicit CLIO_IPC_MODE forces that exact
+  // transport (no probing); when unset, auto-select the fastest path that is
+  // actually available. On this host a same-host SHM round-trip is ~190x
+  // faster than TCP and ~5x faster than the unix-socket path (issue #768), so
+  // defaulting to TCP left the slowest transport as the default.
   if (const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE")) {
     std::string mode_str(ipc_mode_env);
     if (mode_str == "SHM" || mode_str == "shm") {
@@ -152,13 +210,19 @@ bool IpcManager::ClientInit() {
     } else if (mode_str == "IPC" || mode_str == "ipc") {
       ipc_mode_ = IpcMode::kIpc;
     } else {
-      ipc_mode_ = IpcMode::kTcp;  // Default
+      ipc_mode_ = IpcMode::kTcp;
     }
+    HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {} (from CLIO_IPC_MODE)",
+         ipc_mode_ == IpcMode::kShm   ? "SHM"
+         : ipc_mode_ == IpcMode::kIpc ? "IPC"
+                                      : "TCP");
+  } else {
+    ipc_mode_ = SelectBestIpcMode();
+    HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {} (auto-selected)",
+         ipc_mode_ == IpcMode::kShm   ? "SHM"
+         : ipc_mode_ == IpcMode::kIpc ? "IPC"
+                                      : "TCP");
   }
-  HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {}",
-       ipc_mode_ == IpcMode::kShm   ? "SHM"
-       : ipc_mode_ == IpcMode::kIpc ? "IPC"
-                                    : "TCP");
 
   // Parse retry timeout environment variable
   // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
@@ -336,6 +400,13 @@ bool IpcManager::ClientInit() {
         "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
     shm_recv_transport_ = ctp::lbm::TransportFactory::Get(
         "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kServer);
+
+    // Start the dedicated SHM response recv thread: it drains shm_out_server_
+    // and wakes waiters (the SHM analogue of zmq_recv_thread_). App threads now
+    // block on their EventManager in RecvOut instead of polling a per-thread
+    // ring, so this thread MUST be running before any response can land.
+    shm_recv_running_.store(true);
+    shm_recv_thread_ = std::thread([this]() { RecvShmClientThread(); });
   }
 
   // Default host until identified
@@ -358,6 +429,8 @@ bool IpcManager::ClientInit() {
 }
 
 bool IpcManager::ServerInit() {
+  // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
+  ctp::SystemInfo::RequestTimerResolutionFromEnv();
   if (is_initialized_) {
     return true;
   }
@@ -395,6 +468,17 @@ bool IpcManager::ServerInit() {
   // Initialize memory segments for server
   if (!ServerInitShm()) {
     return false;
+  }
+
+  // Publish this runtime's pid as soon as its segments exist, and withdraw it
+  // in UnlinkOwnArtifacts when they go: the record's lifetime brackets the
+  // segments' exactly like the /proc/<pid>/fd symlink Linux memfds carry. It
+  // is what `clio_run stop`/`status` fall back to on platforms whose segments
+  // are plain files naming no owner (macOS/BSD) — including against a runtime
+  // that wedges partway through this ServerInit.
+  if (ConfigManager *config = CLIO_CONFIG_MANAGER) {
+    WriteRuntimePidRecord(config->GetPort(),
+                          static_cast<int>(ctp::SystemInfo::GetPid()));
   }
 
   // Initialize priority queues
@@ -547,6 +631,23 @@ void IpcManager::ClientFinalize() {
     }
   }
 
+  // Stop the SHM response recv thread and tear down the response ring. Join
+  // BEFORE Shutdown so the thread cannot touch a detached segment.
+#if CTP_IS_HOST
+  if (shm_recv_running_.load()) {
+    shm_recv_running_.store(false);
+    // Wake it if parked so the join is prompt (see StopShmServerRecvThread).
+    shm_out_server_.SignalConsumerIfParked();
+    if (shm_recv_thread_.joinable()) {
+      shm_recv_thread_.join();
+    }
+  }
+  if (shm_out_server_ok_) {
+    shm_out_server_.Shutdown();  // unmap + unlink "clio-<pid>-shm-out"
+    shm_out_server_ok_ = false;
+  }
+#endif
+
   // Clean up lightbeam transport objects. The recv thread that reads the
   // response listener is already stopped above, so closing it here is safe.
   // NOTE (Windows): the listener is a ROUTER on the shared ZMQ context; at
@@ -559,7 +660,11 @@ void IpcManager::ClientFinalize() {
   ClearClientPool();
   zmq_transport_.reset();
 
-  // Clients should not destroy shared resources
+  // Clients must not destroy SHARED resources (the runtime's segments), but
+  // they should remove their OWN memfd-dir entries (per-thread MPSC receive
+  // segments, on-demand data segments) so short-lived clients don't pile up
+  // dead symlinks that only the next runtime start would reap.
+  UnlinkOwnPidEntries();
 }
 
 void IpcManager::RegisterTransportShutdownHook(std::function<void()> hook) {
@@ -619,8 +724,36 @@ void IpcManager::ServerFinalize() {
   // no-ops in that case.
   ClearTransports();
 
+  // Tear down the single inbound SHM ring. Join its recv thread FIRST so it
+  // cannot touch a detached segment (or push onto lanes whose workers are
+  // already stopped). The admin ChiMod also stops it via a transport-shutdown
+  // hook on the normal path; both call sites are idempotent.
+#if CTP_IS_HOST
+  StopShmServerRecvThread();
+  if (shm_in_server_ok_) {
+    for (auto &ring : shm_in_servers_) {
+      if (ring) ring->Shutdown();  // unmap + unlink clio-<pid>-shm-in-<k>
+    }
+    shm_in_servers_.clear();
+    shm_in_server_ok_ = false;
+  }
+#endif
+
   // Clear main allocator pointer
   main_allocator_ = nullptr;
+  // issue #783: metadata segment is runtime-owned; clients only detach.
+  metadata_allocator_ = nullptr;
+
+  // Leak scan while the SHM segments are still mapped (alloc_vector_ is not
+  // cleared here). This is the reliable trigger for the IpcManager leak scan:
+  // the CLIO_IPC global is intentionally leaked, so ~IpcManager rarely runs.
+  // No-op unless built with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
+  ReportRuntimeLeaks("ServerFinalize");
+
+  // Remove this runtime's directory entries (main/queue segment symlinks,
+  // control sockets) so a clean stop leaves the per-user memfd dir empty.
+  // Unlink-only: the segments stay mapped for the leaked singletons above.
+  UnlinkOwnArtifacts();
 
   is_initialized_ = false;
 }
@@ -645,29 +778,33 @@ void IpcManager::SetNumSchedQueues(u32 num_sched_queues) {
   HLOG(kInfo, "IpcManager: Updated num_sched_queues to {}", num_sched_queues);
 }
 
-void IpcManager::AwakenWorker(TaskLane *lane) {
+void IpcManager::AwakenWorker(TaskLane *lane, bool force) {
   if (!lane) {
-    HLOG(kWarning, "AwakenWorker: lane is null");
+    // No lane to target — wake every worker so a task parked with no resolvable
+    // owning lane is still re-checked (lost-wakeup safety net).
+    HLOG(kWarning, "AwakenWorker: lane is null; waking all workers");
+    CLIO_WORK_ORCHESTRATOR->AwakenAllWorkers();
     return;
   }
 
-  // ALWAYS send SIGUSR1, never skip on active_=true. Past attempts to
-  // gate this on the park-flag tripped a lost-wakeup race at scale (4n
-  // 256m FPP) where the producer observed active_=true, skipped the
-  // signal, and the worker then stored active_=false and entered
-  // epoll_pwait2 before noticing the just-pushed task. The
-  // post-store-recheck handshake in Worker::SuspendMe is supposed to
-  // catch this but doesn't fire reliably under heavy multi-tier
-  // scheduling pressure. Skipping the tgkill saved a syscall; the
-  // observed cost was hangs that never recovered. The extra signal is
-  // absorbed harmlessly by signalfd — at worst the worker wakes one
-  // extra time and re-checks its (empty) queue. Worth it.
-
+  // Signal ONLY a PARKED worker. The caller has already pushed to `lane` (or to
+  // the event queue whose owner runs on this lane); the seq_cst fence here plus
+  // Worker::SuspendMe's seq_cst SetActive(false)+fence form a Dekker StoreLoad,
+  // so a running worker that we skip is GUARANTEED to observe the just-pushed
+  // task in its post-park re-check and not park. That closes the lost-wakeup the
+  // earlier gated attempt hit; and even a hypothetical residual miss self-heals
+  // within the worker's max_sleep cap (<=50ms) rather than hanging forever (that
+  // cap did not exist when the earlier attempt was reverted). On small requests
+  // this removes the per-op tgkill that made SHM lose to Redis's pipelined TCP.
   int tid = lane->GetTid();
   if (tid > 0) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!force && lane->IsActive()) {
+      return;  // worker is polling; it will drain this task without a wake
+    }
     int runtime_pid = runtime_pid_ ? runtime_pid_ : ctp::SystemInfo::GetPid();
 
-    // Send SIGUSR1 to the worker thread in the runtime process
+    // Send SIGUSR1 to the (parked) worker thread in the runtime process
     int result = ctp::lbm::EventManager::Signal(runtime_pid, tid);
     if (result != 0) {
       HLOG(kError,
@@ -676,18 +813,26 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
            runtime_pid, tid, lane->IsActive(), errno);
     }
   } else {
-    HLOG(kWarning, "AwakenWorker: tid={} (invalid), cannot send signal", tid);
+    // The target lane has no worker tid (only a worker's OWN assigned_lane_
+    // ever gets a tid, so a task parked on any secondary lane reads tid==0).
+    // A targeted signal is impossible, but some worker DOES own this task's
+    // event queue, so wake them all and let the owner re-check and resume the
+    // parked parent. This closes a lost-wakeup that hung sustained O_APPEND
+    // writes (#680 generic/069): a completed PutBlob subtask emplaced its
+    // result on the parent WriteTask's event queue but could not signal, so
+    // the parent slept forever while all workers idled in epoll.
+    CLIO_WORK_ORCHESTRATOR->AwakenAllWorkers();
   }
 }
 
 IpcManagerTls *IpcManager::GetTls() {
   // One-time key registration (double-checked under the mutex). The key is
   // process-wide; the per-thread value below is what differs per thread.
-  if (!ipc_tls_key_created_) {
+  if (!ipc_tls_key_created_.load(std::memory_order_acquire)) {
     std::lock_guard<std::mutex> lk(ipc_tls_key_mutex_);
-    if (!ipc_tls_key_created_) {
+    if (!ipc_tls_key_created_.load(std::memory_order_relaxed)) {
       CTP_THREAD_MODEL->CreateTls<IpcManagerTls>(ipc_tls_key_, nullptr);
-      ipc_tls_key_created_ = true;
+      ipc_tls_key_created_.store(true, std::memory_order_release);
     }
   }
   // Lazily allocate this thread's IpcManagerTls. Its EventManager ctor runs on
@@ -716,6 +861,38 @@ ctp::lbm::ShmMpscTransport *IpcManager::GetOrCreateShmConn(
   return raw;
 }
 
+/**
+ * Keep a large shared mapping out of core dumps (Linux MADV_DONTDUMP).
+ *
+ * The runtime shuts down via std::abort() (admin_runtime.cc), so every clean
+ * `clio_run stop` raises SIGABRT and the kernel dumps core wherever cores are
+ * enabled. With a multi-gigabyte metadata segment mapped that dump takes long
+ * enough to blow the 60s shutdown budget in the CLI lifecycle tests
+ * (cr_cli_runtime_command_tests, cr_cli_cte_wal_restart, cr_cli_compose_restart
+ * all failed this way on docker AND ubuntu-arm). It never reproduced locally
+ * because this dev box has `ulimit -c 0`, so no core is written at all.
+ *
+ * The segment is a cache; its contents have no diagnostic value in a core, so
+ * excluding it costs nothing and removes gigabytes of dump work.
+ */
+static void ExcludeFromCoreDump(void *addr, size_t size, const char *what) {
+#if defined(__linux__) && defined(MADV_DONTDUMP)
+  if (addr == nullptr || size == 0) {
+    return;
+  }
+  if (madvise(addr, size, MADV_DONTDUMP) != 0) {
+    HLOG(kWarning, "MADV_DONTDUMP failed for {} ({} bytes): {}", what, size,
+         strerror(errno));
+  } else {
+    HLOG(kInfo, "{}: excluded {} bytes from core dumps", what, size);
+  }
+#else
+  (void)addr;
+  (void)size;
+  (void)what;
+#endif
+}
+
 bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -731,8 +908,47 @@ bool IpcManager::ServerInitShm() {
     std::string main_segment_name =
         config->GetSharedMemorySegmentName(kMainSegment);
 
-    // Use calculated or explicit main_segment_size
+    // Main segment size (issue #727): yaml `runtime: main_segment_size` /
+    // CLIO_MAIN_SEGMENT_SIZE when set, otherwise the auto default
+    // CalculateMainSegmentSize() resolves — the machine's RAM capacity,
+    // mirroring the metadata segment. On Linux the segment is a sparse memfd,
+    // so the exposure is not the reservation but the LIVE SET in
+    // memory-limited containers — and on Windows the whole size is commit
+    // charge up front.
+    //
+    // Both the auto default and explicit values pass the same half-budget
+    // guard the metadata segment uses — beyond that the live set can only end
+    // in SIGBUS/OOM, so clamp instead of booting a time bomb. The RAM-sized
+    // auto default trips it by design (RAM > budget/2 always), landing the
+    // segment at half the cgroup-aware budget.
     size_t main_segment_size = config->CalculateMainSegmentSize();
+    {
+      const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
+      if (budget > 0 && main_segment_size > budget / 2) {
+        HLOG(kWarning,
+             "Main segment: requested {} bytes exceeds half the memory "
+             "budget ({} bytes); clamping to {} bytes",
+             main_segment_size, budget, budget / 2);
+        main_segment_size = budget / 2;
+      }
+
+      // OFF LINUX THE SEGMENT IS NOT SPARSE MEMORY (issues #727/#817):
+      // macOS/BSD back it with a regular file (no memfd) and Windows charges
+      // the whole reservation as commit up front — a RAM-sized request there
+      // is a real cost, exactly what #727 complained about. Keep the
+      // historical 1 GiB cap on those platforms; explicit configuration can
+      // still go smaller.
+#ifndef __linux__
+      constexpr size_t kNonLinuxMainCap = 1024ULL * 1024 * 1024;  // 1 GiB
+      if (main_segment_size > kNonLinuxMainCap) {
+        HLOG(kInfo,
+             "Main segment: not sparse memory on this platform; "
+             "clamping {} bytes to {} bytes",
+             main_segment_size, kNonLinuxMainCap);
+        main_segment_size = kNonLinuxMainCap;
+      }
+#endif
+    }
 
     HLOG(kInfo, "Initializing main shared memory segment: {} bytes ({} MB)",
          main_segment_size, main_segment_size / (1024 * 1024));
@@ -767,12 +983,173 @@ bool IpcManager::ServerInitShm() {
       return false;
     }
 
-    // Reserve segment indices 0-2 of this pid's allocator-id space: index 1 is
-    // the main segment and index 2 is the queue segment (see above). Runtime
-    // data segments created on demand by IncreaseClientShm (for AllocateBuffer
-    // / FutureShm) start at index 3 so their AllocatorId never collides with
-    // main/queue. Clients use a different pid, so they keep starting at 0.
-    shm_count_.store(3, std::memory_order_relaxed);
+    // issue #783: runtime-wide metadata segment (pid.3). Backs the CTE
+    // shared-memory metadata cache. Deliberately NON-FATAL: if it cannot be
+    // created the runtime still starts and every client simply falls back to
+    // the RPC path. That matters because the reservation is huge (the host's
+    // RAM capacity by default) and a constrained host can legitimately refuse it --
+    // losing an optimization is acceptable, failing to boot is not.
+    metadata_allocator_id_ = ctp::ipc::AllocatorId::Get(pid, 3);
+    std::string metadata_segment_name =
+        config->GetSharedMemorySegmentName(kMetadataSegment);
+    size_t metadata_segment_size = config->CalculateMetadataSegmentSize();
+
+    // Sanity-clamp the reservation against the memory this process may
+    // actually use -- which is NOT the same as physical RAM in a container.
+    //
+    // SystemInfo::GetRamCapacity() reads sysinfo().totalram, i.e. the HOST's
+    // memory, and knows nothing about cgroup limits. Inside the docker CI
+    // image that made this reserve half the RUNNER's RAM, several times the
+    // container's own limit, which showed up as daemon lifecycle timeouts
+    // (cr_cli_runtime_command_tests, cr_cli_cte_wal_restart,
+    // cr_cli_compose_restart) in a job that is green on dev. Read the cgroup
+    // limit first and fall back to physical RAM only when there is none.
+    // Sanity-clamp the reservation against physical RAM.
+    //
+    // NOTE ON WHAT BACKS THIS: on Linux these segments are memfd_create()
+    // objects (SystemInfo::CreateNewSharedMemory), NOT files under /dev/shm.
+    // memfd lives in the kernel's internal shmem pool, bounded by RAM+swap and
+    // the memory cgroup -- the /dev/shm mount size is irrelevant here, which is
+    // why a 1 GB main segment works fine on a host whose /dev/shm is 64 MB.
+    // Do not "fix" this by measuring std::filesystem::space("/dev/shm"); that
+    // reads an unrelated filesystem and needlessly shrinks the cache.
+    //
+    // The reservation itself is nearly free because the segment is sparse and
+    // never pre-faulted. The hazard is only the LIVE SET: pages actually
+    // written come out of RAM, and exhausting shmem surfaces as SIGBUS or the
+    // OOM killer rather than a clean allocation failure. Clamping to half of
+    // RAM keeps the default a no-op on real nodes while protecting small
+    // dev boxes and constrained containers.
+    {
+      size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
+      if (budget > 0 && metadata_segment_size > budget / 2) {
+        size_t clamped = budget / 2;
+        HLOG(kWarning,
+             "Metadata segment: requested {} bytes exceeds half the memory "
+             "budget ({} bytes); clamping to {} bytes",
+             metadata_segment_size, budget, clamped);
+        metadata_segment_size = clamped;
+      }
+
+      // OFF LINUX THE SEGMENT IS A FILE, NOT MEMORY (issue #817).
+      // SystemInfo::CreateNewSharedMemory uses memfd_create only on Linux;
+      // macOS/BSD fall back to a regular file under /tmp/clio_$USER (POSIX
+      // shm_open names cap at 31 chars and have no filesystem path, which
+      // breaks the readiness probes). Everything above -- "the reservation is
+      // nearly free because it is sparse and never pre-faulted" -- is a
+      // statement about memfd and RAM, and it is simply not true of a file:
+      // the ftruncate/mmap goes against the DISK, and a multi-GB request on a
+      // CI runner fails outright.
+      //
+      // That is why macOS has no metadata segment at all today, and therefore
+      // no SHM metadata cache (#783) and no clio-fs fast path (#817) -- both
+      // silently degrade to RPC. Ask for something a filesystem will actually
+      // give us there. Still generous: at 560 B per cached blob this holds
+      // ~1.9M entries.
+#ifndef __linux__
+      constexpr size_t kNonLinuxMetadataCap = 1024ULL * 1024 * 1024;  // 1 GB
+      if (metadata_segment_size > kNonLinuxMetadataCap) {
+        HLOG(kInfo,
+             "Metadata segment: file-backed on this platform (no memfd); "
+             "clamping {} bytes to {} bytes",
+             metadata_segment_size, kNonLinuxMetadataCap);
+        metadata_segment_size = kNonLinuxMetadataCap;
+      }
+#endif
+    }
+
+    HLOG(kInfo,
+         "Initializing metadata shared memory segment: {} bytes ({} MB), "
+         "sparse/not pre-faulted",
+         metadata_segment_size, metadata_segment_size / (1024 * 1024));
+    if (metadata_backend_.shm_init(
+            metadata_allocator_id_,
+            ctp::Unit<size_t>::Bytes(metadata_segment_size),
+            metadata_segment_name)) {
+      metadata_allocator_ = metadata_backend_.MakeAlloc<CLIO_TASK_ALLOC_T>();
+    }
+    if (!metadata_allocator_) {
+      HLOG(kWarning,
+           "ServerInitShm: metadata segment '{}' unavailable ({} bytes) -- "
+           "SHM metadata caching disabled, clients will use the RPC path",
+           metadata_segment_name, metadata_segment_size);
+    } else {
+      ExcludeFromCoreDump(metadata_backend_.region_,
+                          metadata_backend_.backend_size_,
+                          "metadata segment");
+      // Publish the directory of well-known roots as the FIRST object in the
+      // segment. Clients learn its offset from ClientConnect, which is what
+      // makes discovery independent of who created a pool first.
+      try {
+        auto dir_fp =
+            metadata_allocator_->template Allocate<MetadataDirectory>(
+                sizeof(MetadataDirectory));
+        if (!dir_fp.IsNull()) {
+          auto *dir = dir_fp.ptr_;
+          std::memset(dir, 0, sizeof(MetadataDirectory));
+          dir->version_ = MetadataDirectory::kVersion;
+          metadata_dir_off_ = static_cast<u64>(
+              reinterpret_cast<char *>(dir) -
+              reinterpret_cast<char *>(metadata_allocator_));
+          HLOG(kInfo, "ServerInitShm: metadata directory at offset {}",
+               metadata_dir_off_);
+        }
+      } catch (const std::exception &e) {
+        HLOG(kWarning, "ServerInitShm: metadata directory alloc failed: {}",
+             e.what());
+      }
+    }
+
+    // Reserve segment indices 0-3 of this pid's allocator-id space: index 1 is
+    // the main segment, index 2 the queue segment, index 3 the metadata
+    // segment (see above). Runtime data segments created on demand by
+    // IncreaseClientShm (for AllocateBuffer / FutureShm) start at index 4 so
+    // their AllocatorId never collides. Clients use a different pid, so they
+    // keep starting at 0.
+    shm_count_.store(4, std::memory_order_relaxed);
+
+#if CTP_IS_HOST
+    // Single inbound MPSC ring shared by every SHM client (replaces the old
+    // per-worker "clio-<pid>-<tid>" servers). Clients SendBytes serialized tasks
+    // here; the dedicated RecvShmServerThread drains it (-> IpcCpu2Cpu::RecvIn)
+    // and fans tasks out to worker lanes, mirroring how the ZMQ path funnels
+    // all inbound client traffic through one dedicated recv thread. Sized
+    // large (~128MB) so bursty async fan-out from many clients rarely blocks a
+    // producer in SendBytes. The name is derived from the runtime pid so a
+    // client can form it from the server_pid_ it learns via ClientConnect.
+    {
+      // issue #807: S parallel inbound rings clio-<pid>-shm-in-<k>, each drained
+      // by its own thread, replacing the single ring. Spreads MPSC-tail
+      // contention and deserialize+route work across cores. Each ring is sized
+      // down proportionally so total inbound SHM stays ~128MB regardless of S.
+      // issue #807: 0 = auto = one shard per worker (default). Worker w owns
+      // shard w, so cap at the worker count — a shard beyond the last worker
+      // would have no consumer and its clients would hang.
+      u32 nworkers = CLIO_CONFIG_MANAGER->GetNumThreads();
+      u32 shards = CLIO_CONFIG_MANAGER->GetShmInShards();
+      if (shards == 0 || shards > nworkers) shards = nworkers;
+      if (shards < 1) shards = 1;
+      shm_in_shards_ = shards;
+      size_t per_ring_mb = std::max<size_t>(8, 128 / shards);
+      shm_in_servers_.clear();
+      shm_in_server_ok_ = true;
+      for (u32 k = 0; k < shards; ++k) {
+        std::string in_name =
+            "clio-" + std::to_string(pid) + "-shm-in-" + std::to_string(k);
+        auto ring = std::make_unique<ctp::lbm::ShmMpscTransport>();
+        if (!ring->ServerInit(in_name,
+                              ctp::Unit<size_t>::Megabytes(per_ring_mb))) {
+          HLOG(kError, "ServerInitShm: failed to create inbound SHM ring '{}'",
+               in_name);
+          shm_in_server_ok_ = false;
+          return false;
+        }
+        shm_in_servers_.push_back(std::move(ring));
+      }
+      HLOG(kInfo, "ServerInitShm: {} inbound SHM ring(s) '{}-shm-in-0..{}' ({}MB each)",
+           shards, "clio-" + std::to_string(pid), shards - 1, per_ring_mb);
+    }
+#endif
 
     return true;
   } catch (const std::exception &e) {
@@ -825,6 +1202,55 @@ bool IpcManager::ClientInitShm() {
     }
     queue_allocator_id_ = queue_allocator_->GetId();
 
+    // issue #783: attach the runtime-wide metadata segment for SHM metadata
+    // caching. BEST-EFFORT -- unlike main/queue, a failure here is not fatal.
+    // The segment is an optimization; a client that cannot attach it just uses
+    // the RPC path. It is also legitimately absent when the runtime chose not
+    // to create it (small /dev/shm), so this must not log at error level.
+    //
+    // Mapped read-write, not PROT_READ: acquiring a lease is a store. Clients
+    // are trusted by convention to write ONLY lock words, never metadata --
+    // the runtime never treats this segment as authoritative, so a
+    // misbehaving client can degrade other clients but cannot corrupt the
+    // runtime's own state.
+    {
+      std::string metadata_segment_name =
+          config->GetSharedMemorySegmentName(kMetadataSegment);
+      if (metadata_backend_.shm_attach(metadata_segment_name)) {
+        metadata_allocator_ = metadata_backend_.AttachAlloc<CLIO_TASK_ALLOC_T>();
+      }
+      if (metadata_allocator_) {
+        metadata_allocator_id_ = metadata_allocator_->GetId();
+        HLOG(kInfo, "ClientInitShm: attached metadata segment '{}'",
+             metadata_segment_name);
+      } else {
+        HLOG(kInfo,
+             "ClientInitShm: metadata segment '{}' unavailable -- SHM metadata "
+             "caching disabled for this client (RPC path still works)",
+             metadata_segment_name);
+      }
+    }
+
+#if CTP_IS_HOST
+    // Single per-process response ring (replaces the old per-thread
+    // "clio-<pid>-<tid>" servers). The runtime routes every response for this
+    // process here (IpcCpu2Cpu::SendOut -> "clio-<client_pid>-shm-out"); the
+    // dedicated RecvShmClientThread drains it and wakes waiters. ~1MB is ample
+    // for the response stream from one runtime, continuously drained.
+    {
+      std::string out_name =
+          "clio-" + std::to_string(ctp::SystemInfo::GetPid()) + "-shm-out";
+      shm_out_server_ok_ =
+          shm_out_server_.ServerInit(out_name, ctp::Unit<size_t>::Megabytes(1));
+      if (!shm_out_server_ok_) {
+        HLOG(kError, "ClientInitShm: failed to create response SHM ring '{}'",
+             out_name);
+        return false;
+      }
+      HLOG(kInfo, "ClientInitShm: response SHM ring '{}' (1MB)", out_name);
+    }
+#endif
+
     return true;
   } catch (const std::exception &e) {
     HLOG(kError, "ClientInitShm: exception: {}", e.what());
@@ -850,10 +1276,13 @@ bool IpcManager::ServerInitQueues() {
     u32 thread_count = config->GetNumThreads();
     // Note: Last worker serves dual roles as both task worker and network
     // worker
-    u32 total_workers = thread_count;
+    // issue #785: reserve lanes for elastic replacements as well — see
+    // ConfigManager::GetElasticLaneHeadroom. Sizing in
+    // CalculateQueueSegmentSize accounts for the same headroom.
+    u32 total_workers = thread_count + config->GetElasticLaneHeadroom();
 
     // Store worker count and scheduling queue count
-    num_workers_ = total_workers;
+    num_workers_ = thread_count;
     num_sched_queues_ = thread_count;
 
     // Get configured queue depth (no longer hardcoded)
@@ -1075,11 +1504,21 @@ retry_attempt:
     // assuming (1,0)/(2,0).
     main_allocator_id_ = task->main_alloc_id_;
     queue_allocator_id_ = task->queue_alloc_id_;
+    // issue #783: learn where the metadata-segment directory lives so this
+    // client can find module cache roots without depending on having been the
+    // process that created the pool.
+    metadata_dir_off_ = task->metadata_dir_off_;
     if (task->server_pid_ > 0) {
       runtime_pid_ = static_cast<int>(task->server_pid_);
     }
-    HLOG(kInfo, "Successfully connected to runtime (generation={}, server_pid={})",
-         client_generation_, runtime_pid_);
+    // issue #807: learn how many inbound SHM rings to shard requests across.
+    if (task->shm_in_shards_ >= 1) {
+      shm_in_shards_ = task->shm_in_shards_;
+    }
+    HLOG(kInfo,
+         "Successfully connected to runtime (generation={}, server_pid={}, "
+         "shm_in_shards={})",
+         client_generation_, runtime_pid_, shm_in_shards_);
 
     // Client-side GPU queue init was for the cpu2gpu / gpu2gpu queues
     // of the GPU runtime. With the runtime gone, kernels submit
@@ -1267,6 +1706,11 @@ bool IpcManager::IsAlive(u64 node_id) const {
 }
 
 void IpcManager::SetDead(u64 node_id) {
+  // Every confirmed membership change advances the epoch (issue #856):
+  // recovery claims are scoped by (epoch, dead node), so a node that dies,
+  // rejoins and dies again is recoverable each time, while duplicate
+  // coordinators within one epoch are still refused.
+  membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kDead) return;  // Already dead
@@ -1293,6 +1737,11 @@ void IpcManager::SetDead(u64 node_id) {
 }
 
 void IpcManager::SetAlive(u64 node_id) {
+  // Every confirmed membership change advances the epoch (issue #856):
+  // recovery claims are scoped by (epoch, dead node), so a node that dies,
+  // rejoins and dies again is recoverable each time, while duplicate
+  // coordinators within one epoch are still refused.
+  membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kAlive) return;  // Already alive
@@ -1314,6 +1763,22 @@ NodeState IpcManager::GetNodeState(u64 node_id) const {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return NodeState::kDead;
   return it->second.state;
+}
+
+void IpcManager::NoteInbound(u64 node_id) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  it->second.last_inbound = std::chrono::steady_clock::now();
+}
+
+float IpcManager::SecondsSinceInbound(u64 node_id) const {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) {
+    return std::numeric_limits<float>::max();
+  }
+  return std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                      it->second.last_inbound)
+      .count();
 }
 
 void IpcManager::SetNodeState(u64 node_id, NodeState new_state) {
@@ -1640,6 +2105,66 @@ size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
 #endif
 }
 
+size_t IpcManager::ReportRuntimeLeaks(const char *phase) const {
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+  // Private heap (NewTask/NewObj/client-ZMQ buffers). At shutdown this
+  // legitimately still holds process-lifetime runtime state (pools, config,
+  // module manager) that is only released at static teardown -- so report it at
+  // INFO, NOT as a leak, to avoid false positives. Genuinely unfreed CTP_MALLOC
+  // allocations are caught for real by the MallocAllocator destructor
+  // (ctp::ipc::AllocatorLeakChecker) which runs at static teardown, after that
+  // process-lifetime state is gone.
+  const size_t priv = CTP_MALLOC->GetCurrentlyAllocatedSize();
+  if (priv != 0) {
+    HLOG(kInfo,
+         "[leak][runtime] {}: CTP_MALLOC private heap holds {} bytes (may be "
+         "process-lifetime state; verified clean at static teardown)",
+         phase, priv);
+  }
+
+  // Per-process SHM segments the runtime's AllocateBuffer draws from. These
+  // MultiProcessAllocators are placement-constructed in shared memory and never
+  // get a C++ destructor, so this scan is the ONLY place their leaks surface.
+  // Every buffer MUST be freed by shutdown, so any outstanding bytes here are a
+  // real shared-memory leak (reported at ERROR). This is the return value.
+  size_t shm_leaked = 0;
+  {
+    std::lock_guard<std::mutex> lock(shm_mutex_);
+    for (size_t i = 0; i < alloc_vector_.size(); ++i) {
+      auto *alloc = alloc_vector_[i];
+      if (alloc == nullptr) {
+        continue;
+      }
+      const size_t out = alloc->GetCurrentlyAllocatedSize();
+      if (out != 0) {
+        shm_leaked += out;
+        HLOG(kError,
+             "[leak][runtime] {}: SHM allocator #{} leaked {} bytes "
+             "(outstanding at shutdown)",
+             phase, i, out);
+      }
+    }
+  }
+
+  if (shm_leaked == 0) {
+    HLOG(kInfo, "[leak][runtime] {}: no outstanding SHM buffers", phase);
+  } else {
+    HLOG(kError, "[leak][runtime] {}: {} total SHM bytes leaked", phase,
+         shm_leaked);
+  }
+  return shm_leaked;
+#else
+  (void)phase;
+  return 0;
+#endif
+}
+
+IpcManager::~IpcManager() {
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+  ReportRuntimeLeaks("~IpcManager");
+#endif
+}
+
 FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
 #if CTP_IS_HOST
   // HOST-ONLY PATH: The device implementation is in ipc_manager.h
@@ -1789,9 +2314,16 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 }
 
 ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
-                                                    int port) {
-  // Create key for the pool map
+                                                    int port,
+                                                    const char *lane) {
+  // Create key for the pool map. The lane suffix gives distinct traffic
+  // classes (bulk task payloads vs small responses) their own connection
+  // and thus their own socket mutex + ZMQ pipe (issue #892).
   std::string key = addr + ":" + std::to_string(port);
+  if (lane != nullptr && *lane != '\0') {
+    key += "#";
+    key += lane;
+  }
 
   // Lock the pool for thread-safe access
   std::lock_guard<std::mutex> lock(client_pool_mutex_);
@@ -1900,8 +2432,20 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
         break;
     }
     if (wake_lane) {
-      AwakenWorker(wake_lane);
+      // force=true: this push went to a net_queue_ priority lane, which is NOT
+      // in the net worker's SuspendMe re-check set — the parked-skip handshake
+      // is unpaired here, so the signal must be unconditional (see AwakenWorker).
+      AwakenWorker(wake_lane, /*force=*/true);
     }
+    HLOG(kDebug,
+         "[TRACE768] t={} EnqueueNetTask prio={} was_empty={} wake_lane={} "
+         "lane_tid={} send_lane_set={} recv_lane_set={} net_lane_set={}",
+         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), priority_idx, was_empty, wake_lane != nullptr,
+         wake_lane ? wake_lane->GetTid() : -1, net_send_lane_ != nullptr,
+         net_recv_lane_ != nullptr, net_lane_ != nullptr);
+  } else {
+    HLOG(kDebug, "[TRACE768] t={} EnqueueNetTask prio={} was_empty=FALSE (no wake)",
+         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), priority_idx);
   }
 
   HLOG(kDebug,
@@ -2097,6 +2641,29 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
          shm_name, e.what());
     return false;
   }
+}
+
+bool IpcManager::TryLazyRegisterClientSegment(
+    const ctp::ipc::AllocatorId &alloc_id) {
+#if CTP_IS_HOST
+  // Runtime only: clients never resolve other processes' segments, and the
+  // attach below is the server-side registration RegisterMemory performs.
+  if (CLIO_RUNTIME_MANAGER == nullptr || !CLIO_RUNTIME_MANAGER->IsRuntime()) {
+    return false;
+  }
+  if (alloc_id == ctp::ipc::AllocatorId::GetNull()) {
+    return false;
+  }
+  HLOG(kWarning,
+       "IpcManager::TryLazyRegisterClientSegment: resolving ({}.{}) before "
+       "its RegisterMemory round-trip landed — attaching on demand (#807)",
+       alloc_id.major_, alloc_id.minor_);
+  // Idempotent: returns true if the segment is already registered.
+  return RegisterMemory(alloc_id);
+#else
+  (void)alloc_id;
+  return false;
+#endif
 }
 
 ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
@@ -2341,6 +2908,25 @@ size_t IpcManager::ClearUserIpcs() {
       }
     }
 
+    // The runtime pid record (chi_runtime_pid_<user>_<port>) is a plain file,
+    // so the symlink test above cannot see its owner — it names the owner in
+    // its contents instead. Keep it while that runtime is alive: it is the
+    // only handle `clio_run stop` has on a co-resident runtime whose segments
+    // are not /proc symlinks (macOS/BSD).
+    if (name.rfind(kRuntimePidRecordPrefix, 0) == 0) {
+      std::ifstream pid_file(full_path);
+      std::string pid_line;
+      if (pid_file.is_open() && std::getline(pid_file, pid_line)) {
+        int owner_pid = std::atoi(pid_line.c_str());
+        if (owner_pid > 0 && owner_pid != current_pid &&
+            ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+          HLOG(kDebug, "ClearUserIpcs: keeping {} (runtime pid {} alive)", name,
+               owner_pid);
+          continue;
+        }
+      }
+    }
+
     if (ctp::SystemInfo::RemoveFile(full_path)) {
       HLOG(kDebug, "ClearUserIpcs: Removed memfd symlink: {}", name);
       removed_count++;
@@ -2354,6 +2940,91 @@ size_t IpcManager::ClearUserIpcs() {
          removed_count);
   }
 
+  return removed_count;
+}
+
+size_t IpcManager::UnlinkOwnPidEntries() {
+  size_t removed_count = 0;
+  const std::string memfd_dir = ctp::SystemInfo::GetMemfdDir();
+  const int current_pid = ctp::SystemInfo::GetPid();
+
+  // Entries owned by THIS process — on-demand data segments
+  // (clio_<pid>_<idx>) and per-thread MPSC receive segments
+  // (clio-<pid>-<tid>) — identified by their symlink target /proc/<pid>/fd/N.
+  // On platforms where the entries are regular files (macOS), fall back to
+  // the name prefixes. Unlink-only: mapped memory stays valid.
+  const std::string own_proc_prefix =
+      "/proc/" + std::to_string(current_pid) + "/";
+  const std::string own_name_prefixes[] = {
+      "clio_" + std::to_string(current_pid) + "_",
+      "clio-" + std::to_string(current_pid) + "-",
+  };
+  for (const auto &name : ctp::SystemInfo::ListDirectory(memfd_dir)) {
+    const std::string full_path = memfd_dir + "/" + name;
+    bool owned = false;
+    std::error_code ec;
+    auto target = std::filesystem::read_symlink(full_path, ec);
+    if (!ec) {
+      owned = target.string().rfind(own_proc_prefix, 0) == 0;
+    } else {
+      for (const auto &prefix : own_name_prefixes) {
+        if (name.rfind(prefix, 0) == 0) {
+          owned = true;
+          break;
+        }
+      }
+    }
+    if (owned && ctp::SystemInfo::RemoveFile(full_path)) {
+      removed_count++;
+    }
+  }
+  return removed_count;
+}
+
+size_t IpcManager::UnlinkOwnArtifacts() {
+  size_t removed_count = 0;
+  ConfigManager *config = CLIO_CONFIG_MANAGER;
+
+  // Named segments (main + queue) — unlink by name. The backing memfd stays
+  // alive through this process's fds/mappings; only the directory entry goes.
+  if (config) {
+    for (MemorySegment seg : {kMainSegment, kQueueSegment}) {
+      const std::string name = config->GetSharedMemorySegmentName(seg);
+      if (ctp::SystemInfo::RemoveFile(
+              ctp::SystemInfo::GetMemfdPath(name))) {
+        removed_count++;
+      }
+    }
+  }
+
+  // Everything else this pid owns (on-demand + per-thread MPSC segments).
+  removed_count += UnlinkOwnPidEntries();
+
+  // Local control socket files for this runtime's port. Normally unlinked by
+  // ~SocketTransport during graceful teardown; on the force/watchdog paths the
+  // transports are never destroyed, so remove them here (no-op if gone).
+  if (config) {
+    const u32 port = config->GetPort();
+    const std::string socket_paths[] = {
+        ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) +
+                                      ".ipc"),
+        ctp::SystemInfo::GetMemfdPath("clio_zmq_" + std::to_string(port + 3) +
+                                      ".ipc"),
+    };
+    for (const auto &path : socket_paths) {
+      if (ctp::SystemInfo::RemoveFile(path)) {
+        removed_count++;
+      }
+    }
+    // The pid record published in ServerInit: this runtime no longer owns the
+    // port, so nothing must be able to escalate a kill against it.
+    RemoveRuntimePidRecord(port);
+  }
+
+  if (removed_count > 0) {
+    HLOG(kInfo, "UnlinkOwnArtifacts: Removed {} filesystem entries",
+         removed_count);
+  }
   return removed_count;
 }
 
@@ -2403,6 +3074,11 @@ bool IpcManager::ReconnectToOriginalHost() {
     main_allocator_ = nullptr;
     worker_queues_ = ctp::ipc::FullPtr<TaskQueue>();
     main_backend_ = ctp::ipc::PosixShmMmap();
+    // issue #783: the metadata mapping points into the OLD server's segment;
+    // drop it so ClientInitShm re-attaches the restarted server's one instead
+    // of leaving a dangling pointer into an unmapped region.
+    metadata_allocator_ = nullptr;
+    metadata_backend_ = ctp::ipc::PosixShmMmap();
 
     // Re-attach to new shared memory
     if (!ClientInitShm()) return false;
@@ -2510,6 +3186,9 @@ bool IpcManager::ReconnectToNewHost(const std::string &new_addr) {
   shm_send_transport_.reset();
   shm_recv_transport_.reset();
   main_allocator_ = nullptr;
+  // issue #783: remote host -> no shared memory at all, so the metadata cache
+  // is unavailable and every read must take the RPC path.
+  metadata_allocator_ = nullptr;
   runtime_pid_ = 0;
 
   // Create new ZMQ DEALER transport
@@ -2592,15 +3271,41 @@ bool IpcManager::WaitForServerAndReconnect(
     return false;
   }
 
-  // Pick random hosts and try each (may retry same host — that's fine)
-  std::mt19937 rng(std::random_device{}());
-  std::uniform_int_distribution<size_t> dist(0, hosts.size() - 1);
+  // Build a DETERMINISTIC candidate order (issue #856), replacing uniform
+  // random sampling over every host in the file:
+  //   1. the presumptive leader (lowest alive node id) — it coordinates
+  //      recovery, so it is the most useful node to be attached to;
+  //   2. the remaining ALIVE hosts;
+  //   3. hosts believed dead, last and only as a fallback — "dead" is a local
+  //      opinion that can be stale (a peer may have rejoined without this
+  //      client hearing about it), so they are tried rather than excluded.
+  // Random sampling could burn every attempt re-dialling the node that just
+  // died, and made post-failover behaviour irreproducible under test.
+  std::vector<std::string> candidates;
+  {
+    const u64 leader = GetLeaderNodeId();
+    std::vector<std::string> alive, dead;
+    for (const auto &h : hosts) {
+      if (h.node_id == GetNodeId()) continue;  // our own dead runtime
+      if (h.node_id == leader && h.IsAlive()) continue;  // added first below
+      (h.IsAlive() ? alive : dead).push_back(h.ip_address);
+    }
+    const Host *lh = GetHost(leader);
+    if (lh != nullptr && lh->IsAlive() && leader != GetNodeId()) {
+      candidates.push_back(lh->ip_address);
+    }
+    candidates.insert(candidates.end(), alive.begin(), alive.end());
+    candidates.insert(candidates.end(), dead.begin(), dead.end());
+    if (candidates.empty()) {  // degenerate: single-host file
+      for (const auto &h : hosts) candidates.push_back(h.ip_address);
+    }
+  }
 
-  HLOG(kInfo, "WaitForServerAndReconnect: Trying {} random hosts",
-       client_try_new_servers_);
+  HLOG(kInfo,
+       "WaitForServerAndReconnect: trying up to {} host(s), leader-first: {}",
+       client_try_new_servers_, candidates.front());
   for (int i = 0; i < client_try_new_servers_; ++i) {
-    size_t idx = dist(rng);
-    const std::string &addr = hosts[idx].ip_address;
+    const std::string &addr = candidates[i % candidates.size()];
     HLOG(kInfo, "WaitForServerAndReconnect: Trying {}/{}: {}",
          i + 1, client_try_new_servers_, addr);
     if (ReconnectToNewHost(addr)) {
@@ -2609,7 +3314,7 @@ bool IpcManager::WaitForServerAndReconnect(
     }
   }
 
-  HLOG(kError, "WaitForServerAndReconnect: All {} random hosts failed",
+  HLOG(kError, "WaitForServerAndReconnect: All {} candidate hosts failed",
        client_try_new_servers_);
   reconnecting_.store(false, std::memory_order_release);
   return false;
@@ -2731,6 +3436,367 @@ void IpcManager::RecvZmqClientThread() {
   }
 }
 
+namespace {
+/**
+ * Lost-wakeup safety net for the parked SHM drain loops.
+ *
+ * The park/signal handshake (ShmMpscTransport::SignalConsumerIfParked) is
+ * designed so a wake can never be missed, so in principle these threads could
+ * block forever. They don't: a bounded wait means a bug in that handshake — or
+ * a producer killed between reserving its slot and signalling — degrades to a
+ * few milliseconds of extra latency instead of a permanently wedged runtime.
+ * This codebase has shipped that exact failure mode more than once (#768,
+ * #774), and 20 idle wakeups/sec/thread is not a measurable cost.
+ *
+ * This is NOT the polling interval: under load the drainer is woken by the
+ * producer's signal and never reaches the timeout.
+ */
+constexpr int kShmParkTimeoutUs = 50'000;  // 50ms
+
+/**
+ * How long a drainer stays hot before parking, in failed drain attempts.
+ *
+ * Parking is not free: the wake costs the producer a tgkill and the consumer a
+ * signalfd read plus an epoll wakeup. Measured on the task round-trip, parking
+ * on EVERY message is worse than either alternative — the drain thread ends up
+ * asleep whenever a request arrives, so the signal round-trip lands on the
+ * critical path:
+ *
+ *   bdev_allocation, 4 threads    park always   spin always   spin-then-park
+ *   SHM throughput                  5,303/s      14,227/s        (below)
+ *
+ * So spin while there is any reason to believe more work is imminent, and park
+ * only once the ring has been quiet for a while. Under load the drainer never
+ * reaches the budget, stays unparked, and producers skip the signal entirely
+ * (SignalConsumerIfParked checks parked_ first) — the fast path costs nothing.
+ * When traffic genuinely stops, the drainer parks once and the machine goes
+ * fully idle: no polling, no periodic wakeups beyond the safety-net timeout.
+ */
+constexpr size_t kShmSpinBudget = 4096;
+
+/**
+ * Block until this ring has work, using the park/signal handshake.
+ *
+ * Publishing `parked` BEFORE the final IsEmpty() re-check is what makes this
+ * race-free: a producer that reserves its slot after our re-check must observe
+ * parked_ and signal us, and one that reserved before it is seen by the
+ * re-check so we never block on a non-empty ring.
+ */
+void ShmParkUntilWork(ctp::lbm::ShmMpscTransport &ring,
+                      ctp::lbm::EventManager *em) {
+  ring.SetConsumerParked(true);
+  if (ring.IsEmpty()) {
+    em->Wait(kShmParkTimeoutUs);
+  }
+  ring.SetConsumerParked(false);
+}
+
+/**
+ * One idle iteration of a drain loop: spin while warm, then park.
+ * `spins` is the caller's counter; it is reset by the caller on any work, and
+ * here after a park so a woken drainer gets a fresh hot window.
+ */
+void ShmDrainIdle(ctp::lbm::ShmMpscTransport &ring, ctp::lbm::EventManager *em,
+                  size_t &spins) {
+  if (++spins < kShmSpinBudget) {
+    CTP_THREAD_MODEL->Yield();
+    return;
+  }
+  ShmParkUntilWork(ring, em);
+  spins = 0;
+}
+}  // namespace
+
+void IpcManager::RecvShmClientThread() {
+#if CTP_IS_HOST
+  // Client-side SHM analogue of RecvZmqClientThread. Drains the single
+  // per-process response ring (shm_out_server_). For each response: match it to
+  // the waiting Future by net_key (stamped in SendIn, echoed by SendOut), park
+  // the archive for RecvOut to deserialize (RecvOut owns the concrete task
+  // type), mark the client task complete, and wake its waiter via
+  // EventManager::Signal. This replaces the old model where every client thread
+  // polled its own per-thread ring in RecvOut.
+  size_t recv_count = 0;
+  size_t miss_count = 0;
+  // GetTls() registers this thread's signalfd-backed EventManager (its ctor
+  // calls AddSignalEvent, which also BLOCKS SIGUSR1 here — mandatory before
+  // publishing ourselves as the drainer, or a producer's wake would kill the
+  // process via SIGUSR1's default disposition).
+  ctp::lbm::EventManager *em = &GetTls()->event_manager_;
+  shm_out_server_.RegisterConsumer();
+  size_t idle_spins = 0;
+  while (shm_recv_running_.load()) {
+    // issue #807: the shared drainer. When app threads are actively waiting they
+    // drain inline (RecvOut) and win the try-lock, so this thread mostly falls
+    // through to park; when they are parked, it wins the lock and drains for
+    // them. Either way exactly one consumer runs at a time.
+    bool drained_any = DrainShmResponses();
+    if (drained_any) {
+      idle_spins = 0;
+    } else {
+      ShmDrainIdle(shm_out_server_, em, idle_spins);
+    }
+  }
+  shm_out_server_.UnregisterConsumer();
+  (void)recv_count;
+  (void)miss_count;
+#endif
+}
+
+bool IpcManager::DrainShmResponses() {
+#if CTP_IS_HOST
+  if (!shm_out_server_ok_) {
+    return false;
+  }
+  // Sole-consumer gate: if another thread (a spinning waiter or this fallback
+  // thread) is already draining, back off — the caller polls its own IsComplete.
+  std::unique_lock<std::mutex> drain_lk(shm_out_drain_mutex_, std::try_to_lock);
+  if (!drain_lk.owns_lock()) {
+    return false;
+  }
+  bool any = false;
+  // The waiter that drains a response inline (RecvOut spin path) is THIS thread;
+  // it will observe IsComplete on its next spin and needs no wake. Signalling it
+  // is a wasted SYS_tgkill per response — and on a single pipelining thread that
+  // is one syscall PER OP that never amortizes with depth (the whole reason CTE
+  // pipelining lagged Redis, whose 64 replies cost ~1 read). Skip the self-wake;
+  // still signal OTHER (possibly parked) waiters whose responses we demux.
+  const int my_pid = static_cast<int>(ctp::SystemInfo::GetPid());
+  const int my_tid = static_cast<int>(ctp::SystemInfo::GetTid());
+  while (true) {
+    // Cheap check before allocating: a spinning waiter calls this every
+    // iteration, so allocating a LoadTaskArchive only to hit EAGAIN on an empty
+    // ring dominated the spin (measured +7us). IsEmpty is two atomic loads and
+    // is safe here — we hold the sole-consumer lock.
+    if (shm_out_server_.IsEmpty()) {
+      break;
+    }
+    auto archive = std::make_unique<LoadTaskArchive>();
+    ctp::lbm::ClientInfo info =
+        shm_out_server_.Recv(*archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+    if (info.rc != 0) {
+      break;  // EAGAIN: nothing more in flight right now
+    }
+    any = true;
+    if (archive->GetTaskInfos().empty()) {
+      HLOG(kError, "DrainShmResponses: response with no task_infos");
+      continue;
+    }
+    size_t net_key = archive->GetTaskInfos()[0].task_id_.net_key_;
+
+    std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+    auto it = pending_zmq_futures_.find(net_key);
+    if (it == pending_zmq_futures_.end()) {
+      HLOG(kError, "DrainShmResponses: no pending future for net_key {}",
+           net_key);
+      continue;
+    }
+    Task *task = it->second.task;
+    // Park the archive; RecvOut moves it out and deserializes into the task.
+    // Demuxing here (not just for our own net_key) is what lets one draining
+    // waiter serve every waiter's response.
+    pending_response_archives_[net_key] = std::move(archive);
+    // Publish the parked archive before the waiter observes completion.
+    std::atomic_thread_fence(std::memory_order_release);
+    task->SetNewData();
+    task->SetComplete();
+    if (task->WaiterPid() != 0 &&
+        !(static_cast<int>(task->WaiterPid()) == my_pid &&
+          static_cast<int>(task->WaiterTid()) == my_tid)) {
+      ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
+                                     static_cast<int>(task->WaiterTid()));
+    }
+    pending_zmq_futures_.erase(it);
+  }
+  return any;
+#else
+  return false;
+#endif
+}
+
+// issue #807: RecvShmServerThread removed — workers drain shards inline
+// (Worker::DrainMyShard). No dedicated inbound drain thread exists.
+
+
+void IpcManager::StartShmServerRecvThread() {
+#if CTP_IS_HOST
+  // issue #807: NO dedicated inbound drain threads. The workers drain the shard
+  // rings themselves (RegisterShardConsumer / DrainShard from Worker::Run), so
+  // parallel ingress comes from oversubscribing the existing pool rather than
+  // from spawning threads that contend for cores — which is what made the first
+  // cut regress. Intentionally a no-op; rings are created in ServerInitShm and
+  // consumed by workers.
+  shm_in_recv_running_.store(true, std::memory_order_release);
+#endif
+}
+
+void IpcManager::StopShmServerRecvThread() {
+#if CTP_IS_HOST
+  shm_in_recv_running_.store(false, std::memory_order_release);
+#endif
+}
+
+// --- issue #807: worker-driven shard draining --------------------------------
+
+void IpcManager::RegisterShardConsumer(u32 worker_id) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
+  }
+  // Publishes THIS worker thread's tid as the ring's consumer, so a producing
+  // client's SignalConsumerIfParked SIGUSR1s this worker — the same signalfd
+  // path Worker::SuspendMe already parks on.
+  shm_in_servers_[worker_id]->RegisterConsumer();
+#else
+  (void)worker_id;
+#endif
+}
+
+void IpcManager::UnregisterShardConsumer(u32 worker_id) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
+  }
+  shm_in_servers_[worker_id]->UnregisterConsumer();
+#else
+  (void)worker_id;
+#endif
+}
+
+bool IpcManager::ShardEmpty(u32 worker_id) const {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return true;
+  }
+  return shm_in_servers_[worker_id]->IsEmpty();
+#else
+  (void)worker_id;
+  return true;
+#endif
+}
+
+void IpcManager::SetShardParked(u32 worker_id, bool parked) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
+  }
+  shm_in_servers_[worker_id]->SetConsumerParked(parked);
+#else
+  (void)worker_id;
+  (void)parked;
+#endif
+}
+
+// ===========================================================================
+// issue #807 D2: nonblocking, per-destination, background response sender.
+// ===========================================================================
+
+void IpcManager::EnqueueShmSend(const std::string &dest,
+                                clio::run::Future<Task> &&future) {
+#if CTP_IS_HOST
+  ShmSendQueue *q = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
+    auto it = shm_send_queues_.find(dest);
+    if (it == shm_send_queues_.end()) {
+      it = shm_send_queues_
+               .emplace(dest, std::make_unique<ShmSendQueue>())
+               .first;
+    }
+    q = it->second.get();
+  }
+  {
+    std::lock_guard<std::mutex> lk(q->mtx);
+    q->pending.push_back(std::move(future));
+  }
+  // No wake needed: the workers drain these queues in their poll loop
+  // (DrainShmSends), and the enqueuing worker itself will drain on its next
+  // iteration; the 50ms max_sleep cap bounds the worst case if all workers park.
+#else
+  (void)dest;
+  (void)future;
+#endif
+}
+
+u32 IpcManager::DrainShmSends(ctp::lbm::Transport *transport, u32 budget) {
+#if CTP_IS_HOST
+  // issue #807: called from the WORKERS' poll loop (and the shutdown flush), so
+  // deferred response send is oversubscribed onto the existing pool rather than
+  // owned by a dedicated thread. Bounded per call so one worker cannot spend a
+  // whole iteration here and starve its own lane. A no-op when the queues are
+  // empty, which is always the case on the inline-default path.
+  //
+  // Multiple workers may drain concurrently: pops are atomic under each queue's
+  // mutex, and conn->Send serialises per client ring via its own send_mu_, so
+  // two workers transferring to the same client are safe. The client demuxes
+  // responses by net_key, so cross-worker delivery order does not matter.
+  u32 sent = 0;
+  std::vector<ShmSendQueue *> queues;
+  {
+    std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
+    queues.reserve(shm_send_queues_.size());
+    for (auto &kv : shm_send_queues_) queues.push_back(kv.second.get());
+  }
+  for (ShmSendQueue *q : queues) {
+    while (sent < budget) {
+      clio::run::Future<Task> fut;
+      {
+        std::lock_guard<std::mutex> lk(q->mtx);
+        if (q->pending.empty()) break;
+        fut = std::move(q->pending.front());
+        q->pending.pop_front();
+      }
+      clio::run::shared_ptr<Task> task = fut.GetTaskPtr();
+      if (!task.IsNull()) {
+        IpcCpu2Cpu::SendOutTransfer(this, task, transport);
+      }
+      ++sent;
+      // `fut` drops here, freeing the task by RAII on this worker thread.
+    }
+    if (sent >= budget) break;
+  }
+  return sent;
+#else
+  (void)transport;
+  (void)budget;
+  return 0;
+#endif
+}
+
+void IpcManager::StartShmServerSendThread() {
+#if CTP_IS_HOST
+  // issue #807: no dedicated sender thread. The default (inline) send transfers
+  // on the executing worker; the opt-in async send is drained by the workers via
+  // DrainShmSends in their poll loop. Kept as a no-op so the admin bring-up call
+  // site is unchanged.
+  shm_send_running_.store(true, std::memory_order_release);
+#endif
+}
+
+void IpcManager::StopShmServerSendThread() {
+#if CTP_IS_HOST
+  shm_send_running_.store(false, std::memory_order_release);
+  // Shutdown flush: workers have stopped draining, so transfer whatever
+  // responses are still queued instead of dropping them (which would hang the
+  // waiting clients). A temp transport on this thread; bounded so a pathological
+  // producer cannot hang shutdown.
+  ctp::lbm::TransportPtr flush_transport = ctp::lbm::TransportFactory::Get(
+      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
+  int empty_passes = 0;
+  int total_passes = 0;
+  while (empty_passes < 2 && total_passes < 10000) {
+    empty_passes = (DrainShmSends(flush_transport.get(), 4096) > 0)
+                       ? 0
+                       : empty_passes + 1;
+    ++total_passes;
+  }
+#endif
+}
+
 void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
@@ -2743,6 +3809,14 @@ void IpcManager::CleanupResponseArchive(size_t net_key) {
   std::lock_guard<std::mutex> lock(pending_futures_mutex_);
   auto it = pending_response_archives_.find(net_key);
   if (it != pending_response_archives_.end()) {
+    // Frees ZMQ zero-copy recv handles (bulk.desc); a no-op for a SHM archive
+    // (its recv bulks carry no desc). Reaching here means the future was dropped
+    // WITHOUT a Recv — the consumed path erases the entry in RecvOut. NOTE: a
+    // SHM archive's malloc'd recv payloads (bulk.data.ptr_) are intentionally
+    // NOT freed here: bulk.data.ptr_ on the TCP/IPC path can be a CHI-allocated
+    // (non-malloc) buffer, so a blanket free corrupts the heap. The consumed
+    // path adopts SHM payloads into the task (TASK_DATA_OWNER); only a truly
+    // dropped-before-Recv SHM future leaks its payload, which is rare and bounded.
     zmq_transport_->ClearRecvHandles(*(it->second));
     pending_response_archives_.erase(it);
   }
@@ -2962,6 +4036,94 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
            worker ? (int)worker->GetId() : -1);
       if (worker) {
         worker->AddToRetryQueue(task_ptr);
+      } else {
+        // issue #822/#841: no worker context — this is a non-worker thread
+        // (ServerInit's main thread, an embedded client). There is no retry
+        // queue here, so the old code DROPPED the task on Retry/Dne and its
+        // future was never completed: a task.Wait() caller then polls
+        // FUTURE_COMPLETE forever. Concretely: the restart-log replay's
+        // AsyncCompose can route before the just-created admin container's
+        // registration (finished by a worker task) is visible, hit Dne, and
+        // hang ServerInit — a startup-timing window that CI's 2-vCPU runners
+        // open reliably. Retry inline first: the window is transient and
+        // normally closes within a few milliseconds.
+        //
+        // EXCEPT for periodic tasks. The admin container's Create spawns its
+        // periodic service tasks (kSend/kClientSend pumps, kHeartbeatProbe,
+        // kSystemMonitor) on THIS thread, and the container is only
+        // registered after Create returns — so for those, no amount of
+        // waiting here can succeed: the retry blocks the exact thread whose
+        // progress it awaits. Observed as 5 s x N stalls at every runtime
+        // init (unit-amd64 +19 min; the icx windows gate's rotating per-test
+        // timeouts, a retry storm filling the whole 300 s window). Fail them
+        // immediately instead — the same harmless outcome as the historical
+        // silent drop, but loud and with a completed future.
+        //
+        // The budget is a wall-clock DEADLINE, not an iteration count (issue
+        // #849): sleep_for(1ms) rounds up to the platform timer granularity —
+        // ~15.6ms on Windows — so a 5000-iteration loop actually burned ~75s
+        // per unroutable task there, and ServerInit's handful of exhausted
+        // retries alone exceeded a 300s ctest window.
+        constexpr auto kInlineRetryBudget = std::chrono::seconds(5);
+        // Admin-pool tasks get a longer leash (issue #883): the admin
+        // container is GUARANTEED to register (ServerInit creates it), but on
+        // loaded CI runners (Windows icx Debug, 2 vCPU) its worker-side
+        // registration has been observed to outlast 5 s, terminally failing
+        // embedded ClientInit -- and the whole test -- for a wedge that
+        // clears moments later (3 distinct tests on 2026-07-31, all rerun
+        // green). Waiting longer here cannot reintroduce the #849
+        // recovery-test time burn: those exhausted retries target non-admin
+        // pools and keep the 5 s deadline.
+        const auto inline_retry_budget = (task_ptr->pool_id_ == kAdminPoolId)
+                                             ? std::chrono::seconds(30)
+                                             : kInlineRetryBudget;
+        const auto retry_start = std::chrono::steady_clock::now();
+        const auto deadline = retry_start + inline_retry_budget;
+        const bool is_periodic = task_ptr->IsPeriodic();
+        while (!is_periodic &&
+               (result == RouteResult::Retry || result == RouteResult::Dne) &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          result = RouteLocal(future, force_enqueue);
+        }
+        if (result == RouteResult::Retry || result == RouteResult::Dne) {
+          // Inline retry exhausted: this is no longer the ms-scale transient
+          // window but a task that cannot resolve in this phase. FAIL the
+          // future so the waiter unblocks loudly. (An earlier revision parked
+          // the task on worker 0's retry queue here instead, to avoid the
+          // deadline — but a task that is still unroutable after 5 s of
+          // retries just churns the retry queue forever, and re-queuing it
+          // through the RunFuture's non-owning task handle dangled the queue
+          // entry once the popping iteration's owning reference died: the icx
+          // windows-2025 cte_tag_large SEGFAULT. Terminal failure is the
+          // correct end state.)
+          // Report what actually happened, not the budget. A PERIODIC task
+          // skips the loop entirely (see above) and is failed instantly and
+          // by design -- printing the budget for it made five harmless drops
+          // read as five 30-second stalls, and that misreading has cost real
+          // diagnosis time twice (issue #923). Log elapsed time and say which
+          // of the two cases this is.
+          const auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - retry_start).count();
+          if (is_periodic) {
+            HLOG(kError,
+                 "RouteTask: periodic task not routable at spawn time; failing "
+                 "it immediately by design (no retry attempted) -- pool={} "
+                 "method={}",
+                 task_ptr->pool_id_, task_ptr->method_);
+          } else {
+            HLOG(kError,
+                 "RouteTask: inline retry exhausted after {} ms (budget {} ms) "
+                 "on non-worker thread; failing task pool={} method={}",
+                 elapsed_ms,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     inline_retry_budget).count(),
+                 task_ptr->pool_id_, task_ptr->method_);
+          }
+          task_ptr->SetReturnCode(static_cast<u32>(-1));
+          task_ptr->SetComplete();
+        }
       }
     }
     return result;
@@ -3097,8 +4259,32 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   ContainerHold exec_container = exec_dc.get();
 
   if (!exec_container) {
-    HLOG(kError, "RouteLocal: Container not found for pool={} container_id={} method={}",
-         task_ptr->pool_id_, container_id, task_ptr->method_);
+    // kDebug, not kError: this is the routine transient-miss result that the
+    // retry paths (worker retry queue, the non-worker inline retry loop) poll
+    // against — at kError a single exhausted 5s inline retry emits ~5000
+    // lines, and a green coverage run logs ~19k of these (issue #849). The
+    // callers in RouteTask log the kError summary on first failure and on
+    // retry exhaustion.
+    // Include the pool manager's own state. GetContainer can only return an
+    // invalid handle three ways: the manager is not initialized, the pool has
+    // no metadata entry, or the entry exists but has no usable container --
+    // and those want opposite fixes (issue #923). Printing initialized/pool
+    // count here says which, without needing to reproduce.
+    // The instance ADDRESS is the discriminator. CLIO_POOL_MANAGER resolves
+    // through GetGlobalPtrVar, which lazily `new`s a blank PoolManager when the
+    // global pointer is null -- so "initialized=0, pools=0" can mean either a
+    // second, duplicated instance (one per module) or a genuine
+    // access-before-init window on the one instance. Those want different
+    // fixes. Compare this against the address ServerInit logs: two addresses
+    // is duplication, one address is ordering. (issue #923)
+    auto *pm_diag = pool_manager;
+    HLOG(kDebug,
+         "RouteLocal: Container not found for pool={} container_id={} "
+         "method={} (pool_manager={} initialized={}, pools known={})",
+         task_ptr->pool_id_, container_id, task_ptr->method_,
+         static_cast<const void *>(pm_diag),
+         pm_diag != nullptr && pm_diag->IsInitialized(),
+         pm_diag != nullptr ? pm_diag->GetPoolCount() : 0);
     return RouteResult::Dne;
   }
   if (exec_dc.IsPlugged()) {
@@ -3126,13 +4312,36 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
     return RouteResult::ExecHere;
   }
 
-  // Enqueue to the destination worker's lane
-  auto &dest_lane = worker_queues_->GetLane(dest_worker_id, 0);
-  bool was_empty = dest_lane.Empty();
-  dest_lane.Push(future);
-  if (was_empty) {
-    AwakenWorker(&dest_lane);
+  // Self-send deadlock avoidance: a worker force-enqueuing a subtask onto its
+  // OWN lane busy-spins in the WAIT_FOR_SPACE ring Push when the lane is full,
+  // and can never drain it — it IS the consumer, blocked here in Push rather
+  // than in its Run loop. Redirect to an alternate worker whose own thread
+  // drains it, converting the deadlock into transient backpressure. An earlier
+  // "only redirect to a non-full sibling" guard failed under the mmap-writeback
+  // storm (all lanes saturate → no non-full sibling → fell back to self-spin);
+  // redirect UNCONDITIONALLY — briefly spinning on a *sibling's* full lane is
+  // safe because that sibling's thread drains it. (generic/438: mmap read fault
+  // -> GetBlob -> bdev::AsyncRead -> SendIn all on the scheduler worker; the
+  // bdev subtask's predicted io_size is 0 so RuntimeMapTask routes it back to
+  // the scheduler worker = self.)
+  if (force_enqueue && worker && dest_worker_id == worker->GetId()) {
+    Worker *alt = scheduler_->PickAltWorker(dest_worker_id);
+    if (alt != nullptr) {
+      dest_worker_id = alt->GetId();
+    }
   }
+
+  // Enqueue to the destination worker's lane, then ALWAYS signal. Gating the
+  // wakeup on was_empty is the exact lost-wakeup race AwakenWorker's own
+  // comment warns against: the consumer can drain the lane and park in
+  // epoll_pwait2 in the window between our Empty() check and Push, so a
+  // "non-empty" observation skips a wakeup the worker actually needed. The
+  // extra SIGUSR1 is absorbed harmlessly by signalfd if the worker is already
+  // awake. (Surfaced as a permanent hang in generic/208 aio-dio once self-sent
+  // subtasks began routing to otherwise-idle I/O workers.)
+  auto &dest_lane = worker_queues_->GetLane(dest_worker_id, 0);
+  dest_lane.Push(future);
+  AwakenWorker(&dest_lane);
   return RouteResult::Local;
 }
 

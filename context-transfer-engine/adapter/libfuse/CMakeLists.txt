@@ -1,16 +1,61 @@
-# Find FUSE3
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FUSE3 fuse3)
+# Find FUSE3.
+#   Linux:   libfuse3, discovered via pkg-config.
+#   Windows: WinFsp ships a FUSE3-compatible header (inc/fuse3/fuse.h) and an
+#            import library (lib/winfsp-x64.lib) but NO pkg-config file, so
+#            locate it directly. Default install dir is "%ProgramFiles(x86)%\
+#            WinFsp"; override with -DWINFSP_ROOT=... if installed elsewhere.
+# Both branches set FUSE3_FOUND, FUSE3_INCLUDEDIR and FUSE3_LIBRARIES so the
+# target wiring below is identical on either platform.
+if(WIN32)
+  if(NOT WINFSP_ROOT)
+    set(WINFSP_ROOT "$ENV{ProgramFiles\(x86\)}/WinFsp")
+  endif()
+  find_path(FUSE3_INCLUDEDIR
+    NAMES fuse3/fuse.h
+    HINTS "${WINFSP_ROOT}/inc")
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_winfsp_lib_names winfsp-x64)
+  else()
+    set(_winfsp_lib_names winfsp-x86)
+  endif()
+  find_library(FUSE3_LIBRARIES
+    NAMES ${_winfsp_lib_names} winfsp
+    HINTS "${WINFSP_ROOT}/lib")
+  if(FUSE3_INCLUDEDIR AND FUSE3_LIBRARIES)
+    set(FUSE3_FOUND TRUE)
+    set(FUSE3_VERSION "WinFsp")
+  endif()
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FUSE3 QUIET fuse3)
+endif()
 
 if(NOT FUSE3_FOUND)
-  message(FATAL_ERROR "FUSE3 not found but CLIO_CTE_ENABLE_FUSE_ADAPTER=ON. "
-    "Install it with: sudo apt install libfuse3-dev fuse3")
+  if(WIN32)
+    message(WARNING "WinFsp not found. FUSE adapter will not be built.")
+    message(STATUS "Install WinFsp (https://winfsp.dev) or pass -DWINFSP_ROOT=<dir>")
+  else()
+    message(WARNING "FUSE3 not found. FUSE adapter will not be built.")
+    message(STATUS "To install FUSE3: sudo apt install libfuse3-dev")
+  endif()
+  return()
 endif()
 
 message(STATUS "Found FUSE3: ${FUSE3_VERSION}")
 
+# Export the discovery results for the fuse test dir (processed after this
+# one). test_fuse_ops previously re-probed with pkg-config, which silently
+# skipped the suite on Windows (WinFsp has no .pc file) and macOS setups
+# where only these hand-found paths exist (#903).
+set(CLIO_FUSE3_FOUND TRUE CACHE INTERNAL "FUSE3 backend located (adapter/libfuse)")
+set(CLIO_FUSE3_INCLUDEDIR "${FUSE3_INCLUDEDIR}" CACHE INTERNAL "")
+set(CLIO_FUSE3_INCLUDE_DIRS "${FUSE3_INCLUDE_DIRS}" CACHE INTERNAL "")
+set(CLIO_FUSE3_LIBRARY_DIRS "${FUSE3_LIBRARY_DIRS}" CACHE INTERNAL "")
+set(CLIO_FUSE3_LIBRARIES "${FUSE3_LIBRARIES}" CACHE INTERNAL "")
+
 add_executable(clio_cte_fuse
-    fuse_cte.cc)
+    fuse_cte.cc       # FUSE operation callbacks (unit-tested, coverage-tracked)
+    fuse_cte_main.cc) # process entry / mount glue (coverage-excluded)
 
 target_compile_definitions(clio_cte_fuse PRIVATE
     FUSE_USE_VERSION=35
@@ -32,4 +77,10 @@ target_link_libraries(clio_cte_fuse
     ctp::cxx)
 
 install(TARGETS clio_cte_fuse
+    RUNTIME DESTINATION bin)
+# Also ship in the pip wheel: scikit-build-core installs only COMPONENT
+# pip_package, so without this second rule the wheel's clio_cte_fuse
+# console script points at a binary that is not there (#899).
+install(TARGETS clio_cte_fuse
+    COMPONENT pip_package
     RUNTIME DESTINATION bin)

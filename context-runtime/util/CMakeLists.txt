@@ -9,8 +9,10 @@ cmake_minimum_required(VERSION 3.10)
 add_library(clio_run_commands STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_runtime_start.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_runtime_stop.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_runtime_status.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_monitor.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_compose.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_config.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_migrate.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_refresh_repo.cc
 )

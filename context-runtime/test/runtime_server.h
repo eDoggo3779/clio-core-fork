@@ -49,14 +49,18 @@
  *     leaked `sleep(300)` child keeps holding the runtime's TCP port.
  *   - impossible on Windows: there is no `fork()`.
  *
- * Spawning a real binary (posix_spawn on POSIX, CreateProcess on Windows) and
- * connecting to it as an ordinary external client is portable across Linux,
- * macOS and Windows — which is why the tests that use this helper no longer
- * need an `if(NOT WIN32)` guard.
+ * The process spawn/wait/kill live in ctp::SystemInfo (SpawnProcess /
+ * IsChildRunning / TerminateChild), so this header pulls in NO OS headers — no
+ * <windows.h> to clash with the ctp lightbeam <winsock2.h> a client TU also
+ * needs (that clash is why RuntimeServer tests were POSIX-only, issue #476).
+ * Tests that do not otherwise use fork() can therefore build on Windows too.
  */
 
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -64,15 +68,17 @@
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/config_parse.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#else
+// Downstream POSIX tests that include this header (test_clio_run_cli,
+// test_cte_fallback, ...) call kill()/waitpid()/open() directly and have long
+// relied on it to pull the declarations. Keep providing them on POSIX: only
+// <windows.h> was the #476 clash with the ctp lightbeam <winsock2.h> — these
+// POSIX headers do not conflict, and the block is skipped on Windows. (The
+// process spawn/wait/kill this header itself needs now live in ctp::SystemInfo.)
+#ifndef _WIN32
 #include <csignal>
 #include <fcntl.h>
-#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
-extern char **environ;
 #endif
 
 // Defined in clio::run::test; tests reach it as clio::run::test::RuntimeServer.
@@ -80,24 +86,13 @@ namespace clio {
 namespace run {
 namespace test {
 
-/** Portable setenv(): tests set CLIO_IPC_MODE / CLIO_WITH_RUNTIME etc., and
- *  Windows has no setenv(). */
+/** Portable setenv() (routed through SystemInfo so no OS headers leak in). */
 inline void SetEnvVar(const char *key, const std::string &val) {
-#ifdef _WIN32
-  _putenv_s(key, val.c_str());
-#else
-  setenv(key, val.c_str(), 1);
-#endif
+  ctp::SystemInfo::Setenv(key, val, /*overwrite=*/1);
 }
 
-/** Portable unsetenv(). On Windows _putenv_s(key, "") removes the variable. */
-inline void UnsetEnvVar(const char *key) {
-#ifdef _WIN32
-  _putenv_s(key, "");
-#else
-  unsetenv(key);
-#endif
-}
+/** Portable unsetenv(). */
+inline void UnsetEnvVar(const char *key) { ctp::SystemInfo::Unsetenv(key); }
 
 class RuntimeServer {
  public:
@@ -112,9 +107,19 @@ class RuntimeServer {
    * the runtime lives. Returns true if the process was spawned (use
    * WaitForReady() to confirm it actually came up).
    */
+  /**
+   * @param detached  Spawn the daemon with NO controlling console/terminal
+   *   (Windows: DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP; POSIX:
+   *   POSIX_SPAWN_SETSID). This is the console-less spawn from issue #721, where
+   *   the ZeroMQ transport failed to initialize Winsock ("WSASTARTUP not yet
+   *   performed") and the daemon stayed alive but unreachable. A serviceable
+   *   daemon after a detached spawn proves the transport initializes regardless
+   *   of console.
+   */
   bool Start(unsigned port = 10500,
              const std::string &bind_addr = "127.0.0.1",
-             bool ephemeral = false) {
+             bool ephemeral = false,
+             bool detached = false) {
     port_ = port;
     SetEnv("CLIO_PORT", std::to_string(port));
     SetEnv("CLIO_BIND_ADDR", bind_addr);
@@ -128,63 +133,38 @@ class RuntimeServer {
     }
     const std::string log = ServerLogPath();
 
-#ifdef _WIN32
-    std::string cmd = "\"" + exe + "\" start";
-    if (ephemeral) cmd += " --ephemeral";
-    STARTUPINFOA si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    // Redirect child stdout/stderr to the log file so the daemon's worker
-    // chatter does not flood the test output (and is inspectable on failure).
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = nullptr;
-    sa.bInheritHandle = TRUE;
-    HANDLE hlog = CreateFileA(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hlog != INVALID_HANDLE_VALUE) {
-      si.dwFlags |= STARTF_USESTDHANDLES;
-      si.hStdOutput = hlog;
-      si.hStdError = hlog;
-      si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    }
-    ZeroMemory(&pi_, sizeof(pi_));
-    std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
-    mutable_cmd.push_back('\0');
-    BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr,
-                             TRUE, 0, nullptr, nullptr, &si, &pi_);
-    if (hlog != INVALID_HANDLE_VALUE) CloseHandle(hlog);
-    if (!ok) return false;
+    // Redirect the daemon's stdout/stderr to the log so its worker chatter does
+    // not flood the test output (and is inspectable on failure). When `detached`,
+    // spawn console-less to reproduce issue #721.
+    std::vector<std::string> args;
+    args.push_back("start");
+    if (ephemeral) args.push_back("--ephemeral");
+    proc_ = ctp::SystemInfo::SpawnProcess(exe, args, log, detached);
+    if (!proc_.valid) return false;
     started_ = true;
     return true;
-#else
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, 1, log.c_str(),
-                                     O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    posix_spawn_file_actions_adddup2(&actions, 1, 2);
-    const char *argv_plain[] = {exe.c_str(), "start", nullptr};
-    const char *argv_eph[] = {exe.c_str(), "start", "--ephemeral", nullptr};
-    int rc = posix_spawn(&pid_, exe.c_str(), &actions, nullptr,
-                         const_cast<char *const *>(ephemeral ? argv_eph
-                                                             : argv_plain),
-                         environ);
-    posix_spawn_file_actions_destroy(&actions);
-    if (rc != 0) {
-      pid_ = -1;
-      return false;
-    }
-    started_ = true;
-    return true;
-#endif
   }
 
   /**
-   * Poll until the runtime's main shared-memory segment exists, signalling that
-   * the daemon has initialized far enough to serve clients. Portable: on POSIX
-   * the segment is a file under /tmp/clio_$USER, on Windows a named mapping
-   * — SystemInfo::OpenSharedMemory abstracts both. Returns false if the timeout
-   * elapses or the daemon exits early.
+   * Poll until the daemon is genuinely able to serve clients. Two stages:
+   *
+   *   1. the runtime's main shared-memory segment exists — portable: on POSIX a
+   *      file under /tmp/clio_$USER, on Windows a named mapping, both behind
+   *      SystemInfo::OpenSharedMemory;
+   *   2. its request ROUTER is BOUND, read from the daemon's captured log.
+   *
+   * Stage 2 exists because stage 1 fires early in daemon init, well before the
+   * transport comes up. This used to be papered over with a flat 1 s sleep,
+   * which is a guess, not a signal: on a loaded Windows Debug runner the ROUTER
+   * can still be unbound when it expires, and the daemon can also die inside it
+   * (issue #848) with the old code returning true for a dead process. Either
+   * way the caller was handed a daemon it could not reach, and callers that
+   * retry on a fresh port (see test_daemon_detached_spawn) never got the chance
+   * — they had already been told the daemon was ready. That is the
+   * cr_detached_spawn flake: the client's DEALER dials port+3 and times out.
+   *
+   * Returns false if the timeout elapses or the daemon exits early, which is
+   * what lets those callers retry instead of failing outright.
    */
   bool WaitForReady(int timeout_ms = 30000) {
     // Segment names are port-keyed (see ConfigManager::GetSharedMemorySegmentName)
@@ -193,61 +173,137 @@ class RuntimeServer {
         ctp::ConfigParse::ExpandPath("chi_main_segment_${USER}") + "_" +
         std::to_string(port_);
     const int attempts = timeout_ms / 200;
-    for (int i = 0; i < attempts; ++i) {
+    int i = 0;
+    bool segment_up = false;
+    for (; i < attempts && !segment_up; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       if (!IsRunning()) return false;  // daemon died during startup
       ctp::File fd;
       if (ctp::SystemInfo::OpenSharedMemory(fd, seg)) {
         ctp::SystemInfo::CloseSharedMemory(fd);
-        // Let the daemon finish binding its transports / starting workers.
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        return true;
+        segment_up = true;
       }
     }
-    return false;
+    if (!segment_up) return false;
+
+    // Spend whatever budget is left waiting for the daemon to log that its
+    // admin pool exists. The daemon logs it at INFO, so a caller that wants
+    // this stage must leave CTP_LOG_LEVEL at info or lower; if the line never
+    // shows up we fall through to the settle sleep rather than failing a
+    // daemon that is fine.
+    //
+    // The marker is the ADMIN POOL, not the ROUTER bind. Ordering the daemon's
+    // own startup log, the ROUTER binds second of twenty-one markers -- before
+    // the chimods load, before the workers spawn, and before the admin pool is
+    // created. Treating it as "ready" would hand callers a daemon that cannot
+    // yet route a task, which is strictly worse than the sleep it replaced.
+    // Waiting for the admin pool means the runtime can actually serve work.
+    const std::string log_path = ServerLogPath();
+    bool marker_seen = false;
+    for (; i < attempts && !marker_seen; ++i) {
+      if (!IsRunning()) return false;
+      if (ServerLogHasAdminPool(log_path)) {
+        marker_seen = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    // Keep the historical settle in BOTH cases -- marker seen or budget spent.
+    // The marker is necessary but not provably sufficient: startup work that
+    // logs nothing (e.g. compose/WAL replay re-creating restartable pools) can
+    // still be in flight. Retaining the settle makes this readiness check
+    // strictly stronger than the sleep-only version it replaces, never weaker.
+    // Do not call a daemon that died inside the settle ready.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    return IsRunning();
   }
 
-  /** Stop the daemon (SIGTERM then SIGKILL on POSIX; TerminateProcess on
-   *  Windows) and reap it. Idempotent; called by the destructor. */
+  /**
+   * @return true if the daemon's captured log shows the admin pool created --
+   * i.e. the runtime can route a task, not merely accept a connection.
+   */
+  static bool ServerLogHasAdminPool(const std::string &log_path) {
+    std::ifstream f(log_path, std::ios::binary);
+    if (!f) return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str().find("Admin chimod pool created successfully") !=
+           std::string::npos;
+  }
+
+  /** Stop the daemon (SIGTERM then SIGKILL on POSIX — so ServerFinalize's leak
+   *  report runs; TerminateProcess on Windows) and reap it. Idempotent; called
+   *  by the destructor. */
   void Stop() {
     if (!started_) return;
     started_ = false;
-#ifdef _WIN32
-    TerminateProcess(pi_.hProcess, 0);
-    WaitForSingleObject(pi_.hProcess, 5000);
-    CloseHandle(pi_.hProcess);
-    CloseHandle(pi_.hThread);
-#else
-    if (pid_ <= 0) return;
-    kill(pid_, SIGTERM);
-    for (int i = 0; i < 50; ++i) {  // up to 5s for a clean shutdown
-      int status;
-      if (waitpid(pid_, &status, WNOHANG) != 0) {
-        pid_ = -1;
-        return;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    kill(pid_, SIGKILL);
-    int status;
-    waitpid(pid_, &status, 0);
-    pid_ = -1;
-#endif
+    ctp::SystemInfo::TerminateChild(proc_);
   }
 
   /** True while the daemon process is still alive. */
   bool IsRunning() {
     if (!started_) return false;
-#ifdef _WIN32
-    DWORD code = 0;
-    if (!GetExitCodeProcess(pi_.hProcess, &code)) return false;
-    return code == STILL_ACTIVE;
-#else
-    if (pid_ <= 0) return false;
-    int status;
-    return waitpid(pid_, &status, WNOHANG) == 0;  // 0 => still running
-#endif
+    return ctp::SystemInfo::IsChildRunning(proc_);
   }
+
+#ifndef _WIN32
+  /** The spawned daemon's pid (-1 if not started or already reaped). */
+  pid_t Pid() const { return proc_.valid ? proc_.pid : -1; }
+
+  /**
+   * Wait for the daemon to exit on its own (e.g. after an external
+   * `clio_run stop`) and capture its exit code. Reaps the process, so the
+   * destructor will not try to kill it again.
+   * @param timeout_ms how long to poll before giving up
+   * @param exit_code out: WEXITSTATUS if the daemon exited normally, or
+   *                  128+signal if it was terminated by a signal
+   * @return true if the daemon exited within the timeout
+   */
+  bool WaitExit(int timeout_ms, int *exit_code) {
+    if (!proc_.valid || proc_.pid <= 0) return false;
+    const int attempts = timeout_ms / 100;
+    for (int i = 0; i <= attempts; ++i) {
+      int status = 0;
+      pid_t ret = waitpid(proc_.pid, &status, WNOHANG);
+      if (ret == proc_.pid) {
+        if (exit_code != nullptr) {
+          if (WIFEXITED(status)) {
+            *exit_code = WEXITSTATUS(status);
+          } else if (WIFSIGNALED(status)) {
+            *exit_code = 128 + WTERMSIG(status);
+          } else {
+            *exit_code = -1;
+          }
+        }
+        proc_.pid = -1;
+        proc_.valid = false;
+        started_ = false;
+        return true;
+      }
+      if (ret < 0) {  // already reaped elsewhere
+        proc_.pid = -1;
+        proc_.valid = false;
+        started_ = false;
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+  }
+
+  /**
+   * Abandon ownership of the daemon: the destructor will neither kill nor
+   * reap it. Use after the test dispatched the process by other means (e.g.
+   * an external tool killed and reaped it is impossible — reaping is ours —
+   * so pair with a final waitpid by the caller).
+   */
+  void Disown() {
+    started_ = false;
+    proc_.pid = -1;
+    proc_.valid = false;
+  }
+#endif
 
  private:
   /** Absolute path to the clio_run binary. CMake passes CLIO_RUN_EXE via
@@ -269,14 +325,11 @@ class RuntimeServer {
   static std::string ServerLogPath() {
     const char *override_path = std::getenv("CLIO_TEST_SERVER_LOG");
     if (override_path && *override_path) return override_path;
-#ifdef _WIN32
-    char tmp[MAX_PATH];
-    DWORD n = GetTempPathA(MAX_PATH, tmp);
-    std::string dir = (n > 0 && n < MAX_PATH) ? std::string(tmp, n) : ".\\";
-    return dir + "clio_run_test_server.log";
-#else
-    return "/tmp/clio_run_test_server.log";
-#endif
+    // Portable temp dir (no <windows.h> GetTempPath needed).
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec) dir = ".";
+    return (dir / "clio_run_test_server.log").string();
   }
 
   static void SetEnv(const char *key, const std::string &val) {
@@ -287,11 +340,8 @@ class RuntimeServer {
   // Port the daemon was started on; segment names are port-keyed so multiple
   // runtimes (the fallback topology) can coexist on one node + ${USER}.
   unsigned port_ = 0;
-#ifdef _WIN32
-  PROCESS_INFORMATION pi_{};
-#else
-  pid_t pid_ = -1;
-#endif
+  // Platform-opaque child handle (see ctp::SpawnedProcess) — no OS types here.
+  ctp::SpawnedProcess proc_;
 };
 
 }  // namespace test
