@@ -1,0 +1,183 @@
+# =============================================================================
+# Issue #968 - CLIO vs Zarr S3 READ benchmark: SMOKE TEST (2 rows).
+# =============================================================================
+#
+# Run this FIRST, before the full s3_read_bench.yaml grid. It is the same
+# pipeline narrowed to one granularity (32 MiB objects / 256^3 chunks) at two
+# concurrencies (1 and 32), repeat 1 => 2 rows, ~10 minutes, ~4 GiB of egress.
+#
+# It answers the one question that decides whether the full grid is worth
+# running: DOES CLIO CONCURRENCY ACTUALLY SCALE?
+#
+#   The S3 assimilator downloads via fork() + blocking waitpid() on a runtime
+#   worker thread, so effective concurrency is capped by the worker count
+#   rather than by the requested K. Compare clio_s3.read.agg_bw_mbps between
+#   the K=1 and K=32 rows:
+#
+#     * K=32 clearly faster -> concurrency scales; run the full grid.
+#     * K=32 about equal to K=1 -> workers are the ceiling. Either raise
+#       runtime.num_threads further, or switch the concurrency axis to the
+#       multi-process fallback (clio_s3.nprocs > 1, which partitions the key
+#       space via --object-stride/--object-offset).
+#
+# Also confirms, without burning an 8-hour allocation: credentials reach BOTH
+# stacks, the staged dataset is where the pipeline thinks it is, both drivers
+# emit parseable results, and no column comes back blank.
+#
+# Usage (identical to the full grid):
+#   export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench
+#   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
+#   jarvis ppl submit <abs path>/s3_read_bench_smoke.yaml
+#
+# Output: ${HOME}/s3_read_bench_smoke_results/results.csv - 2 rows.
+#         Every *.agg_bw_mbps column must be populated. A green row with a
+#         blank throughput column is a FAILURE.
+
+scheduler:
+  name: slurm
+  job_name: clio_s3_read_smoke
+  nodes: 1
+  ntasks_per_node: 1
+  # Must stay large: Ares Slurm uses proctrack/cgroup with ConstrainCores, and
+  # the S3 assimilator blocks a whole runtime worker thread on waitpid() for
+  # the duration of each GET. A narrow cgroup silently caps concurrency.
+  cpus_per_task: 48
+  partition: compute
+  time: "01:00:00"
+  output: ${HOME}/s3_read_bench_smoke-%j.out
+  error: ${HOME}/s3_read_bench_smoke-%j.err
+  # MUST stay literally identical to config.hostfile below.
+  hostfile: "${HOME}/.jarvis-s3-bench/s3_read_bench_smoke_hostfile.txt"
+  pre_cmds:
+    # 1) Toolchain. Pure PATH prepends -- never `spack load` / `conda activate`
+    #    (they install shell functions that misbehave under `set -euo pipefail`).
+    - 'export PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
+    - 'export LD_LIBRARY_PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib:${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib64:${LD_LIBRARY_PATH:-}"'
+    - 'command -v clio_run           >/dev/null 2>&1 || { echo "ERROR: clio_run not on PATH (view: ${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view})" >&2; exit 1; }'
+    - 'command -v clio_s3_read_bench >/dev/null 2>&1 || { echo "ERROR: clio_s3_read_bench not on PATH — was IOWarp built with +cae +s3?" >&2; exit 1; }'
+    - 'command -v cae_s3_tool        >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3?" >&2; exit 1; }'
+    - 'command -v jarvis             >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
+    - '"${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" -c "import zarr,s3fs,numpy" || { echo "ERROR: zarr venv broken at ${ZARR_VENV:-$HOME/zarr-venv}" >&2; exit 1; }'
+    - 'echo "toolchain: clio_run=$(command -v clio_run) bench=$(command -v clio_s3_read_bench) jarvis=$(command -v jarvis)"'
+    # 2) AWS credentials. NO SECRETS IN THIS FILE. Credentials live in
+    #    ~/.aws/credentials (mode 600); both the AWS C++ SDK default chain
+    #    (cae_s3_tool) and botocore (s3fs) read it. Only non-secret profile and
+    #    region names appear here.
+    - 'export AWS_PROFILE="${S3_BENCH_PROFILE:-clio-bench}"'
+    - 'export AWS_DEFAULT_REGION="${S3_BENCH_REGION:-us-east-1}"'
+    # Real AWS: an endpoint override flips cae_s3_tool to path-style addressing
+    # against a nonexistent host, so both must stay unset.
+    - 'unset S3_ENDPOINT AWS_ENDPOINT_URL'
+    - '[ -r "$HOME/.aws/credentials" ] || { echo "ERROR: ~/.aws/credentials missing/unreadable" >&2; exit 1; }'
+    - '[ -n "${S3_BENCH_BUCKET:-}" ] || { echo "ERROR: S3_BENCH_BUCKET not set" >&2; exit 1; }'
+    # 3) The runtime forks cae_s3_tool, so IT needs these -- exporting them in
+    #    the benchmark package alone is not enough. TMPDIR must be node-local
+    #    with room for concurrency * object_size (32 x 256 MiB = 8 GiB).
+    - 'export CAE_S3_TOOL="$(command -v cae_s3_tool)"'
+    - 'export TMPDIR=/tmp/clio_s3_bench; mkdir -p "$TMPDIR"'
+    # 4) Stale-state cleanup. pkill patterns are BRACKETED so they never match
+    #    this script's own argv.
+    - 'pkill -9 -f "[c]himaera" 2>/dev/null || true'
+    - 'pkill -9 -f "[c]lio_run" 2>/dev/null || true'
+    - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
+    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
+    - 'rm -rf "$TMPDIR"/cae_s3_* /tmp/iowarp_chi* 2>/dev/null || true'
+    # 5) Experiment dirs + repo registration + clean slate (the sweep runner
+    #    RESUMES over an existing results.csv and would skip failed rows).
+    - 'mkdir -p "$HOME/s3_read_bench_smoke_results" "$HOME/.jarvis-s3-bench"'
+    - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
+    - 'rm -f "$HOME/s3_read_bench_smoke_results/results.csv"'
+  post_cmds:
+    - 'RES="$HOME/s3_read_bench_smoke_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 2"'
+    # A green row with a blank throughput column is a FAILURE, not a success.
+    # Assert it here instead of leaving it to manual inspection.
+    - |
+      python3 - "$HOME/s3_read_bench_smoke_results/results.csv" <<'EOF'
+      import csv, os, sys
+      path = sys.argv[1]
+      if not os.path.exists(path):
+          print("NO RESULTS CSV AT", path); sys.exit(0)
+      need = ["clio_s3.read.agg_bw_mbps", "zarr_s3.read.agg_bw_mbps",
+              "zarr_s3.readzstd.agg_bw_mbps"]
+      rows = list(csv.DictReader(open(path)))
+      bad = [r.get("run_idx") for r in rows
+             if r.get("status") == "success" and any(not r.get(c) for c in need)]
+      print("rows:", len(rows))
+      print("GREEN ROWS WITH BLANK THROUGHPUT (== FAILURES):", bad or "none")
+      EOF
+
+config:
+  name: s3_read_bench_smoke
+
+  # MUST stay literally identical to scheduler.hostfile above.
+  hostfile: "${HOME}/.jarvis-s3-bench/s3_read_bench_smoke_hostfile.txt"
+
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 16          # SWEPT with concurrency -- see the note above
+      client_data_segment_size: "4G"
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      # SWIM off: transient errors must not promote a peer to dead mid-bench.
+      swim_enabled: false
+      sleep: 4
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      # 24 GB is ~12x the 2 GiB working set, so a row never spills or evicts.
+      devices:
+        - ["ram::cte_ram_tier1", "24GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+
+    - pkg_type: jarvis_clio_core.clio_s3_read_bench
+      pkg_name: clio_s3
+      bucket: "${S3_BENCH_BUCKET}"
+      key_prefix: "clio-s3-read-bench/raw/33554432"   # SWEPT
+      object_size: "32m"                              # SWEPT
+      num_objects: 64                                 # SWEPT
+      concurrency: 8                                  # SWEPT
+      worker_threads: 16                              # SWEPT (reported only)
+      tag_prefix: "s3rb"
+      tmpdir: "/tmp/clio_s3_bench"
+      aws_region: "${S3_BENCH_REGION}"
+      verify: false
+
+    - pkg_type: jarvis_clio_core.zarr_s3_read_bench
+      pkg_name: zarr_s3
+      bucket: "${S3_BENCH_BUCKET}"
+      store_prefix: "clio-s3-read-bench"
+      chunk_edge: 256                                 # SWEPT
+      variants: ["none", "zstd"]
+      async_concurrency: 8                            # SWEPT
+      aws_region: "${S3_BENCH_REGION}"
+      venv: "${ZARR_VENV}"
+
+vars:
+  # One granularity only: 32 MiB objects <-> 256^3 chunks, 64 requests, 2 GiB.
+  clio_s3.key_prefix:  ["clio-s3-read-bench/raw/33554432"]
+  clio_s3.object_size: ["32m"]
+  clio_s3.num_objects: [64]
+  zarr_s3.chunk_edge:  [256]
+
+  # The whole point of the smoke test: K=1 vs K=32.
+  clio_s3.concurrency:       [1, 32]
+  zarr_s3.async_concurrency: [1, 32]
+  runtime.num_threads:       [4, 48]
+  clio_s3.worker_threads:    [4, 48]
+
+loop:
+  - [clio_s3.key_prefix, clio_s3.object_size, clio_s3.num_objects,
+     zarr_s3.chunk_edge]
+  - [clio_s3.concurrency, zarr_s3.async_concurrency, runtime.num_threads,
+     clio_s3.worker_threads]
+
+# Per-combination wall-clock backstop. Expiry marks that row failed and the
+# sweep continues, so one wedged row can no longer lose the other 35.
+run_timeout: 1800
+
+repeat: 1
+output: "${HOME}/s3_read_bench_smoke_results"
