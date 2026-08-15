@@ -2512,12 +2512,16 @@ void Runtime::RebuildTagSearchIndexLocked() {
   // yields the full path. Used after WAL/metadata restore, where tags are
   // inserted directly (bypassing GetOrAssignTagId's per-insert indexing).
   tag_search_.Clear();
+  std::vector<std::pair<TagId, std::string>> tags;
   tag_id_to_info_.for_each([&](const TagId & /*id*/, const TagInfo &info) {
-    std::string abs = ResolveTagName(info.tag_name_.str());
-    if (!abs.empty()) {
-      tag_search_.Insert(abs, info.tag_id_);
-    }
+    tags.emplace_back(info.tag_id_, info.tag_name_.str());
   });
+  for (const auto &tag : tags) {
+    std::string abs = ResolveTagName(tag.second);
+    if (!abs.empty()) {
+      tag_search_.Insert(abs, tag.first);
+    }
+  }
 }
 
 TagId Runtime::GetOrCreateTagChain(const std::string &name,
