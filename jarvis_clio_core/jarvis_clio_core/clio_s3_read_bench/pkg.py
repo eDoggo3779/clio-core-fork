@@ -247,6 +247,15 @@ class ClioS3ReadBench(Application):
         _get_stat(): the sweep runner reloads a fresh package instance before
         collecting stats, so an in-memory buffer would be lost.
         """
+        # The sweep runner reloads a fresh instance and calls start() WITHOUT
+        # re-running _configure(), so the paths it sets are still None here.
+        # Resolve them from framework attributes (as _get_stat already does)
+        # rather than trusting _configure -- otherwise _time_prefix() feeds a
+        # None into ' '.join() ("sequence item 3: expected str instance").
+        self.output_path = os.path.join(self.shared_dir,
+                                        'clio_s3_bench_output.txt')
+        self.rss_path = os.path.join(self.shared_dir, 'clio_s3_bench_time.txt')
+
         # Stale output from a previous combination is the blank-column failure
         # mode -- a crash here would otherwise be scored with old numbers.
         for path in (self.output_path, self.rss_path):

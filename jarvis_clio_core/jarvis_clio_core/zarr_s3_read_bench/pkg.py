@@ -201,6 +201,14 @@ class ZarrS3ReadBench(Application):
 
     def start(self):
         """Run the reader once per compression variant."""
+        # The sweep runner reloads a fresh instance and calls start() WITHOUT
+        # re-running _configure(), so self.script_path set there is still None
+        # here. Resolve it from self.pkg_dir (a framework attribute set on
+        # every instance) rather than trusting _configure -- otherwise the
+        # command becomes "python None ..." and can't open the script.
+        self.script_path = os.path.join(self.pkg_dir, 'scripts',
+                                        'zarr_s3_read.py')
+
         venv = os.path.expandvars(self.config['venv'])
         python = os.path.join(venv, 'bin', 'python3')
         if not os.path.exists(python):
