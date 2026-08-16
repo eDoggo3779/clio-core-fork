@@ -58,7 +58,7 @@ scheduler:
   # Must stay large: Ares Slurm uses proctrack/cgroup with ConstrainCores, and
   # the S3 assimilator blocks a whole runtime worker thread on waitpid() for
   # the duration of each GET. A narrow cgroup silently caps concurrency.
-  cpus_per_task: 48
+  cpus_per_task: 40
   partition: compute
   time: "08:00:00"
   output: ${HOME}/s3_read_bench-%j.out
