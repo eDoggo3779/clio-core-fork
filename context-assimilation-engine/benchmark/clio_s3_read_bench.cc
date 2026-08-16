@@ -345,6 +345,13 @@ RunResult RunReadLoop(const BenchConfig& c, clio::cae::core::Client& cae_client,
     ctx.format = "binary";
     ctx.range_off = 0;
     ctx.range_size = 0;  // whole object
+    // Forward THIS process's resolved AWS region/profile into the context. The
+    // assimilator runs in the runtime daemon (ssh-launched, no inherited AWS_*),
+    // so without this cae_s3_tool defaults to us-east-1/anonymous and every GET
+    // fails (PermanentRedirect / Access Denied) even though the client's own
+    // preflight -- which runs here, with these vars set -- succeeds.
+    if (const char* r = std::getenv("AWS_DEFAULT_REGION")) ctx.s3_region = r;
+    if (const char* p = std::getenv("AWS_PROFILE")) ctx.s3_profile = p;
     return ctx;
   };
 

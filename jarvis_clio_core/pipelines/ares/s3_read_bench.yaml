@@ -168,6 +168,11 @@ config:
       tag_prefix: "s3rb"
       tmpdir: "/tmp/clio_s3_bench"
       aws_region: "${S3_BENCH_REGION}"
+      # Set explicitly so the benchmark's env carries AWS_PROFILE deterministically;
+      # the benchmark forwards region+profile into each assimilation context so the
+      # ssh-launched runtime daemon's cae_s3_tool (which inherits neither) can sign
+      # correctly. Without this the daemon defaults to us-east-1/anonymous.
+      aws_profile: "${S3_BENCH_PROFILE}"
       verify: false
 
     - pkg_type: jarvis_clio_core.zarr_s3_read_bench
