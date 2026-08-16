@@ -503,9 +503,16 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Bring up CLIO + CTE + CAE. The AWS SDK is never linked into this process;
-  // all S3 I/O happens out-of-process via cae_s3_tool.
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
+  // Attach to the already-running clio_run daemon as a pure client. The
+  // second arg (default_with_runtime) MUST be false here: the jarvis pipeline
+  // starts the runtime via the clio_runtime package, so bootstrapping a second
+  // runtime in-process collides on port 9413 ("Address already in use") and
+  // aborts the row. (test_s3_assim.cc passes true because a unit test has no
+  // external daemon and must start its own -- the wrong precedent to copy for
+  // a pipeline client; clio_cte_bench.cc, which runs in this same pipeline
+  // shape, correctly uses false.) The AWS SDK is never linked into this
+  // process; all S3 I/O happens out-of-process via cae_s3_tool.
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     HLOG(kError, "Failed to initialize Clio");
     return 1;
   }
