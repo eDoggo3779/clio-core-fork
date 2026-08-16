@@ -118,7 +118,14 @@ config:
       num_threads: 16          # SWEPT with concurrency -- see the note above
       client_data_segment_size: "4G"
       port: 9413
-      ipc_mode: "shm"
+      # IPC (unix socket), NOT shm: the benchmark is a detached client, not a
+      # descendant of the runtime daemon, and Ares compute nodes run
+      # ptrace_scope=1. SHM mode attaches the daemon's main segment by
+      # reopening /proc/<server_pid>/fd via a memfd symlink, which ptrace_scope=1
+      # denies for a non-descendant (shm_open -> EACCES, "Failed to initialize
+      # Clio"). The unix-socket transport needs no /proc reopen; it is ~38x
+      # faster than TCP (issue #768) so the throughput cost vs SHM is small.
+      ipc_mode: "ipc"
       log_level: "info"
       # SWIM off: transient errors must not promote a peer to dead mid-bench.
       swim_enabled: false
