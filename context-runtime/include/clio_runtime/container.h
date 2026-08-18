@@ -591,10 +591,14 @@ class Container {
   /**
    * Register this ChiMod's web-dashboard routes.
    *
-   * Called once per container by PoolManager::RegisterContainer, right after
-   * the container is published. By then the ChiMod's `viz/` asset directory (if
-   * it ships one) is already mounted at /viz/<mod_name>, so an override only
-   * needs to add the endpoints its pages fetch:
+   * Called TWICE-over: once at module-load time on a throwaway
+   * default-constructed prototype instance (ModuleManager::LoadChiMod) -- so a
+   * module's pages and its /api/mod/<mod>/create form exist BEFORE any pool of
+   * the module does -- and again per container by
+   * PoolManager::RegisterContainer (a no-op thanks to first-wins route
+   * registration). The ChiMod's `viz/` asset directory (if it ships one) is
+   * mounted at /viz/<mod_name> by the same hooks, so an override only needs to
+   * add the endpoints its pages fetch:
    *
    *   void RegisterViz(viz::VizServer &viz, const std::string &mod) override {
    *     viz.AddRoute({"GET", "/api/mod/" + mod + "/{pool}/stats", mod,
@@ -609,10 +613,14 @@ class Container {
    * may read node-local manager state and may submit a task and wait on its
    * Future, but they are not coroutines and must not co_await.
    *
-   * Prefer capturing by value and reading the manager singletons, as above: a
-   * handler outlives no container that way. A handler that DOES capture `this`
-   * must call viz.RemoveModule(mod_name) when the container is destroyed, or a
-   * later request will run it over freed memory.
+   * Because the load-time call runs on an UNINITIALIZED prototype that is
+   * destroyed immediately after, neither this method's body nor any handler it
+   * registers may read container state or capture `this`. Capture by value and
+   * reach state through the manager singletons or a locally-constructed
+   * client (Client(pool_id) resolved from the request), as above. A module
+   * that violates this and captures `this` must call
+   * viz.RemoveModule(mod_name) before the container dies, or a later request
+   * runs the handler over freed memory.
    *
    * @param viz The node-local viz server / route registry
    * @param mod_name This container's ChiMod name (what get_chimod_name()

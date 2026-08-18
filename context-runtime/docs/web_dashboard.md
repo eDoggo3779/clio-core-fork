@@ -107,10 +107,14 @@ the home page (the admin ChiMod's dashboard shell).
    }
    ```
 
-   `RegisterViz` is called once per container by
-   `PoolManager::RegisterContainer`, right after the container is published and
-   before its `Create` runs. Registration is idempotent (first `(method, path)`
-   wins), so several containers — or several pools of the same ChiMod — are fine.
+   `RegisterViz` is called at module-LOAD time on a throwaway
+   default-constructed prototype instance (so your create form and pages exist
+   before any pool of the module does) and again per container by
+   `PoolManager::RegisterContainer`. Registration is idempotent (first
+   `(method, path)` wins). Because of the prototype call, neither the method
+   body nor any handler may read container state or capture `this` — capture by
+   value and construct clients locally (`Client(pool_id)` resolved from the
+   request), as above.
 
    Path segments of the form `{name}` bind into `Request::path_vars`.
 
@@ -150,11 +154,65 @@ workers stop, so no handler can be left waiting on a task that will never run.
 | `GET /api/nodes/{node}/containers` | containers and their learned task-cost models |
 | `GET /api/nodes/{node}/bdevs` | block devices on the node |
 | `GET /api/pools/{pool}/monitor` | forward `?query` to a pool's own `Monitor()` (`?routing=local\|broadcast\|…`) |
+| `GET /api/chimods` | loaded modules, and which registered a create form / shipped pages |
+| `POST /api/pools/compose` | create a pool of ANY module via the compose path (identity fields + raw YAML) |
 
 `{node}` is a node id or `local`. Addressing this node by its own id routes
 locally, so the single-node case never touches the network.
 
-All of them are read-only. Nothing here shuts a node down or mutates data.
+The GETs are all read-only. The POSTs create pools and manage module resources
+— the same operations any local RPC client can already perform — and stay
+node-local; nothing here shuts a node down or deletes data.
+
+## Creating pools: the "Add Pool" convention
+
+The Pools tab's **Add Pool** button lists every loaded ChiMod
+(`GET /api/chimods`) with a search box. Creation then goes one of two ways:
+
+- **The module's own form.** A ChiMod registers
+  `GET /api/mod/<mod>/create` answering a form spec —
+  `{"title", "note", "fields":[{name,label,type,required,default,options,placeholder,help}]}`
+  with field types `text`, `select`, `textarea` — and
+  `POST /api/mod/<mod>/create` accepting those fields urlencoded.
+  `action=validate` checks everything and creates nothing (the form's Validate
+  button); otherwise the module creates the pool with its own typed client and
+  answers `{"ok":true,"pool_id":...}`. Validation failures come back as
+  `{"ok":false,"errors":{field: message}}` at HTTP 400, all fields at once.
+  bdev, safe-bdev and the CTE core all register this convention.
+
+- **The generic compose editor.** Modules without a form are still creatable:
+  `POST /api/pools/compose` takes `mod_name`, `pool_name`, `pool_id`,
+  `pool_query` and a raw-YAML `config` field, and drives the same
+  `AsyncCompose` path as `clio_run compose` — the YAML is the compose entry's
+  module parameters, verbatim.
+
+Two rules make the forms work:
+
+- **Explicit pool ids.** The runtime rejects null pool ids, so specs prefill
+  `pool_id` from `viz::SuggestFreePoolMajor(base)` — a node-local suggestion
+  the user may edit, not a reservation.
+- **Never `ConfigParse::ParseSize` on form input.** It `exit(1)`s on garbage.
+  Use `viz::ParseSizeField`, which rejects instead of dying.
+
+POST bodies of type `application/x-www-form-urlencoded` are parsed into
+`Request::params` (query string wins on a key collision), so handlers read one
+map whether the value came from the URL or the form.
+
+## The module websites
+
+- **`/viz/clio_bdev`** — per-device capacity, throughput, latency and TTL
+  cards, from each pool's `Monitor("stats")`.
+- **`/viz/clio_safe_bdev`** — pick an array, watch recovery progress and the
+  member roster live, **add** a member (an existing bdev pool by name, or
+  name+capacity to create one on the spot; `as_parity=1` raises the parity
+  level) and **remove** one. Backed by
+  `POST /api/mod/clio_safe_bdev/{pool}/add_member` and `.../remove_member`.
+- **`/viz/clio_cte_core`** — the pool's storage-target roster (name, score,
+  free space, traffic) with **register** (a bdev by name — fresh
+  type+capacity, or `attach_pool_id` to attach an existing pool such as a
+  safe-bdev array) and **unregister** buttons. Backed by
+  `POST /api/mod/clio_cte_core/{pool}/register_target` and
+  `.../unregister_target`, with the roster at `GET .../targets`.
 
 ## Build requirements
 

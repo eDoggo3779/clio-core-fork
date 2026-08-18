@@ -100,6 +100,28 @@ HttpReply HttpGet(clio::run::u32 port, const std::string &path) {
   return reply;
 }
 
+/** POST a urlencoded form to the dashboard, the way the pages' fetch() does.
+ *  Actions get a longer client timeout than reads: creating a pool composes
+ *  nested pools and the handler itself waits up to 30s. */
+HttpReply HttpPostForm(clio::run::u32 port, const std::string &path,
+                       const std::string &form) {
+  HttpReply reply;
+  Poco::Net::HTTPClientSession session("127.0.0.1",
+                                       static_cast<Poco::UInt16>(port));
+  session.setTimeout(Poco::Timespan(60, 0));
+  Poco::Net::HTTPRequest request(Poco::Net::HTTPRequest::HTTP_POST, path,
+                                 Poco::Net::HTTPMessage::HTTP_1_1);
+  request.setContentType("application/x-www-form-urlencoded");
+  request.setContentLength(static_cast<std::streamsize>(form.size()));
+  session.sendRequest(request) << form;
+  Poco::Net::HTTPResponse response;
+  std::istream &stream = session.receiveResponse(response);
+  Poco::StreamCopier::copyToString(stream, reply.body);
+  reply.status = static_cast<int>(response.getStatus());
+  reply.content_type = response.getContentType();
+  return reply;
+}
+
 bool Contains(const std::string &haystack, const std::string &needle) {
   return haystack.find(needle) != std::string::npos;
 }
@@ -583,6 +605,255 @@ TEST_CASE("Viz extends itself when another ChiMod comes up", "[viz]") {
   REQUIRE(stats.status == 200);
   REQUIRE(Contains(stats.body, "\"total_capacity\":"));
   REQUIRE(Contains(stats.body, "\"pool_name\":\"ram::viz_test_bdev\""));
+}
+
+TEST_CASE("Viz form bodies parse like query parameters", "[viz]") {
+  std::map<std::string, std::string> params;
+  viz::VizServer::ParseFormBody(
+      "pool_name=ram%3A%3Aform&capacity=16MB&note=a+b%26c&flag", &params);
+  REQUIRE(params["pool_name"] == "ram::form");
+  REQUIRE(params["capacity"] == "16MB");
+  REQUIRE(params["note"] == "a b&c");
+  REQUIRE(params.count("flag") == 1);
+  REQUIRE(params["flag"].empty());
+
+  // Existing keys (the query string, parsed first) win over the body.
+  std::map<std::string, std::string> merged{{"action", "validate"}};
+  viz::VizServer::ParseFormBody("action=create&other=1", &merged);
+  REQUIRE(merged["action"] == "validate");
+  REQUIRE(merged["other"] == "1");
+}
+
+TEST_CASE("Viz Add Pool: module create forms and the generic compose",
+          "[viz]") {
+  // The "Add Pool" convention end to end: /api/chimods advertises which loaded
+  // modules registered a create form, the module's GET answers a field spec,
+  // and its POST validates or creates -- while modules without a form are
+  // creatable through the admin's generic compose editor.
+  REQUIRE(InitRuntimeWithViz());
+  const clio::run::u32 port = CLIO_VIZ->GetPort();
+
+  // A bdev pool must exist for bdev's routes to be registered (the previous
+  // test made one; make the dependency explicit rather than ordering-implicit).
+  {
+    clio::run::PoolId seed_id(4991, 0);
+    clio::run::bdev::Client seed(seed_id);
+    auto create = seed.AsyncCreate(clio::run::PoolQuery::Dynamic(),
+                                   "ram::viz_seed_bdev", seed_id,
+                                   clio::run::bdev::BdevType::kRam,
+                                   16 * 1024 * 1024);
+    create.Wait();
+    REQUIRE(create->return_code_ == 0);
+  }
+
+  // ---- module inventory ----
+  HttpReply chimods = HttpGet(port, "/api/chimods");
+  Explain("/api/chimods", chimods);
+  REQUIRE(chimods.status == 200);
+  REQUIRE(Contains(chimods.body,
+                   "\"name\":\"clio_bdev\",\"has_create\":true"));
+
+  // ---- the module's own form ----
+  HttpReply spec = HttpGet(port, "/api/mod/clio_bdev/create");
+  Explain("GET /api/mod/clio_bdev/create", spec);
+  REQUIRE(spec.status == 200);
+  REQUIRE(Contains(spec.body, "\"fields\":["));
+  REQUIRE(Contains(spec.body, "\"name\":\"pool_name\""));
+  REQUIRE(Contains(spec.body, "\"name\":\"bdev_type\""));
+
+  // Validation catches every bad field in one round trip, creating nothing.
+  HttpReply invalid = HttpPostForm(
+      port, "/api/mod/clio_bdev/create",
+      "action=validate&pool_name=&pool_id=notanid&capacity=alot");
+  Explain("POST create (invalid)", invalid);
+  REQUIRE(invalid.status == 400);
+  REQUIRE(Contains(invalid.body, "\"ok\":false"));
+  REQUIRE(Contains(invalid.body, "\"pool_name\":"));
+  REQUIRE(Contains(invalid.body, "\"pool_id\":"));
+  REQUIRE(Contains(invalid.body, "\"capacity\":"));
+
+  HttpReply valid = HttpPostForm(
+      port, "/api/mod/clio_bdev/create",
+      "action=validate&pool_name=ram::viz_form_bdev&pool_id=4992.0"
+      "&bdev_type=ram&capacity=16MB");
+  Explain("POST create (validate)", valid);
+  REQUIRE(valid.status == 200);
+  REQUIRE(Contains(valid.body, "\"ok\":true"));
+
+  // Create for real, then confirm the pool is actually there.
+  HttpReply created = HttpPostForm(
+      port, "/api/mod/clio_bdev/create",
+      "pool_name=ram::viz_form_bdev&pool_id=4992.0&bdev_type=ram"
+      "&capacity=16MB");
+  Explain("POST create", created);
+  REQUIRE(created.status == 200);
+  REQUIRE(Contains(created.body, "\"ok\":true"));
+  REQUIRE(Contains(created.body, "\"pool_id\":\"4992.0\""));
+  HttpReply pools = HttpGet(port, "/api/mod/clio_bdev/pools");
+  REQUIRE(Contains(pools.body, "ram::viz_form_bdev"));
+
+  // ---- the generic compose editor (any module, YAML params) ----
+  HttpReply composed = HttpPostForm(
+      port, "/api/pools/compose",
+      "mod_name=clio_bdev&pool_name=ram::viz_composed_bdev&pool_id=4993.0"
+      "&pool_query=local&config=" +
+          std::string("bdev_type%3A%20ram%0Acapacity%3A%2016MB"));
+  Explain("POST /api/pools/compose", composed);
+  REQUIRE(composed.status == 200);
+  REQUIRE(Contains(composed.body, "\"ok\":true"));
+  HttpReply pools2 = HttpGet(port, "/api/mod/clio_bdev/pools");
+  REQUIRE(Contains(pools2.body, "ram::viz_composed_bdev"));
+
+  // An unknown module is a validation error, not a create attempt.
+  HttpReply bad_mod = HttpPostForm(
+      port, "/api/pools/compose",
+      "mod_name=clio_nonexistent&pool_name=x&pool_id=4994.0");
+  REQUIRE(bad_mod.status == 400);
+  REQUIRE(Contains(bad_mod.body, "\"mod_name\":"));
+}
+
+TEST_CASE("Viz safe-bdev website: create, add and remove members", "[viz]") {
+  // The safe-bdev page's whole lifecycle over HTTP: create member bdevs via the
+  // bdev form, create the array via safe-bdev's form, watch it through
+  // Monitor("stats"), grow it with add_member, shrink it with remove_member.
+  REQUIRE(InitRuntimeWithViz());
+  const clio::run::u32 port = CLIO_VIZ->GetPort();
+
+  // Three data members, created through the bdev module's own create route.
+  for (int i = 0; i < 3; ++i) {
+    HttpReply member = HttpPostForm(
+        port, "/api/mod/clio_bdev/create",
+        "pool_name=ram::viz_safe_member_" + std::to_string(i) +
+            "&pool_id=" + std::to_string(4950 + i) +
+            ".0&bdev_type=ram&capacity=16MB");
+    REQUIRE(member.status == 200);
+  }
+
+  // Validation: a member name that does not exist is reported by name.
+  HttpReply invalid = HttpPostForm(
+      port, "/api/mod/clio_safe_bdev/create",
+      "action=validate&pool_name=viz_safe_array&pool_id=4960.0"
+      "&max_failures=1&members=ram::viz_safe_member_0,ram::no_such_pool");
+  Explain("safe-bdev create (invalid)", invalid);
+  REQUIRE(invalid.status == 400);
+  REQUIRE(Contains(invalid.body, "no_such_pool"));
+
+  // Create the array over the three members.
+  HttpReply created = HttpPostForm(
+      port, "/api/mod/clio_safe_bdev/create",
+      "pool_name=viz_safe_array&pool_id=4960.0&max_failures=1"
+      "&members=ram::viz_safe_member_0,%20ram::viz_safe_member_1,"
+      "%20ram::viz_safe_member_2");
+  Explain("safe-bdev create", created);
+  REQUIRE(created.status == 200);
+  REQUIRE(Contains(created.body, "\"ok\":true"));
+  REQUIRE(Contains(created.body, "\"data_members\":3"));
+
+  // The module's page and index are up.
+  HttpReply page = HttpGet(port, "/viz/clio_safe_bdev/index.html");
+  REQUIRE(page.status == 200);
+  HttpReply pools = HttpGet(port, "/api/mod/clio_safe_bdev/pools");
+  Explain("/api/mod/clio_safe_bdev/pools", pools);
+  REQUIRE(pools.status == 200);
+  REQUIRE(Contains(pools.body, "viz_safe_array"));
+
+  // Live state through the generic Monitor forward -- what the page polls.
+  HttpReply stats =
+      HttpGet(port, "/api/pools/4960.0/monitor?query=stats&routing=local");
+  Explain("safe-bdev stats", stats);
+  REQUIRE(stats.status == 200);
+  REQUIRE(Contains(stats.body, "\"data_count\":3"));
+  REQUIRE(Contains(stats.body, "\"members\":["));
+
+  // Grow the array: a parity member the handler creates on the spot.
+  HttpReply added = HttpPostForm(
+      port, "/api/mod/clio_safe_bdev/4960.0/add_member",
+      "member_name=ram::viz_safe_parity&capacity=16MB&bdev_type=ram"
+      "&as_parity=1");
+  Explain("safe-bdev add_member", added);
+  REQUIRE(added.status == 200);
+  REQUIRE(Contains(added.body, "\"ok\":true"));
+  const std::string member_id_key = "\"member_pool_id\":\"";
+  const size_t id_at = added.body.find(member_id_key) + member_id_key.size();
+  const std::string parity_id =
+      added.body.substr(id_at, added.body.find('"', id_at) - id_at);
+
+  HttpReply grown =
+      HttpGet(port, "/api/pools/4960.0/monitor?query=stats&routing=local");
+  REQUIRE(Contains(grown.body, "\"parity_level\":1"));
+  REQUIRE(Contains(grown.body, "viz_safe_parity"));
+
+  // Shrink it again: remove the parity member we just added.
+  HttpReply removed = HttpPostForm(
+      port, "/api/mod/clio_safe_bdev/4960.0/remove_member",
+      "member_pool_id=" + parity_id + "&was_faulty=0");
+  Explain("safe-bdev remove_member", removed);
+  REQUIRE(removed.status == 200);
+  REQUIRE(Contains(removed.body, "\"ok\":true"));
+
+  // Error paths: a missing member name, and a pool that is not a safe-bdev.
+  HttpReply no_member = HttpPostForm(
+      port, "/api/mod/clio_safe_bdev/4960.0/add_member", "member_name=");
+  REQUIRE(no_member.status == 400);
+  HttpReply wrong_pool = HttpPostForm(
+      port, "/api/mod/clio_safe_bdev/4950.0/add_member",
+      "member_name=ram::viz_safe_member_0");
+  REQUIRE(wrong_pool.status == 404);
+}
+
+TEST_CASE("Viz CTE website: targets register and unregister by name",
+          "[viz]") {
+  // The CTE page's lifecycle over HTTP: create a bare CTE pool via its form,
+  // register a bdev by name as a placement target, see it in the roster with
+  // score and capacity, then unregister it.
+  REQUIRE(InitRuntimeWithViz());
+  const clio::run::u32 port = CLIO_VIZ->GetPort();
+
+  HttpReply created = HttpPostForm(
+      port, "/api/mod/clio_cte_core/create",
+      "pool_name=viz_cte_pool&pool_id=4970.0");
+  Explain("CTE create", created);
+  REQUIRE(created.status == 200);
+  REQUIRE(Contains(created.body, "\"ok\":true"));
+
+  HttpReply page = HttpGet(port, "/viz/clio_cte_core/index.html");
+  REQUIRE(page.status == 200);
+  HttpReply pools = HttpGet(port, "/api/mod/clio_cte_core/pools");
+  REQUIRE(pools.status == 200);
+  REQUIRE(Contains(pools.body, "viz_cte_pool"));
+
+  // Register a fresh RAM bdev, by name, as a target.
+  HttpReply registered = HttpPostForm(
+      port, "/api/mod/clio_cte_core/4970.0/register_target",
+      "name=ram::viz_cte_tier&bdev_type=ram&capacity=16MB");
+  Explain("CTE register_target", registered);
+  REQUIRE(registered.status == 200);
+  REQUIRE(Contains(registered.body, "\"ok\":true"));
+
+  HttpReply targets = HttpGet(port, "/api/mod/clio_cte_core/4970.0/targets");
+  Explain("CTE targets", targets);
+  REQUIRE(targets.status == 200);
+  REQUIRE(Contains(targets.body, "ram::viz_cte_tier"));
+  REQUIRE(Contains(targets.body, "\"remaining_space\":"));
+
+  // And gone again.
+  HttpReply unregistered = HttpPostForm(
+      port, "/api/mod/clio_cte_core/4970.0/unregister_target",
+      "name=ram::viz_cte_tier");
+  Explain("CTE unregister_target", unregistered);
+  REQUIRE(unregistered.status == 200);
+  HttpReply after = HttpGet(port, "/api/mod/clio_cte_core/4970.0/targets");
+  REQUIRE_FALSE(Contains(after.body, "ram::viz_cte_tier"));
+
+  // Error paths: capacity is required for a fresh bdev, and a non-CTE pool 404s.
+  HttpReply no_cap = HttpPostForm(
+      port, "/api/mod/clio_cte_core/4970.0/register_target",
+      "name=ram::viz_cte_tier2&bdev_type=ram&capacity=0");
+  REQUIRE(no_cap.status == 400);
+  HttpReply wrong_pool = HttpPostForm(
+      port, "/api/mod/clio_cte_core/4960.0/register_target",
+      "name=ram::x&capacity=16MB");
+  REQUIRE(wrong_pool.status == 404);
 }
 
 SIMPLE_TEST_MAIN()

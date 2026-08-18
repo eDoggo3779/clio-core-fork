@@ -306,6 +306,17 @@ class VizServer {
   static bool MatchPath(const std::string &pattern, const std::string &path,
                         std::map<std::string, std::string> *vars);
 
+  /**
+   * Parse an `application/x-www-form-urlencoded` body ("a=1&b=x%20y") into
+   * @p out, percent-decoding keys and values. Keys already present in @p out
+   * are NOT overwritten, so calling this after the query string has been
+   * parsed gives the query string precedence. The HTTP layer applies this to
+   * every POST with that content type; exposed so tests (and non-HTTP callers)
+   * can build the same Request a form submission produces.
+   */
+  static void ParseFormBody(const std::string &body,
+                            std::map<std::string, std::string> *out);
+
  private:
   /** Resolve a mount + URL to a file on disk, rejecting traversal. */
   bool ResolveAsset(const Request &req, std::string *file_path,
@@ -322,6 +333,35 @@ class VizServer {
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/**
+ * Pick a pool MAJOR id no existing pool uses, starting at @p base.
+ *
+ * Explicit pool ids are mandatory (PoolManager rejects null ids), so every
+ * dashboard create form needs a sensible default; this is that default. It is a
+ * node-local suggestion, not a reservation — two racing creates can still
+ * collide, and the create itself reports that — so forms treat it as a
+ * prefilled field the user may edit.
+ *
+ * @param base First candidate major (each ChiMod picks its own range so the
+ *             suggestions do not trample the well-known ids)
+ * @return A major id such that (major, 0) names no current pool
+ */
+u32 SuggestFreePoolMajor(u32 base);
+
+/**
+ * Parse a human size string ("16MB", "1g", "4096") into bytes, REJECTING
+ * garbage instead of dying.
+ *
+ * ctp::ConfigParse::ParseSize exits the process on an unknown suffix -- fine
+ * for a config file the operator wrote, fatal for a dashboard form field an
+ * HTTP client typed. Every viz handler that accepts a size must use this.
+ *
+ * Grammar matches ConfigParse: optional decimal number, optional K/M/G/T/P
+ * suffix (case-insensitive, trailing "B"/"b" tolerated), whitespace ignored.
+ * @return true and set @p out on success; false on anything else.
+ */
+bool ParseSizeField(const std::string &text, u64 *out);
 
 }  // namespace clio::run::viz
 

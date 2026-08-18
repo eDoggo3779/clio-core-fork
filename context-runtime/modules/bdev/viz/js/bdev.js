@@ -56,6 +56,9 @@ async function render() {
         <tr><td>writes</td><td class="num">${esc(s.total_writes)}</td></tr>
         <tr><td>bytes read</td><td class="num">${bytes(s.total_bytes_read)}</td></tr>
         <tr><td>bytes written</td><td class="num">${bytes(s.total_bytes_written)}</td></tr>
+        ${Number(s.predicted_ttl_days) < 999999
+          ? `<tr><td>predicted TTL</td><td class="num">${esc(s.predicted_ttl_days)} days</td></tr>`
+          : ''}
       </tbody></table></div>
     </div>`;
   }));

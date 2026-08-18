@@ -20,7 +20,34 @@
   <main class="content">
     <h1>Pools</h1>
     <div id="errors"></div>
+    <div class="row">
+      <button id="add-pool-btn">Add Pool</button>
+      <span class="sub" id="add-pool-msg"></span>
+    </div>
+
+    <!-- Add Pool: pick a loaded ChiMod, then fill the form IT provides
+         (GET /api/mod/<mod>/create). Modules without a form get the generic
+         compose editor: identity fields plus raw YAML for module params. -->
+    <div class="card" id="add-pool-panel" style="display:none; margin:1rem 0;">
+      <h3>Add pool</h3>
+      <div class="row">
+        <input id="ap-search" size="18" placeholder="search modules…">
+        <select id="ap-module"></select>
+      </div>
+      <div id="ap-form" style="margin-top:0.75rem;"></div>
+      <div class="row" style="margin-top:0.75rem;">
+        <button id="ap-validate">Validate</button>
+        <button id="ap-create">Create</button>
+        <button id="ap-cancel">Cancel</button>
+      </div>
+      <div class="sub" id="ap-result"></div>
+    </div>
+
     <div id="pools"></div>
+
+    <h2>Module pages</h2>
+    <p class="sub">ChiMods that ship their own management page.</p>
+    <div class="grid" id="module-pages"></div>
 
     <h2>Monitor explorer</h2>
     <p class="sub">

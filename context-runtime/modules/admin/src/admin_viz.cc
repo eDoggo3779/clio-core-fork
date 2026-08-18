@@ -50,9 +50,11 @@
  */
 
 #include <clio_ctp/serialize/msgpack_wrapper.h>
+#include <yaml-cpp/yaml.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -77,6 +79,10 @@ using clio::run::viz::Response;
 /** How long a dashboard request waits on a MonitorTask before giving up. A
  *  cross-node query to a node that is gone must not pin an HTTP thread. */
 constexpr float kMonitorTimeoutSec = 5.0f;
+
+/** How long a create-pool request waits. Creation composes nested pools (a CTE
+ *  create composes its bdev tiers), so it gets a bigger budget than a read. */
+constexpr float kCreateTimeoutSec = 30.0f;
 
 /** ChiMod name the admin routes are attributed to. */
 constexpr const char *kAdminModName = "clio_admin";
@@ -266,11 +272,24 @@ const char *NodeStateName(clio::run::NodeState state) {
 // Monitor forwarding
 //===========================================================================
 
-bool Runtime::VizMonitor(
+namespace {
+
+/**
+ * Run a Monitor query on behalf of a dashboard request and collect the raw
+ * per-container payloads.
+ *
+ * Called from an HTTP thread, never from a worker: it submits a MonitorTask
+ * and waits on the Future with a bounded timeout, the same way a client
+ * process would. Deliberately a free function over a LOCAL admin client --
+ * RegisterViz runs on a prototype container at module-load time, so no
+ * handler may capture container state (see Container::RegisterViz).
+ */
+bool VizMonitor(
     const clio::run::PoolQuery &pool_query, const std::string &query,
     std::unordered_map<clio::run::ContainerId, std::string> *results,
     std::string *error) {
-  auto future = client_.AsyncMonitor(pool_query, query);
+  Client admin_client(clio::run::kAdminPoolId);
+  auto future = admin_client.AsyncMonitor(pool_query, query);
   if (!future.Wait(kMonitorTimeoutSec)) {
     *error = "monitor '" + query + "' timed out after " +
              std::to_string(static_cast<int>(kMonitorTimeoutSec)) + "s";
@@ -284,6 +303,8 @@ bool Runtime::VizMonitor(
   *results = future->results_;
   return true;
 }
+
+}  // namespace
 
 //===========================================================================
 // Route registration
@@ -479,7 +500,7 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
     const std::string key = nr.key;
     const std::string query = nr.query;
     viz.AddRoute({"GET", nr.path, kAdminModName, nr.doc,
-                  [this, key, query](const Request &req, Response &resp) {
+                  [key, query](const Request &req, Response &resp) {
                     clio::run::PoolQuery pool_query;
                     clio::run::u64 node_id = 0;
                     if (!NodeQuery(req.Var("node"), &pool_query, &node_id)) {
@@ -507,7 +528,7 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
   viz.AddRoute(
       {"GET", "/api/nodes/{node}/system_stats", kAdminModName,
        "Sampled CPU / RAM / GPU utilization ring, newer than ?min_event_id",
-       [this](const Request &req, Response &resp) {
+       [](const Request &req, Response &resp) {
          clio::run::PoolQuery pool_query;
          clio::run::u64 node_id = 0;
          if (!NodeQuery(req.Var("node"), &pool_query, &node_id)) {
@@ -542,7 +563,7 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
   viz.AddRoute(
       {"GET", "/api/pools/{pool}/monitor", kAdminModName,
        "Forward ?query to a pool's own Monitor() (?routing=local|broadcast|...)",
-       [this](const Request &req, Response &resp) {
+       [](const Request &req, Response &resp) {
          const std::string pool = req.Var("pool");
          const std::string query = req.Param("query");
          const std::string routing = req.Param("routing", "local");
@@ -576,6 +597,177 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
          w.Field("pool_id", pool);
          w.Field("query", query);
          w.RawField("results", ResultsToJsonMap(results));
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+
+  // ---- Module inventory for the "Add Pool" flow ---------------------------
+  // Every loaded ChiMod, plus whether it registered a create form
+  // (GET /api/mod/<mod>/create) and whether it mounted pages. The Pools page
+  // uses this to offer a searchable module list: modules with a form get it,
+  // the rest fall back to the generic compose editor below.
+  viz.AddRoute({"GET", "/api/chimods", kAdminModName,
+                "Loaded ChiMods and their dashboard capabilities",
+                [vizp = &viz](const Request &, Response &resp) {
+                  auto *module_manager = CLIO_MODULE_MANAGER;
+                  if (!module_manager) {
+                    resp.Error(503, "module manager unavailable");
+                    return;
+                  }
+                  std::set<std::string> creators;
+                  for (const auto &route : vizp->GetRoutes()) {
+                    // The convention: a module's create form lives at
+                    // GET /api/mod/<mod>/create.
+                    if (route.method == "GET" &&
+                        route.path == "/api/mod/" + route.mod_name + "/create") {
+                      creators.insert(route.mod_name);
+                    }
+                  }
+                  std::set<std::string> mounted;
+                  for (const auto &mount : vizp->GetMounts()) {
+                    mounted.insert(mount.mod_name);
+                  }
+                  JsonWriter w;
+                  w.BeginObject();
+                  w.Key("chimods").BeginArray();
+                  for (const std::string &name :
+                       module_manager->GetLoadedChiMods()) {
+                    w.BeginObject();
+                    w.Field("name", name);
+                    w.Field("has_create", creators.count(name) > 0);
+                    w.Field("has_pages", mounted.count(name) > 0);
+                    w.EndObject();
+                  }
+                  w.EndArray();
+                  w.EndObject();
+                  resp.Json(w.Str());
+                }});
+
+  // ---- Generic pool creation (the compose path) ---------------------------
+  // Creates a pool of ANY loaded ChiMod, the same way `clio_run compose` does:
+  // the module-specific parameters travel as the compose entry's YAML, so a
+  // module needs no dashboard code at all to be creatable. Modules that DO
+  // register /api/mod/<mod>/create give the user a real form instead; this is
+  // the fallback (and the escape hatch for exotic parameters).
+  //
+  // action=validate checks everything and creates nothing, which is how the
+  // form's Validate button works. Note get-or-create semantics on the create
+  // itself: a pool_name that already exists returns the existing pool.
+  viz.AddRoute(
+      {"POST", "/api/pools/compose", kAdminModName,
+       "Create a pool of any ChiMod (fields: mod_name, pool_name, pool_id, "
+       "pool_query, config[, action=validate])",
+       [](const Request &req, Response &resp) {
+         const std::string mod_name = req.Param("mod_name");
+         const std::string pool_name = req.Param("pool_name");
+         const std::string pool_id_str = req.Param("pool_id");
+         const std::string pool_query_str = req.Param("pool_query", "local");
+         const std::string config = req.Param("config");
+         const bool validate_only = req.Param("action") == "validate";
+
+         // Collect every field error, so one round trip fixes the whole form.
+         JsonWriter errors;
+         errors.BeginObject();
+         size_t error_count = 0;
+         auto fail = [&errors, &error_count](const std::string &field,
+                                             const std::string &message) {
+           errors.Field(field, message);
+           ++error_count;
+         };
+
+         auto *module_manager = CLIO_MODULE_MANAGER;
+         if (mod_name.empty()) {
+           fail("mod_name", "required");
+         } else if (module_manager && !module_manager->GetChiMod(mod_name)) {
+           fail("mod_name", "no ChiMod named '" + mod_name + "' is loaded");
+         }
+         if (pool_name.empty()) {
+           fail("pool_name", "required");
+         }
+         clio::run::PoolId pool_id;
+         if (pool_id_str.empty()) {
+           fail("pool_id", "required (e.g. \"" +
+                               std::to_string(viz::SuggestFreePoolMajor(800)) +
+                               ".0\")");
+         } else {
+           try {
+             pool_id = clio::run::PoolId::FromString(pool_id_str);
+             if (pool_id.IsNull()) {
+               fail("pool_id", "must not be null");
+             }
+           } catch (const std::exception &e) {
+             fail("pool_id", std::string("unparseable: ") + e.what());
+           }
+         }
+         clio::run::PoolQuery pool_query;
+         try {
+           pool_query = clio::run::PoolQuery::FromString(pool_query_str);
+         } catch (const std::exception &e) {
+           fail("pool_query", std::string("unparseable: ") + e.what());
+         }
+         // The module parses config_ as YAML at Create time, where a syntax
+         // error surfaces as an opaque create failure -- so catch it here.
+         YAML::Node config_node(YAML::NodeType::Map);
+         if (!config.empty()) {
+           try {
+             config_node = YAML::Load(config);
+             if (!config_node.IsMap()) {
+               fail("config", "must be a YAML mapping (key: value lines)");
+             }
+           } catch (const std::exception &e) {
+             fail("config", std::string("invalid YAML: ") + e.what());
+           }
+         }
+         errors.EndObject();
+
+         if (error_count > 0) {
+           JsonWriter w;
+           w.BeginObject();
+           w.Field("ok", false);
+           w.RawField("errors", errors.Str());
+           w.EndObject();
+           resp.status = 400;
+           resp.Json(w.Str());
+           return;
+         }
+         if (validate_only) {
+           resp.Json("{\"ok\":true}");
+           return;
+         }
+
+         // Build the compose entry exactly as ConfigManager::ParseYAML would
+         // have stored it: identity keys merged over the module-specific YAML,
+         // the whole node re-emitted into PoolConfig::config_.
+         config_node["mod_name"] = mod_name;
+         config_node["pool_name"] = pool_name;
+         config_node["pool_id"] = pool_id_str;
+         config_node["pool_query"] = pool_query_str;
+         YAML::Emitter emitter;
+         emitter << config_node;
+
+         clio::run::PoolConfig pool_config;
+         pool_config.mod_name_ = mod_name;
+         pool_config.pool_name_ = pool_name;
+         pool_config.pool_id_ = pool_id;
+         pool_config.pool_query_ = pool_query;
+         pool_config.config_ = emitter.c_str();
+
+         Client admin_client(clio::run::kAdminPoolId);
+         auto future = admin_client.AsyncCompose(pool_config);
+         if (!future.Wait(kCreateTimeoutSec)) {
+           resp.Error(503, "pool creation timed out");
+           return;
+         }
+         if (future->GetReturnCode() != 0) {
+           resp.Error(500, "pool creation failed with rc=" +
+                               std::to_string(future->GetReturnCode()));
+           return;
+         }
+         JsonWriter w;
+         w.BeginObject();
+         w.Field("ok", true);
+         w.Field("pool_name", pool_name);
+         w.Field("pool_id", future->new_pool_id_.ToString());
          w.EndObject();
          resp.Json(w.Str());
        }});

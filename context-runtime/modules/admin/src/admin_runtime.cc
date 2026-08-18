@@ -72,20 +72,13 @@ namespace clio::run::admin {
 // Method implementations
 //===========================================================================
 
-Runtime::~Runtime() {
-  // The dashboard's route handlers capture this container (they use client_ to
-  // submit Monitor tasks), so the server must be down before we go away, and our
-  // routes must go with us -- otherwise re-creating the admin pool in this
-  // process would leave the OLD container's handlers registered (AddRoute is
-  // first-wins) and the next request would run them over freed memory. Normal
-  // shutdown already stopped the server in RuntimeManager::ServerFinalize; this
-  // covers any path that destroys the admin container on its own. Stop() is
-  // idempotent and waits for in-flight requests, so removal after it is safe.
-  if (auto *viz = CLIO_VIZ) {
-    viz->Stop();
-    viz->RemoveModule(CreateParams::chimod_lib_name);
-  }
-}
+// NOTE: no dashboard teardown here. Every viz handler is stateless (no
+// container capture -- see Container::RegisterViz), so an admin container can
+// be destroyed and re-created under a running server; requests in the gap get
+// error responses from a dead pool, not use-after-free. This destructor must
+// also stay trivial because ModuleManager destroys a throwaway prototype
+// instance right after load-time route registration.
+Runtime::~Runtime() {}
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN

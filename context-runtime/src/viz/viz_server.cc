@@ -39,13 +39,16 @@
 #include "clio_runtime/viz/viz_server.h"
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 
 #include "clio_runtime/container.h"
 #include "clio_runtime/module_manager.h"
 #include "clio_runtime/config_manager.h"
+#include "clio_runtime/pool_manager.h"
 #include "clio_runtime/viz/viz_json.h"
 
 #if CLIO_RUN_HAS_POCO
@@ -189,6 +192,134 @@ bool VizServer::MatchPath(const std::string &pattern, const std::string &path,
     *vars = std::move(bound);
   }
   return true;
+}
+
+namespace {
+
+/** Percent-decode a form component ('+' means space in form encoding). */
+std::string FormDecode(const std::string &in) {
+  std::string out;
+  out.reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    char c = in[i];
+    if (c == '+') {
+      out.push_back(' ');
+    } else if (c == '%' && i + 2 < in.size() && std::isxdigit(in[i + 1]) &&
+               std::isxdigit(in[i + 2])) {
+      auto hex = [](char h) {
+        return (h >= '0' && h <= '9')   ? h - '0'
+               : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+                                        : h - 'A' + 10;
+      };
+      out.push_back(static_cast<char>(hex(in[i + 1]) * 16 + hex(in[i + 2])));
+      i += 2;
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+void VizServer::ParseFormBody(const std::string &body,
+                              std::map<std::string, std::string> *out) {
+  size_t start = 0;
+  while (start <= body.size()) {
+    size_t amp = body.find('&', start);
+    std::string pair = (amp == std::string::npos)
+                           ? body.substr(start)
+                           : body.substr(start, amp - start);
+    if (!pair.empty()) {
+      size_t eq = pair.find('=');
+      std::string key =
+          FormDecode(eq == std::string::npos ? pair : pair.substr(0, eq));
+      std::string value =
+          (eq == std::string::npos) ? "" : FormDecode(pair.substr(eq + 1));
+      if (!key.empty()) {
+        out->emplace(key, value);  // emplace: existing (query) keys win
+      }
+    }
+    if (amp == std::string::npos) break;
+    start = amp + 1;
+  }
+}
+
+bool ParseSizeField(const std::string &text, u64 *out) {
+  // Strip whitespace, split into the numeric run and the suffix.
+  std::string number;
+  std::string suffix;
+  bool in_suffix = false;
+  bool seen_dot = false;
+  for (char c : text) {
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      continue;
+    }
+    if (!in_suffix && (std::isdigit(static_cast<unsigned char>(c)) ||
+                       (c == '.' && !seen_dot))) {
+      seen_dot = seen_dot || (c == '.');
+      number.push_back(c);
+    } else {
+      in_suffix = true;
+      suffix.push_back(c);
+    }
+  }
+  if (number.empty() || number == ".") {
+    return false;
+  }
+  double value = 0.0;
+  try {
+    value = std::stod(number);
+  } catch (const std::exception &) {
+    return false;
+  }
+  // Optional trailing "B"/"b" ("MB", "kb", plain "B") is unit noise.
+  if (!suffix.empty() && (suffix.back() == 'B' || suffix.back() == 'b')) {
+    suffix.pop_back();
+  }
+  u64 scale = 1;
+  if (suffix.empty()) {
+    scale = 1;
+  } else if (suffix.size() == 1) {
+    switch (std::toupper(static_cast<unsigned char>(suffix[0]))) {
+      case 'K': scale = 1ull << 10; break;
+      case 'M': scale = 1ull << 20; break;
+      case 'G': scale = 1ull << 30; break;
+      case 'T': scale = 1ull << 40; break;
+      case 'P': scale = 1ull << 50; break;
+      default: return false;
+    }
+  } else {
+    return false;
+  }
+  *out = static_cast<u64>(value * static_cast<double>(scale));
+  return true;
+}
+
+u32 SuggestFreePoolMajor(u32 base) {
+  // Majors this process has already handed out. Without this, two concurrent
+  // requests (or one request that creates two pools, like a register-target
+  // that first creates its bdev) would both be suggested the same free major,
+  // and the second create would silently bind to the FIRST pool (create is
+  // get-or-create by id). Static because suggestions are process-wide advice;
+  // the set stays tiny (one entry per dashboard-created pool).
+  static std::mutex suggest_mutex;
+  static std::set<u32> suggested;
+
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  std::set<u32> taken;
+  if (pool_manager) {
+    for (const auto &pid : pool_manager->GetAllPoolIds()) {
+      taken.insert(pid.major_);
+    }
+  }
+  std::lock_guard<std::mutex> guard(suggest_mutex);
+  u32 major = base;
+  while (taken.count(major) || suggested.count(major)) {
+    ++major;
+  }
+  suggested.insert(major);
+  return major;
 }
 
 std::string VizServer::MimeTypeOf(const std::string &path) {
@@ -567,6 +698,14 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
       if (req.method != "GET" && req.method != "HEAD") {
         Poco::StreamCopier::copyToString(preq.stream(), req.body,
                                          kMaxBodyBytes);
+        // A form submission's fields become params, exactly as if they had been
+        // query parameters — with the query string winning on a key collision
+        // (ParseFormBody never overwrites). Handlers then read one map either
+        // way, and pages can use plain <form> posts or fetch+URLSearchParams.
+        const std::string &ctype = preq.getContentType();
+        if (ctype.compare(0, 33, "application/x-www-form-urlencoded") == 0) {
+          VizServer::ParseFormBody(req.body, &req.params);
+        }
       }
       if (!viz_->Dispatch(req, resp)) {
         resp.Error(404, "no route or asset for " + req.path);
