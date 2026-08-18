@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clio Pools</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <nav class="navbar">
+    <div class="nav-brand">Clio</div>
+    <ul class="nav-links">
+      <li><a href="index.html">Cluster</a></li>
+      <li><a href="pools.html">Pools</a></li>
+      <li><a href="config.html">Config</a></li>
+    </ul>
+    <div class="nav-status" id="conn-status">connecting…</div>
+  </nav>
+
+  <main class="content">
+    <h1>Pools</h1>
+    <div id="errors"></div>
+    <div id="pools"></div>
+
+    <h2>Monitor explorer</h2>
+    <p class="sub">
+      Forwards any query to a pool's own <code>Monitor()</code> handler. This is
+      the same endpoint a ChiMod's own dashboard page uses, so whatever a module
+      answers here it can render for itself.
+    </p>
+    <div class="row">
+      <input id="pool" size="10" placeholder="pool id" value="">
+      <input id="query" size="18" placeholder="query" value="stats">
+      <select id="routing">
+        <option value="local">local</option>
+        <option value="broadcast">broadcast</option>
+      </select>
+      <button id="run">Query</button>
+    </div>
+    <pre id="result">Pick a pool above, or click a row.</pre>
+  </main>
+
+  <script src="js/api.js"></script>
+  <script src="js/pools.js"></script>
+</body>
+</html>

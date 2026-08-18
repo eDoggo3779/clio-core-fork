@@ -46,6 +46,13 @@ set(TASK_STAT_MODEL_TEST_SOURCES
   test_task_stat_model.cc
 )
 
+# Web dashboard test executable (issue #990). Needs Poco: the dashboard's HTTP
+# transport is Poco::Net, and the test drives it with Poco's HTTP client.
+set(VIZ_TEST_TARGET clio_run_viz_tests)
+set(VIZ_TEST_SOURCES
+  test_viz_server.cc
+)
+
 # Per-Process Shared Memory test executable
 set(PER_PROCESS_SHM_TEST_TARGET clio_run_per_process_shm_tests)
 set(PER_PROCESS_SHM_TEST_SOURCES
@@ -253,6 +260,39 @@ set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
 set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Create web dashboard test executable (issue #990). Skipped entirely when Poco
+# is absent: without it the build has no HTTP transport to test.
+if(Poco_FOUND)
+  add_executable(${VIZ_TEST_TARGET} ${VIZ_TEST_SOURCES})
+
+  target_include_directories(${VIZ_TEST_TARGET} PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test  # For simple_test.h
+    ${CLIO_RUN_ROOT}/modules/admin/include  # For admin tasks
+  )
+
+  target_link_libraries(${VIZ_TEST_TARGET}
+    clio_admin_runtime          # Admin module runtime (starts the dashboard)
+    clio_admin_client           # Admin module client
+    clio_bdev_runtime           # Composed by the default config
+    clio_bdev_client
+    ctp::cxx                    # ClioCtp library
+    Poco::Net                   # HTTP client used to drive the dashboard
+    Poco::Foundation
+    ${CMAKE_THREAD_LIBS_INIT}   # Threading support
+  )
+
+  # The test fetches /viz/clio_admin/index.html, so the assets have to be staged
+  # next to the libraries before it runs.
+  add_dependencies(${VIZ_TEST_TARGET} clio_admin_viz)
+
+  set_target_properties(${VIZ_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+endif()
 
 # Create Per-Process Shared Memory test executable.
 # POSIX-only: uses fork()/waitpid()/setenv() — no Windows equivalent that
@@ -748,6 +788,24 @@ if(CLIO_CORE_ENABLE_TESTS)
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 300
   )
+
+  # Web dashboard (issue #990). Own ctest entry => own process: it brings up an
+  # in-process runtime, and CLIO_INIT is once-per-process. The dashboard binds an
+  # ephemeral port (CLIO_VIZ_PORT=0, set by the test itself) so a concurrently
+  # running daemon cannot collide with it -- only the RPC port needs the shared
+  # lock that CLIO_PORT implies.
+  if(Poco_FOUND)
+    add_test(
+      NAME cr_viz_tests
+      COMMAND ${VIZ_TEST_TARGET}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_viz_tests PROPERTIES
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      TIMEOUT 300
+      RESOURCE_LOCK "clio_runtime_port"
+    )
+  endif()
 
   add_test(
     NAME cr_unit_tests
@@ -1338,6 +1396,9 @@ if(NOT WIN32)
 endif()
 if(CLIO_CORE_ENABLE_CAE)
   list(APPEND _install_test_targets ${AUTOGEN_COVERAGE_TEST_TARGET})
+endif()
+if(Poco_FOUND)
+  list(APPEND _install_test_targets ${VIZ_TEST_TARGET})
 endif()
 install(TARGETS ${_install_test_targets} RUNTIME DESTINATION bin)
 

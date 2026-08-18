@@ -72,7 +72,20 @@ namespace clio::run::admin {
 // Method implementations
 //===========================================================================
 
-Runtime::~Runtime() {}
+Runtime::~Runtime() {
+  // The dashboard's route handlers capture this container (they use client_ to
+  // submit Monitor tasks), so the server must be down before we go away, and our
+  // routes must go with us -- otherwise re-creating the admin pool in this
+  // process would leave the OLD container's handlers registered (AddRoute is
+  // first-wins) and the next request would run them over freed memory. Normal
+  // shutdown already stopped the server in RuntimeManager::ServerFinalize; this
+  // covers any path that destroys the admin container on its own. Stop() is
+  // idempotent and waits for in-flight requests, so removal after it is safe.
+  if (auto *viz = CLIO_VIZ) {
+    viz->Stop();
+    viz->RemoveModule(CreateParams::chimod_lib_name);
+  }
+}
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -147,6 +160,17 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       CTP_MALLOC, kSystemStatsRingSize);
   prev_cpu_times_ = ctp::SystemInfo::GetCpuTimes();
   client_.AsyncSystemMonitor(clio::run::PoolQuery::Local(), 1000000);  // 1s
+
+  // Spawn the web dashboard (issue #990). One server per node -- the routes it
+  // serves are all node-local reads or explicitly-addressed Monitor queries, so
+  // there is no collective here and every node can serve the same UI. Our
+  // routes were already registered by PoolManager::RegisterContainer (which
+  // runs before this Create), and any ChiMod composed later adds its own as it
+  // comes up. Start() is a no-op unless the dashboard is enabled, and never
+  // fatal: a taken port disables the dashboard, it does not fail the runtime.
+  if (auto *viz = CLIO_VIZ) {
+    viz->Start();
+  }
 
   HLOG(kDebug,
        "Admin: Container created and initialized for pool: {} (ID: {}, count: "

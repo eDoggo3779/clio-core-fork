@@ -195,6 +195,11 @@ std::vector<std::string> ModuleManager::GetLoadedChiMods() const {
 
 bool ModuleManager::IsInitialized() const { return is_initialized_; }
 
+std::string ModuleManager::GetChiModLibPath(const std::string &chimod_name) {
+  ChiModInfo *chimod = GetChiMod(chimod_name);
+  return chimod ? chimod->lib_path : std::string();
+}
+
 void ModuleManager::ScanForChiMods() {
   std::vector<std::string> scan_dirs = GetScanDirectories();
 

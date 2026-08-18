@@ -10,6 +10,8 @@
 #include <clio_runtime/worker.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/serialize/msgpack_wrapper.h>
+#include <clio_runtime/pool_manager.h>
+#include <clio_runtime/viz/viz_json.h>
 
 #include <algorithm>
 #include <cctype>
@@ -538,6 +540,40 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
 }
 
 void Runtime::PostGpuContainerCreate() {}
+
+void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
+                          const std::string &mod_name) {
+  // Node-local read only: the pool table is already in this process, so the
+  // page's index costs no task. Runs on an HTTP thread, so it takes the pool
+  // manager's own read lock and touches nothing else.
+  viz.AddRoute(
+      {"GET", "/api/mod/" + mod_name + "/pools", mod_name,
+       "Block-device pools on this node",
+       [mod_name](const clio::run::viz::Request &,
+                  clio::run::viz::Response &resp) {
+         auto *pool_manager = CLIO_POOL_MANAGER;
+         if (!pool_manager) {
+           resp.Error(503, "pool manager unavailable");
+           return;
+         }
+         clio::run::viz::JsonWriter w;
+         w.BeginObject();
+         w.Key("pools").BeginArray();
+         for (const auto &pid : pool_manager->GetAllPoolIds()) {
+           const auto *info = pool_manager->GetPoolInfo(pid);
+           if (!info || info->chimod_name_ != mod_name) {
+             continue;
+           }
+           w.BeginObject();
+           w.Field("pool_id", pid.ToString());
+           w.Field("pool_name", info->pool_name_);
+           w.EndObject();
+         }
+         w.EndArray();
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+}
 
 void Runtime::StopHealthPolling() {
   health_poll_stop_.store(true, std::memory_order_relaxed);

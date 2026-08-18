@@ -53,6 +53,7 @@
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/task_stat_model.h"
 #include "clio_runtime/types.h"
+#include "clio_runtime/viz/viz_server.h"
 
 // Forward declarations to avoid circular dependencies
 namespace clio::run {
@@ -585,6 +586,41 @@ class Container {
    */
   virtual void Migrate(u32 dest_node_id) {
     (void)dest_node_id;
+  }
+
+  /**
+   * Register this ChiMod's web-dashboard routes.
+   *
+   * Called once per container by PoolManager::RegisterContainer, right after
+   * the container is published. By then the ChiMod's `viz/` asset directory (if
+   * it ships one) is already mounted at /viz/<mod_name>, so an override only
+   * needs to add the endpoints its pages fetch:
+   *
+   *   void RegisterViz(viz::VizServer &viz, const std::string &mod) override {
+   *     viz.AddRoute({"GET", "/api/mod/" + mod + "/{pool}/stats", mod,
+   *                   "Per-pool device stats",
+   *                   [](const viz::Request &req, viz::Response &resp) { ... }});
+   *   }
+   *
+   * Registration is idempotent: the first (method, path) wins, so being called
+   * once per container (and once per pool of the same ChiMod) is harmless.
+   *
+   * Handlers run on the dashboard's own HTTP thread pool, NOT on a worker: they
+   * may read node-local manager state and may submit a task and wait on its
+   * Future, but they are not coroutines and must not co_await.
+   *
+   * Prefer capturing by value and reading the manager singletons, as above: a
+   * handler outlives no container that way. A handler that DOES capture `this`
+   * must call viz.RemoveModule(mod_name) when the container is destroyed, or a
+   * later request will run it over freed memory.
+   *
+   * @param viz The node-local viz server / route registry
+   * @param mod_name This container's ChiMod name (what get_chimod_name()
+   *                 reports, and the name its assets are mounted under)
+   */
+  virtual void RegisterViz(viz::VizServer &viz, const std::string &mod_name) {
+    (void)viz;
+    (void)mod_name;
   }
 
   /**

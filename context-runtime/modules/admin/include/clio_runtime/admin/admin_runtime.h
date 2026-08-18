@@ -233,6 +233,32 @@ public:
   void MonitorGetHostInfo(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
+   * Register the web dashboard's endpoints and claim its home page
+   * (issue #990). Defined in admin_viz.cc.
+   */
+  void RegisterViz(clio::run::viz::VizServer &viz,
+                   const std::string &mod_name) override;
+
+  /**
+   * Run a Monitor query on behalf of a dashboard request and collect the raw
+   * per-container payloads.
+   *
+   * Called from an HTTP thread, never from a worker: it submits a MonitorTask
+   * and waits on the Future with a bounded timeout, the same way a client
+   * process would. Defined in admin_viz.cc.
+   *
+   * @param pool_query Routing for the query (local / physical:N / ...)
+   * @param query Monitor query string, e.g. "worker_stats"
+   * @param[out] results Per-container msgpack payloads
+   * @param[out] error Human-readable failure reason when this returns false
+   * @return true on success
+   */
+  bool VizMonitor(
+      const clio::run::PoolQuery &pool_query, const std::string &query,
+      std::unordered_map<clio::run::ContainerId, std::string> *results,
+      std::string *error);
+
+  /**
    * Handle AnnounceShutdown - Mark a departing node as dead immediately
    * and trigger recovery if this node is the new leader.
    */
