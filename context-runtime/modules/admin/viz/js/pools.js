@@ -10,47 +10,79 @@
 
 let CHIMODS = [];
 let CUR_SPEC = null;   // the selected module's form spec, or null for generic
+let PAGED_MODS = {};   // mod_name -> url_prefix, for modules that ship a page
 
 async function post(path, fields) {
-  const resp = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams(fields).toString(),
-  });
-  let body = {};
-  try { body = await resp.json(); } catch (e) { /* non-JSON error */ }
-  return { ok: resp.ok && body.ok !== false, body, status: resp.status };
+  try {
+    const body = await API.post(path, fields);
+    return { ok: true, body, status: 200 };
+  } catch (e) {
+    return { ok: false, body: { error: String(e.message || e) }, status: 0 };
+  }
+}
+
+/** Where a pool card navigates: the module's own website (with the pool
+ *  preselected via ?pool=), or the generic pool page when it ships none. */
+function poolHref(pool) {
+  const prefix = PAGED_MODS[pool.chimod_name];
+  const page = prefix ? `${prefix}/index.html` : '/viz/clio_admin/pool.html';
+  return `${page}?pool=${encodeURIComponent(pool.pool_id)}`;
+}
+
+// eslint-disable-next-line no-unused-vars
+async function destroyPool(poolId, poolName) {
+  if (!window.confirm(
+      `Shut down pool ${poolName} (${poolId})?\n\n` +
+      'Its containers are destroyed on this node and tasks addressed to it will fail.')) {
+    return;
+  }
+  const msg = document.getElementById('add-pool-msg');
+  try {
+    await API.post(`/api/pools/${encodeURIComponent(poolId)}/destroy`);
+    msg.textContent = `shut down ${poolName} (${poolId})`;
+  } catch (e) {
+    msg.textContent = `shutdown failed: ${e.message}`;
+  }
+  renderPools();
 }
 
 async function renderPools() {
-  const data = await API.get('/api/pools');
-  const rows = data.pools || [];
-  document.getElementById('pools').innerHTML = table(rows, [
-    ['pool_id', 'pool id'],
-    ['pool_name', 'name'],
-    ['chimod_name', 'chimod'],
-    ['container_id', 'container'],
+  const [data, mods] = await Promise.all([
+    API.get('/api/pools'),
+    API.get('/api/routes'),
   ]);
-  // Clicking a row loads it into the explorer below.
-  document.querySelectorAll('#pools tbody tr').forEach((tr, i) => {
-    tr.style.cursor = 'pointer';
-    tr.onclick = () => {
-      document.getElementById('pool').value = rows[i].pool_id;
-      runQuery();
-    };
-  });
-}
+  PAGED_MODS = {};
+  (mods.mounts || []).forEach((m) => { PAGED_MODS[m.mod_name] = m.url_prefix; });
 
-async function renderModulePages() {
-  const data = await API.get('/api/routes');
-  const mounts = (data.mounts || []).filter((m) => m.mod_name !== 'clio_admin');
-  document.getElementById('module-pages').innerHTML = mounts.length
-    ? mounts.map((m) => `<div class="card clickable"
-          onclick="location.href='${esc(m.url_prefix)}/index.html'">
-        <h3>${esc(m.mod_name)}</h3>
-        <div class="sub">${esc(m.url_prefix)}</div>
-      </div>`).join('')
-    : '<div class="empty">No module shipped a page (compose one of its pools first).</div>';
+  // One section per ChiMod, cards inside.
+  const groups = {};
+  (data.pools || []).forEach((p) => {
+    (groups[p.chimod_name] = groups[p.chimod_name] || []).push(p);
+  });
+  const sections = Object.keys(groups).sort().map((mod) => {
+    const cards = groups[mod]
+      .sort((a, b) => a.pool_id.localeCompare(b.pool_id, undefined, { numeric: true }))
+      .map((p) => {
+        // The admin pool IS the runtime; the server refuses to destroy it, so
+        // don't offer the control.
+        const closer = p.chimod_name === 'clio_admin' ? '' :
+          `<button class="card-close" title="Shut down this pool"
+             onclick="event.stopPropagation();
+                      destroyPool('${esc(p.pool_id)}','${esc(p.pool_name)}')">&times;</button>`;
+        return `<div class="card clickable pool-card"
+                     onclick="location.href='${poolHref(p)}'">
+          ${closer}
+          <h3>${esc(p.pool_name)}</h3>
+          <div class="sub"><span class="badge">${esc(p.pool_id)}</span>
+            container ${esc(p.container_id)}</div>
+        </div>`;
+      }).join('');
+    return `<h2>${esc(mod)} <span class="badge">${groups[mod].length}</span></h2>
+            <div class="grid">${cards}</div>`;
+  });
+  document.getElementById('pools').innerHTML = sections.length
+    ? sections.join('')
+    : '<div class="empty">No pools composed on this node.</div>';
 }
 
 // ---- Add Pool flow ---------------------------------------------------------
@@ -135,7 +167,6 @@ async function submitAddPool(action) {
   }
   out.textContent = `created ${body.pool_name} (${body.pool_id})`;
   renderPools();
-  renderModulePages();
 }
 
 async function openAddPool() {
@@ -197,7 +228,4 @@ async function runQuery() {
 }
 
 document.getElementById('run').onclick = runQuery;
-poll(async () => {
-  await renderPools();
-  await renderModulePages();
-}, 5000);
+poll(renderPools, 5000);

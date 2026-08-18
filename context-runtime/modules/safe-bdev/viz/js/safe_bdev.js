@@ -3,24 +3,10 @@
 // this module's add_member / remove_member routes.
 
 const MOD = 'clio_safe_bdev';
-let CUR_POOL = null;
+// Preselect the array a Pools-tab card navigated here with.
+let CUR_POOL = poolParam();
 
-async function post(path, fields) {
-  const resp = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams(fields).toString(),
-  });
-  let body = {};
-  try { body = await resp.json(); } catch (e) { /* non-JSON error */ }
-  if (!resp.ok || body.ok === false) {
-    const msg = body.error
-      || (body.errors ? Object.entries(body.errors).map(([k, v]) => `${k}: ${v}`).join('; ')
-                      : `${resp.status}`);
-    throw new Error(msg);
-  }
-  return body;
-}
+const post = (path, fields) => API.post(path, fields);
 
 async function loadPools() {
   const sel = document.getElementById('pool-select');
@@ -107,7 +93,12 @@ async function refresh() {
   if (!CUR_POOL) return;
   const s = await stats();
   renderRecovery(s);
+  // Every scalar the module's Monitor("stats") reports -- capacity (slots),
+  // parity level, WAL depth, recovery counters -- in one table.
+  document.getElementById('all-stats').innerHTML =
+    kvTable(s, ['pool_name']);
   renderMembers(s.members);
+  await renderPredictions('predictions', CUR_POOL);
 }
 
 // eslint-disable-next-line no-unused-vars

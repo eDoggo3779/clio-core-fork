@@ -156,6 +156,7 @@ workers stop, so no handler can be left waiting on a task that will never run.
 | `GET /api/pools/{pool}/monitor` | forward `?query` to a pool's own `Monitor()` (`?routing=local\|broadcast\|…`) |
 | `GET /api/chimods` | loaded modules, and which registered a create form / shipped pages |
 | `POST /api/pools/compose` | create a pool of ANY module via the compose path (identity fields + raw YAML) |
+| `POST /api/pools/{pool}/destroy` | shut a pool down (the Pools tab's per-card "x"; the admin pool is refused) |
 
 `{node}` is a node id or `local`. Addressing this node by its own id routes
 locally, so the single-node case never touches the network.
@@ -197,6 +198,23 @@ Two rules make the forms work:
 POST bodies of type `application/x-www-form-urlencoded` are parsed into
 `Request::params` (query string wins on a key collision), so handlers read one
 map whether the value came from the URL or the form.
+
+## The Pools tab
+
+Pools are grouped into one section per ChiMod. Each pool is a card: clicking it
+opens the pool's website — its module's page with `?pool=<id>` preselected, or
+the generic pool page (`/viz/clio_admin/pool.html`) for modules that ship none —
+and the card's corner "x" shuts the pool down after a confirmation
+(`POST /api/pools/{pool}/destroy`; destroying the admin pool is refused, since
+that is the runtime itself). Every pool page shows the pool's **task
+predictions**: the learned per-method CPU/wall coefficients and their MAPE
+(average prediction error), served by `GET /api/nodes/{node}/containers` and
+rendered by the shared `renderPredictions()` helper in
+`/viz/clio_admin/js/api.js`.
+
+Known issue #1000: destroying a pool whose module runs periodic tasks
+(safe-bdev, CTE) currently leaves those periodics retrying against the
+destroyed pool.
 
 ## The module websites
 

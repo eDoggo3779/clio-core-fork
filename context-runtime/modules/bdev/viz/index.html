@@ -28,7 +28,15 @@
       ship with the module, not with the dashboard.
     </p>
     <div id="errors"></div>
+    <div class="sub" id="focus-line"></div>
     <div class="grid" id="devices"></div>
+
+    <h2 id="pred-heading" style="display:none;">Task predictions</h2>
+    <p class="sub" id="pred-sub" style="display:none;">
+      The learned per-method cost model for the selected pool: predicted time =
+      coefficient &times; task size; the error columns are the average miss.
+    </p>
+    <div id="predictions"></div>
   </main>
 
   <script src="/viz/clio_admin/js/api.js"></script>

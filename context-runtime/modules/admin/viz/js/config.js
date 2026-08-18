@@ -32,15 +32,9 @@ async function renderConfig() {
 }
 
 async function renderRoutes() {
+  // Module pages themselves live on the Pools tab now (each pool card links to
+  // its module's website); this page keeps the raw route table.
   const data = await API.get('/api/routes');
-  document.getElementById('mounts').innerHTML = (data.mounts || []).length
-    ? (data.mounts || []).map((m) => `<div class="card">
-        <h3>${esc(m.mod_name)}</h3>
-        <div class="sub"><a href="${esc(m.url_prefix)}/index.html">${esc(m.url_prefix)}</a></div>
-        <div class="sub">${esc(m.dir)}</div>
-      </div>`).join('')
-    : '<div class="empty">No ChiMod mounted any assets.</div>';
-
   document.getElementById('routes').innerHTML = table(data.routes, [
     ['method', 'method'],
     ['path', 'path'],

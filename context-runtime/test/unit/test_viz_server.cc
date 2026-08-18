@@ -67,6 +67,8 @@
 #include <clio_runtime/bdev/bdev_tasks.h>
 
 #include <Poco/Net/HTTPClientSession.h>
+#include <Poco/Net/StreamSocket.h>
+#include <Poco/Net/SocketAddress.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/StreamCopier.h>
@@ -854,6 +856,70 @@ TEST_CASE("Viz CTE website: targets register and unregister by name",
       port, "/api/mod/clio_cte_core/4960.0/register_target",
       "name=ram::x&capacity=16MB");
   REQUIRE(wrong_pool.status == 404);
+}
+
+TEST_CASE("Viz pools can be shut down from the dashboard", "[viz]") {
+  // The Pools tab's per-card "x": create a pool over HTTP, destroy it over
+  // HTTP, and verify both the guard rails -- the admin pool is refused (that
+  // would be killing the runtime, not managing a pool) and a second destroy
+  // reports the pool gone.
+  REQUIRE(InitRuntimeWithViz());
+  const clio::run::u32 port = CLIO_VIZ->GetPort();
+
+  HttpReply created = HttpPostForm(
+      port, "/api/mod/clio_bdev/create",
+      "pool_name=ram::viz_doomed_bdev&pool_id=4995.0&bdev_type=ram"
+      "&capacity=16MB");
+  Explain("create doomed bdev", created);
+  REQUIRE(created.status == 200);
+  REQUIRE(Contains(HttpGet(port, "/api/mod/clio_bdev/pools").body,
+                   "ram::viz_doomed_bdev"));
+
+  HttpReply destroyed = HttpPostForm(port, "/api/pools/4995.0/destroy", "");
+  Explain("destroy pool", destroyed);
+  REQUIRE(destroyed.status == 200);
+  REQUIRE(Contains(destroyed.body, "\"ok\":true"));
+  REQUIRE(Contains(destroyed.body, "ram::viz_doomed_bdev"));
+  REQUIRE_FALSE(Contains(HttpGet(port, "/api/mod/clio_bdev/pools").body,
+                         "ram::viz_doomed_bdev"));
+
+  // Gone means gone: a second destroy is a 404, not a silent success.
+  HttpReply again = HttpPostForm(port, "/api/pools/4995.0/destroy", "");
+  REQUIRE(again.status == 404);
+
+  // The admin pool is the runtime itself; the dashboard must refuse.
+  HttpReply admin_pool = HttpPostForm(
+      port, "/api/pools/" + clio::run::kAdminPoolId.ToString() + "/destroy",
+      "");
+  Explain("destroy admin pool (refused)", admin_pool);
+  REQUIRE(admin_pool.status == 403);
+  REQUIRE(Contains(HttpGet(port, "/api/health").body, "\"ok\":true"));
+
+  // A BARE POST -- no body, no Content-Length, no Content-Type, which is what
+  // `curl -X POST` sends -- must answer promptly. The bridge once handed such
+  // a request an unbounded body stream, so every bodyless action sat on
+  // Poco's full 60s receive timeout while the action itself had long
+  // succeeded. Sent raw because a well-behaved HTTP client library always
+  // adds Content-Length and would never exercise this.
+  {
+    Poco::Net::StreamSocket socket(Poco::Net::SocketAddress(
+        "127.0.0.1", static_cast<Poco::UInt16>(port)));
+    socket.setReceiveTimeout(Poco::Timespan(10, 0));
+    const std::string raw =
+        "POST /api/pools/4995.0/destroy HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    socket.sendBytes(raw.data(), static_cast<int>(raw.size()));
+    char buf[512];
+    const auto start = std::chrono::steady_clock::now();
+    const int n = socket.receiveBytes(buf, sizeof(buf));  // throws on timeout
+    const double sec = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+    std::cout << "  bare POST answered in " << sec << "s" << std::endl;
+    REQUIRE(n > 0);
+    REQUIRE(Contains(std::string(buf, static_cast<size_t>(n)), "404"));
+    REQUIRE(sec < 5.0);
+  }
 }
 
 SIMPLE_TEST_MAIN()

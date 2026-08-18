@@ -695,7 +695,18 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
       for (const auto &kv : uri.getQueryParameters()) {
         req.params[kv.first] = kv.second;
       }
-      if (req.method != "GET" && req.method != "HEAD") {
+      // Read the body ONLY when the request declares one (Content-Length or
+      // chunked). A bare POST -- `curl -X POST` sends neither -- otherwise
+      // hands stream() an unbounded body, and copyToString blocks for the
+      // server's full 60s receive timeout waiting for bytes that are never
+      // coming: the action succeeds instantly server-side while the client
+      // stares at a hung connection.
+      const bool has_body =
+          preq.getChunkedTransferEncoding() ||
+          (preq.getContentLength64() !=
+               Poco::Net::HTTPMessage::UNKNOWN_CONTENT_LENGTH &&
+           preq.getContentLength64() > 0);
+      if (req.method != "GET" && req.method != "HEAD" && has_body) {
         Poco::StreamCopier::copyToString(preq.stream(), req.body,
                                          kMaxBodyBytes);
         // A form submission's fields become params, exactly as if they had been

@@ -122,6 +122,30 @@ h2 {
 .card.clickable:hover { border-color: var(--accent-secondary); }
 .card.dead { opacity: 0.55; }
 
+/* Pool cards: room for the shutdown "x" in the corner. */
+.pool-card { position: relative; padding-right: 2.25rem; }
+
+.card-close {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  width: 1.5rem;
+  height: 1.5rem;
+  line-height: 1;
+  padding: 0;
+  font-size: 1rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.card-close:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(233, 69, 96, 0.12);
+}
+
 /* ---- Badges and meters -------------------------------------------------- */
 
 .badge {

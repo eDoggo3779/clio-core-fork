@@ -3,6 +3,8 @@
 //   /api/pools/<id>/monitor?query=stats -- reaches bdev's Monitor("stats")
 
 const BDEV_TYPES = ['file', 'ram', 'hbm', 'pinned', 'noop', 's3', 'gcs'];
+// A pool card navigated here with ?pool= -> focus on that device.
+const FOCUS_POOL = poolParam();
 
 function typeName(v) {
   return BDEV_TYPES[v] !== undefined ? BDEV_TYPES[v] : `type ${v}`;
@@ -18,8 +20,20 @@ async function statsFor(poolId) {
 
 async function render() {
   const index = await API.get('/api/mod/clio_bdev/pools');
-  const pools = index.pools || [];
+  let pools = index.pools || [];
   document.getElementById('errors').innerHTML = '';
+
+  // Focused view: the card the user clicked on the Pools tab.
+  if (FOCUS_POOL) {
+    pools = pools.filter((p) => p.pool_id === FOCUS_POOL);
+    document.getElementById('focus-line').innerHTML = pools.length
+      ? `showing pool ${esc(FOCUS_POOL)} — <a href="index.html">show all devices</a>`
+      : `pool ${esc(FOCUS_POOL)} is not a bdev on this node — <a href="index.html">show all devices</a>`;
+    document.getElementById('pred-heading').style.display = '';
+    document.getElementById('pred-sub').style.display = '';
+    await renderPredictions('predictions', FOCUS_POOL);
+  }
+
   if (pools.length === 0) {
     document.getElementById('devices').innerHTML =
       '<div class="empty">No block-device pools on this node.</div>';
@@ -42,24 +56,15 @@ async function render() {
     const used = s.total_capacity
       ? ((s.total_capacity - s.remaining_capacity) / s.total_capacity) * 100
       : 0;
+    // Everything Monitor("stats") reports, minus the two device-health JSON
+    // blobs (they are nested documents, not stats) and the fields the header
+    // and meter already show.
     return `<div class="card">
       <h3>${esc(pool.pool_name)} <span class="badge">${esc(typeName(s.bdev_type))}</span></h3>
       <div class="sub">${esc(pool.pool_id)}</div>
       ${meter('capacity used', used)}
       <div class="sub">${bytes(s.remaining_capacity)} free of ${bytes(s.total_capacity)}</div>
-      <div class="table-wrap"><table><tbody>
-        <tr><td>read</td><td class="num">${num(s.read_bandwidth_mbps)} MB/s</td></tr>
-        <tr><td>write</td><td class="num">${num(s.write_bandwidth_mbps)} MB/s</td></tr>
-        <tr><td>read latency</td><td class="num">${num(s.read_latency_us)} µs</td></tr>
-        <tr><td>write latency</td><td class="num">${num(s.write_latency_us)} µs</td></tr>
-        <tr><td>reads</td><td class="num">${esc(s.total_reads)}</td></tr>
-        <tr><td>writes</td><td class="num">${esc(s.total_writes)}</td></tr>
-        <tr><td>bytes read</td><td class="num">${bytes(s.total_bytes_read)}</td></tr>
-        <tr><td>bytes written</td><td class="num">${bytes(s.total_bytes_written)}</td></tr>
-        ${Number(s.predicted_ttl_days) < 999999
-          ? `<tr><td>predicted TTL</td><td class="num">${esc(s.predicted_ttl_days)} days</td></tr>`
-          : ''}
-      </tbody></table></div>
+      ${kvTable(s, ['pool_name', 'bdev_type', 'device_health', 'failure_prediction'])}
     </div>`;
   }));
 

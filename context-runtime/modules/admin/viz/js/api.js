@@ -21,7 +21,91 @@ const API = {
     }
     return body;
   },
+
+  /** POST a urlencoded form (the shape every dashboard action route accepts).
+   *  Throws with the server's error message or joined field errors. */
+  async post(path, fields) {
+    const resp = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(fields || {}).toString(),
+    });
+    let body = {};
+    try { body = await resp.json(); } catch (e) { /* non-JSON error */ }
+    if (!resp.ok || body.ok === false) {
+      const msg = body.error
+        || (body.errors
+          ? Object.entries(body.errors).map(([k, v]) => `${k}: ${v}`).join('; ')
+          : `${resp.status}`);
+      throw new Error(msg);
+    }
+    return body;
+  },
 };
+
+/** The ?pool= a pool card navigated here with, or null. */
+function poolParam() {
+  return new URLSearchParams(window.location.search).get('pool');
+}
+
+/** Render every scalar entry of a monitor-stats object as a key/value table —
+ *  the "all monitorable statistics" view. Arrays/objects are skipped (pages
+ *  render those with purpose-built tables); `skip` drops noisy keys. */
+function kvTable(obj, skip = []) {
+  const rows = Object.entries(obj || {})
+    .filter(([k, v]) => !skip.includes(k) && (typeof v !== 'object' || v === null))
+    .map(([k, v]) => {
+      let shown = v;
+      if (/bytes|capacity|_space/.test(k) && typeof v === 'number') shown = bytes(v);
+      else if (typeof v === 'number' && !Number.isInteger(v)) shown = num(v, 3);
+      else shown = esc(v);
+      return `<tr><td>${esc(k)}</td><td class="num">${shown}</td></tr>`;
+    }).join('');
+  if (!rows) return '<div class="empty">No statistics reported.</div>';
+  return `<div class="table-wrap"><table><tbody>${rows}</tbody></table></div>`;
+}
+
+/**
+ * Render the pool's learned task-cost model into `elId`: per-method CPU/wall
+ * coefficients and their MAPE (mean absolute percentage error — how far the
+ * prediction is off on average; lower is more accurate), plus the averages
+ * across methods that have actually learned something.
+ */
+async function renderPredictions(elId, poolId) {
+  const host = document.getElementById(elId);
+  if (!host || !poolId) return;
+  const data = await API.get('/api/nodes/local/containers');
+  const entry = (data.containers || []).find((c) => c.pool_id === poolId);
+  if (!entry) {
+    host.innerHTML = '<div class="empty">No model for this pool on this node.</div>';
+    return;
+  }
+  const methods = (entry.methods || []).filter((m) => m.name);
+  const rows = methods.map((m) => `<tr>
+      <td>${esc(m.name)}</td>
+      <td class="num">${num(m.coefficient, 3)}</td>
+      <td class="num">${num(m.mape * 100, 1)}%</td>
+      <td class="num">${num(m.wall_coefficient, 3)}</td>
+      <td class="num">${num(m.wall_mape * 100, 1)}%</td>
+    </tr>`).join('');
+  // Average error over the methods the model has trained on (mape > 0);
+  // untouched methods sit at their seed and would dilute the answer to
+  // "how accurate is this model in practice".
+  const trainedCpu = methods.filter((m) => m.mape > 0);
+  const trainedWall = methods.filter((m) => m.wall_mape > 0);
+  const avg = (list, key) => (list.length
+    ? num(list.reduce((a, m) => a + m[key], 0) / list.length * 100, 1) + '%'
+    : 'no samples yet');
+  host.innerHTML = `
+    <div class="sub">learning rate ${num(entry.learning_rate, 2)} ·
+      avg CPU error ${avg(trainedCpu, 'mape')}
+      (${trainedCpu.length} trained method${trainedCpu.length === 1 ? '' : 's'}) ·
+      avg wall error ${avg(trainedWall, 'wall_mape')}</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>method</th><th>cpu coef</th><th>cpu err</th>
+        <th>wall coef</th><th>wall err</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+}
 
 /** Reflect connection health in the navbar. */
 function setStatus(text, cls) {

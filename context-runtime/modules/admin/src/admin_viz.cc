@@ -601,6 +601,60 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
          resp.Json(w.Str());
        }});
 
+  // ---- Pool shutdown -------------------------------------------------------
+  // The Pools tab's per-card "x". Refuses the admin pool: destroying it is not
+  // pool management, it is killing the runtime out from under every client --
+  // the CLI's `clio_run stop` is the honest spelling of that intent.
+  viz.AddRoute(
+      {"POST", "/api/pools/{pool}/destroy", kAdminModName,
+       "Destroy a pool and its containers on this node",
+       [](const Request &req, Response &resp) {
+         const std::string pool_str = req.Var("pool");
+         clio::run::PoolId pool_id;
+         try {
+           pool_id = clio::run::PoolId::FromString(pool_str);
+         } catch (const std::exception &e) {
+           resp.Error(400, "bad pool id '" + pool_str + "': " + e.what());
+           return;
+         }
+         auto *pool_manager = CLIO_POOL_MANAGER;
+         const auto *info =
+             pool_manager ? pool_manager->GetPoolInfo(pool_id) : nullptr;
+         if (!info) {
+           resp.Error(404, "no pool with id " + pool_str);
+           return;
+         }
+         if (pool_id == clio::run::kAdminPoolId) {
+           resp.Error(403,
+                      "refusing to destroy the admin pool -- that is the "
+                      "runtime itself; use `clio_run stop`");
+           return;
+         }
+         const std::string pool_name = info->pool_name_;
+
+         Client admin_client(clio::run::kAdminPoolId);
+         auto future = admin_client.AsyncDestroyPool(
+             clio::run::PoolQuery::Local(), pool_id);
+         if (!future.Wait(kCreateTimeoutSec)) {
+           resp.Error(503, "DestroyPool timed out");
+           return;
+         }
+         HLOG(kInfo, "Viz: destroyed pool {} ({}) from the dashboard",
+              pool_str, pool_name);
+         if (future->GetReturnCode() != 0) {
+           resp.Error(500, "DestroyPool failed with rc=" +
+                               std::to_string(future->GetReturnCode()));
+           return;
+         }
+         JsonWriter w;
+         w.BeginObject();
+         w.Field("ok", true);
+         w.Field("pool_id", pool_str);
+         w.Field("pool_name", pool_name);
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+
   // ---- Module inventory for the "Add Pool" flow ---------------------------
   // Every loaded ChiMod, plus whether it registered a create form
   // (GET /api/mod/<mod>/create) and whether it mounted pages. The Pools page

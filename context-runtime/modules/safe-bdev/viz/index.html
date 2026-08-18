@@ -36,6 +36,9 @@
     <h2>Recovery</h2>
     <div class="grid" id="recovery"></div>
 
+    <h2>All statistics</h2>
+    <div id="all-stats"></div>
+
     <h2>Members</h2>
     <div id="members"></div>
 
@@ -52,6 +55,13 @@
       <button id="am-submit">Add member</button>
     </div>
     <div class="sub" id="am-msg"></div>
+
+    <h2>Task predictions</h2>
+    <p class="sub">
+      The learned per-method cost model for this array: predicted time =
+      coefficient &times; task size; the error columns are the average miss.
+    </p>
+    <div id="predictions"></div>
   </main>
 
   <script src="/viz/clio_admin/js/api.js"></script>
