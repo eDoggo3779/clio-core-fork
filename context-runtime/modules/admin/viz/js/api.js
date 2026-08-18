@@ -81,12 +81,23 @@ async function renderPredictions(elId, poolId) {
     return;
   }
   const methods = (entry.methods || []).filter((m) => m.name);
-  const rows = methods.map((m) => `<tr>
+  // A method whose MAPE is still 0 has never had a real completion reinforce
+  // it: its coefficient is the seed and an error of "0.0%" would read as
+  // "perfectly accurate". Show untrained columns as em-dashes instead, and
+  // list trained methods first so the meaningful rows lead.
+  const trained = (m) => m.mape > 0 || m.wall_mape > 0;
+  methods.sort((a, b) => Number(trained(b)) - Number(trained(a))
+    || a.name.localeCompare(b.name));
+  // First cell of each group carries the group rule, matching the header.
+  const cell = (coef, mape) => (mape > 0
+    ? `<td class="num pred-group">${num(coef, 3)}</td>
+       <td class="num">${num(mape * 100, 1)}%</td>`
+    : `<td class="num pred-group untrained">${num(coef, 3)}</td>
+       <td class="num untrained">&mdash;</td>`);
+  const rows = methods.map((m) => `<tr${trained(m) ? '' : ' class="untrained"'}>
       <td>${esc(m.name)}</td>
-      <td class="num">${num(m.coefficient, 3)}</td>
-      <td class="num">${num(m.mape * 100, 1)}%</td>
-      <td class="num">${num(m.wall_coefficient, 3)}</td>
-      <td class="num">${num(m.wall_mape * 100, 1)}%</td>
+      ${cell(m.coefficient, m.mape)}
+      ${cell(m.wall_coefficient, m.wall_mape)}
     </tr>`).join('');
   // Average error over the methods the model has trained on (mape > 0);
   // untouched methods sit at their seed and would dilute the answer to
@@ -96,14 +107,25 @@ async function renderPredictions(elId, poolId) {
   const avg = (list, key) => (list.length
     ? num(list.reduce((a, m) => a + m[key], 0) / list.length * 100, 1) + '%'
     : 'no samples yet');
+  // Two-tier header: "CPU time" / "Wall time" group their coefficient+error
+  // pairs, with a rule between groups, so every number sits under an
+  // unambiguous column.
   host.innerHTML = `
     <div class="sub">learning rate ${num(entry.learning_rate, 2)} ·
       avg CPU error ${avg(trainedCpu, 'mape')}
       (${trainedCpu.length} trained method${trainedCpu.length === 1 ? '' : 's'}) ·
-      avg wall error ${avg(trainedWall, 'wall_mape')}</div>
-    <div class="table-wrap"><table>
-      <thead><tr><th>method</th><th>cpu coef</th><th>cpu err</th>
-        <th>wall coef</th><th>wall err</th></tr></thead>
+      avg wall error ${avg(trainedWall, 'wall_mape')} ·
+      &mdash; = not trained yet</div>
+    <div class="table-wrap"><table class="pred-table">
+      <thead>
+        <tr><th rowspan="2" class="pred-method">method</th>
+            <th colspan="2" class="pred-group">CPU time</th>
+            <th colspan="2" class="pred-group">Wall time</th></tr>
+        <tr><th class="num pred-group">coefficient</th>
+            <th class="num">avg error</th>
+            <th class="num pred-group">coefficient</th>
+            <th class="num">avg error</th></tr>
+      </thead>
       <tbody>${rows}</tbody></table></div>`;
 }
 
@@ -162,18 +184,25 @@ function meter(label, pct) {
   </div>`;
 }
 
-/** Build a table from an array of objects, using `columns` = [[key, label, fmt]]. */
+/** Build a table from an array of objects, using `columns` = [[key, label, fmt]].
+ *  Alignment is decided PER COLUMN (numeric anywhere -> the whole column,
+ *  header included, right-aligns): deciding it per cell left the header and
+ *  even some cells of one column aligned differently, so a value could sit
+ *  visually under its neighbour's heading. */
 function table(rows, columns) {
   if (!rows || rows.length === 0) {
     return '<div class="empty">Nothing to show.</div>';
   }
-  const head = columns.map(([, label]) => `<th>${esc(label)}</th>`).join('');
+  const numeric = columns.map(([key]) =>
+    rows.some((row) => typeof row[key] === 'number'));
+  const cls = (i) => (numeric[i] ? ' class="num"' : '');
+  const head = columns.map(([, label], i) =>
+    `<th${cls(i)}>${esc(label)}</th>`).join('');
   const body = rows.map((row) => {
-    const cells = columns.map(([key, , fmt]) => {
+    const cells = columns.map(([key, , fmt], i) => {
       const raw = row[key];
       const text = fmt ? fmt(raw, row) : esc(raw);
-      const cls = typeof raw === 'number' ? ' class="num"' : '';
-      return `<td${cls}>${text}</td>`;
+      return `<td${cls(i)}>${text}</td>`;
     }).join('');
     return `<tr>${cells}</tr>`;
   }).join('');

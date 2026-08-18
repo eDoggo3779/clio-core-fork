@@ -63,45 +63,11 @@ async function renderWorkers() {
   ]);
 }
 
-async function renderBdevs() {
-  const data = await API.get(`${nodePath}/bdevs`);
-  // bdev_stats nests the device payload under "stats" alongside its pool id.
-  const rows = (data.devices || []).map((d) => {
-    const s = d.stats || d;
-    return Object.assign({ pool_id: d.pool_id || '' }, s);
-  });
-  document.getElementById('bdevs').innerHTML = table(rows, [
-    ['pool_id', 'pool'],
-    ['pool_name', 'name'],
-    ['total_capacity', 'capacity', (v) => bytes(v)],
-    ['remaining_capacity', 'free', (v) => bytes(v)],
-    ['read_bandwidth_mbps', 'read MB/s', (v) => num(v)],
-    ['write_bandwidth_mbps', 'write MB/s', (v) => num(v)],
-    ['total_reads', 'reads'],
-    ['total_writes', 'writes'],
-    ['total_bytes_read', 'bytes read', (v) => bytes(v)],
-    ['total_bytes_written', 'bytes written', (v) => bytes(v)],
-  ]);
-}
-
-async function renderContainers() {
-  const data = await API.get(`${nodePath}/containers`);
-  const rows = (data.containers || []).map((c) => Object.assign({}, c, {
-    methods_learned: (c.methods || []).filter((m) => m.name).length,
-  }));
-  document.getElementById('containers').innerHTML = table(rows, [
-    ['pool_id', 'pool'],
-    ['pool_name', 'name'],
-    ['chimod_name', 'chimod'],
-    ['container_id', 'container'],
-    ['methods_learned', 'methods'],
-    ['learning_rate', 'learning rate', (v) => num(v, 2)],
-  ]);
-}
+// Block-device and container detail moved to where they belong: devices live
+// on the bdev module's website and per-pool models on each pool's page (via
+// the Pools tab cards). This page is the node's utilization + worker view.
 
 poll(async () => {
   await renderSystem();
   await renderWorkers();
-  await renderBdevs();
-  await renderContainers();
 }, 2000);

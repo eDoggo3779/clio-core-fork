@@ -218,7 +218,17 @@ th {
 
 tbody tr:hover { background: var(--bg-card); }
 
-td.num { text-align: right; }
+/* Numeric columns right-align — HEADERS INCLUDED. A left-aligned header over a
+   right-aligned column makes the value appear to belong to its neighbour. */
+td.num, th.num { text-align: right; }
+
+/* Task-prediction table: the CPU / Wall groups get a dividing rule, group
+   titles center over their coefficient+error pairs, and rows the model has
+   not trained yet recede. */
+.pred-group { border-left: 1px solid var(--border); }
+.pred-table thead tr:first-child th.pred-group { text-align: center; }
+.pred-table thead th { vertical-align: bottom; }
+.pred-table tr.untrained td { color: var(--text-muted); }
 
 /* ---- Forms and pre ------------------------------------------------------ */
 
