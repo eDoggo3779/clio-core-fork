@@ -651,7 +651,10 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
     return false;
   }
   impl_ = std::move(impl);
-  HLOG(kInfo, "Viz: dashboard listening on http://{}:{}", impl_->bind_addr,
+  // kSuccess (green) rather than kInfo: this line is the address an operator
+  // has to copy into a browser, so it should stand out in a startup log that is
+  // otherwise a wall of white.
+  HLOG(kSuccess, "Viz: dashboard listening at http://{}:{}", impl_->bind_addr,
        impl_->port);
   return true;
 }
