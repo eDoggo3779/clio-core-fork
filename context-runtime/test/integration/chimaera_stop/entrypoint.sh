@@ -71,7 +71,7 @@ jarvis hostfile set "${HOSTFILE}"
 
 echo '[node1] building pipeline (clio_runtime only, tcp:9413)'
 jarvis ppl create chimaera_stop
-jarvis pkg append jarvis_clio_core.clio_runtime runtime
+jarvis ppl append jarvis_clio_core.clio_runtime runtime
 jarvis pkg conf runtime \
     port=9413 \
     ipc_mode=tcp \
