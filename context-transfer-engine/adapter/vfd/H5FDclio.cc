@@ -66,7 +66,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <map>
+#include <string>
 #include <vector>
 
 /* The driver identification number, initialized at runtime */
@@ -81,6 +83,14 @@ static hid_t H5FDclio_err_minor_g = H5I_INVALID_HID;
  * static) so a test can confirm HDF5 actually took the vector I/O path. */
 unsigned long H5FDclio_read_vector_calls_g = 0;
 unsigned long H5FDclio_write_vector_calls_g = 0;
+
+/* Observability: the largest span serviced as ONE coalesced I/O, in bytes.
+ * The coalescing window is a promise about memory -- the span sizes a scratch
+ * buffer -- and a promise nothing can see is one that rots. Single-element
+ * groups are not counted: those are serviced directly, allocate nothing, and
+ * are legitimately larger than the window. Exported (not static) so the suite
+ * can assert the window is actually enforced. */
+unsigned long H5FDclio_vec_max_span_g = 0;
 
 /* Observability: CTE cache-tier operations that FAILED. Survivable while the
  * cache is populate-only, but a dropped Pwrite is a range the cache believes
@@ -196,6 +206,21 @@ typedef struct H5FD_clio_fapl_t {
  * drivers that implement vector I/O -- see H5FD__clio_write_vector. */
 #define H5FD_CLIO_SIEVE_MAX_DEF ((size_t)(64 * 1024))
 
+/* Largest accepted coalescing window. The window bounds a scratch buffer this
+ * driver allocates per vector call, so an absurd value is not a slow
+ * configuration but an out-of-memory one -- and 1 GiB is already four orders of
+ * magnitude past the useful range (HDF5's own sieve default is 64 KiB). Having
+ * a stated maximum is also what lets every entry point reject a nonsense value
+ * with the same message instead of each one inventing its own bound. */
+#define H5FD_CLIO_SIEVE_MAX_LIM ((unsigned long long)1 << 30)
+
+/* 0 (coalescing off) through the limit above. Applied to every source of the
+ * value: the config string, and a driver-info block an application built by
+ * hand and passed to H5Pset_driver. */
+static inline bool H5FD__clio_sieve_valid(size_t v) {
+  return (unsigned long long)v <= H5FD_CLIO_SIEVE_MAX_LIM;
+}
+
 /* Default policy when a file is opened without a driver-specific FAPL
  * (e.g. H5Pset_driver(fapl, driver, NULL)): cache on, coalescing on. */
 static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {
@@ -247,12 +272,34 @@ static bool H5FD__clio_apply_config_str(hid_t fapl_id, H5FD_clio_fapl_t *fa) {
       }
       fa->cache_enabled = on ? 1 : 0;
     } else if (e.first == "sieve") {
+      /* strtoull WRAPS a negative instead of rejecting it -- "-1" parses as
+         ULLONG_MAX with errno untouched, which would install a SIZE_MAX
+         window. Refuse the sign up front; detecting the wrap afterwards is not
+         possible, since ULLONG_MAX is also a legitimate spelling of a value
+         this driver would reject for being too large anyway. */
+      const std::string &sv = e.second;
+      const size_t first = sv.find_first_not_of(" \t");
+      if (first == std::string::npos || sv[first] == '-') {
+        H5FD_CLIO_ERROR(("driver config: sieve='" + sv +
+                         "' is not a byte count (must be >= 0)")
+                            .c_str());
+        return false;
+      }
       errno = 0;
       char *endp = nullptr;
-      const unsigned long long v = strtoull(e.second.c_str(), &endp, 0);
-      if (errno != 0 || endp == e.second.c_str() || (endp && *endp != '\0')) {
-        H5FD_CLIO_ERROR(("driver config: sieve='" + e.second +
+      const unsigned long long v = strtoull(sv.c_str(), &endp, 0);
+      if (errno != 0 || endp == sv.c_str() || (endp && *endp != '\0')) {
+        H5FD_CLIO_ERROR(("driver config: sieve='" + sv +
                          "' is not a byte count")
+                            .c_str());
+        return false;
+      }
+      /* Bound before the narrowing cast: on a 32-bit size_t the cast alone
+         would silently truncate, and a window larger than the limit is
+         refused on every platform for the same reason. */
+      if (v > H5FD_CLIO_SIEVE_MAX_LIM) {
+        H5FD_CLIO_ERROR(("driver config: sieve='" + sv +
+                         "' exceeds the maximum coalescing window (1 GiB)")
                             .c_str());
         return false;
       }
@@ -485,6 +532,21 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
        fails the open rather than being ignored: the caller asked for something
        specific, and silently giving them the default is how a user ends up
        believing a knob is set when it is not. */
+    return nullptr;
+  }
+
+  /* Validate the coalescing window HERE, after both sources have had their say.
+     The config string vets its own input, but a driver-info block does not go
+     through it at all: H5Pset_driver(fapl, id, &fa) takes whatever struct the
+     application filled in, so a value that never passed a parser can still
+     reach this point. sieve_max sizes a scratch allocation, which makes a
+     nonsense one an allocation failure rather than a slow open -- and this is
+     the single place every FAPL path converges on. Fail closed, as the config
+     string does. */
+  if (!H5FD__clio_sieve_valid(fa.sieve_max)) {
+    errno = EINVAL;
+    H5FD_CLIO_ERROR("driver FAPL: the vector-I/O coalescing window "
+                    "(sieve_max) exceeds the maximum of 1 GiB");
     return nullptr;
   }
 
@@ -1057,16 +1119,26 @@ static uint32_t H5FD__clio_vec_group(uint32_t i, uint32_t count,
   haddr_t end = addrs[i] + st.size;
   size_t payload = st.size;
   uint32_t j = i + 1;
-  if (cap > 0) {
+  /* An element that is already larger than the window stays a group of one.
+     Coalescing around it cannot honour the window -- the scratch buffer would
+     be sized by that element, not by `cap` -- and there is nothing to gain:
+     the element is serviced as a single I/O either way. */
+  if (cap > 0 && (uint64_t)(end - addrs[i]) <= (uint64_t)cap) {
     while (j < count) {
       H5FD_clio_vecst_t nxt = st;
       H5FD__clio_vecst_step(&nxt, j, sizes, types);
       if (addrs[j] < addrs[i]) break;                 /* not ascending */
       const haddr_t e = addrs[j] + nxt.size;
       if (e <= addrs[i]) break;                       /* degenerate */
-      if ((uint64_t)(e - addrs[i]) > (uint64_t)cap) break;
+      /* Test the span the group WOULD have, not this element's own end. They
+         differ whenever an element falls inside the span already accumulated
+         (a shorter element after a longer one), and testing the element's end
+         there would admit it while the span -- and with it the scratch
+         allocation -- stayed above the window. */
+      const haddr_t nend = (e > end) ? e : end;
+      if ((uint64_t)(nend - addrs[i]) > (uint64_t)cap) break;
       st = nxt;
-      if (e > end) end = e;
+      end = nend;
       payload += nxt.size;
       j++;
     }
@@ -1077,10 +1149,29 @@ static uint32_t H5FD__clio_vec_group(uint32_t i, uint32_t count,
 }
 
 /* Scratch for one coalesced group. Bounded by the sieve window, so this is a
- * 64 KiB allocation by default and it is reused for the whole vector call. */
+ * 64 KiB allocation by default and it is reused for the whole vector call.
+ *
+ * The allocation is the one step here that can fail, and it must fail as this
+ * driver's failure rather than as an exception: these callbacks are reached
+ * from HDF5's C frames, and unwinding a C++ exception through them is
+ * undefined. Convert it to FAIL, with the reason on HDF5's error stack, and
+ * let the caller return FAIL to the library. */
 static herr_t H5FD__clio_vec_scratch(std::vector<char> *buf, size_t need) {
-  if (buf->size() < need) {
+  if (buf->size() >= need) {
+    return SUCCEED;
+  }
+  try {
     buf->resize(need);
+  } catch (const std::exception &ex) {
+    errno = ENOMEM;
+    H5FD_CLIO_ERROR(
+        ("could not allocate the " + std::to_string(need) +
+         "-byte vector-I/O scratch buffer: " + ex.what()).c_str());
+    return FAIL;
+  } catch (...) {
+    errno = ENOMEM;
+    H5FD_CLIO_ERROR("could not allocate the vector-I/O scratch buffer");
+    return FAIL;
   }
   return SUCCEED;
 }
@@ -1142,6 +1233,8 @@ static herr_t H5FD__clio_read_vector(H5FD_t *_file, hid_t dxpl, uint32_t count,
       }
     } else {
       const size_t span = (size_t)(end - addrs[i]);
+      if ((unsigned long)span > H5FDclio_vec_max_span_g)
+        H5FDclio_vec_max_span_g = (unsigned long)span;
       if (H5FD__clio_vec_scratch(&scratch, span) < 0) return FAIL;
       if (H5FD__clio_traced(file, clio::vfdtrace::Op::kRead, (int)gst.type,
                             addrs[i], span, [&] {
@@ -1194,6 +1287,8 @@ static herr_t H5FD__clio_write_vector(H5FD_t *_file, hid_t dxpl, uint32_t count,
       }
     } else {
       const size_t span = (size_t)(end - addrs[i]);
+      if ((unsigned long)span > H5FDclio_vec_max_span_g)
+        H5FDclio_vec_max_span_g = (unsigned long)span;
       if (H5FD__clio_vec_scratch(&scratch, span) < 0) return FAIL;
       /* Elements that exactly tile the span leave no bytes to preserve, so the
          read-modify part is skipped and this is a pure gather. */
@@ -1407,7 +1502,13 @@ herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t cache_enabled) {
   if (driver < 0) {
     return FAIL;
   }
-  H5FD_clio_fapl_t fa;
+  /* Start from the defaults so EVERY field is initialized, including the ones
+     this entry point does not expose. H5Pset_driver copies the struct verbatim
+     onto the FAPL, so a field left unset here would reach H5FD__clio_open as
+     stack garbage -- for sieve_max, as the coalescing window and therefore as
+     the size of a scratch allocation. Assigning the default struct rather than
+     naming fields keeps that true for whatever is added next. */
+  H5FD_clio_fapl_t fa = H5FD_clio_fapl_default_g;
   fa.cache_enabled = cache_enabled;
   return H5Pset_driver(fapl_id, driver, &fa);
 }
