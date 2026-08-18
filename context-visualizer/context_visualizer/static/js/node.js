@@ -387,7 +387,7 @@
     }
 
     // ---- Poll Container Stats ----
-    var expandedContainers = {};  // track which containers are expanded by pool_id
+    var expandedContainers = {};  // track which containers are expanded by pool_id:container_id
     var modelMode = "cpu";  // "cpu" or "wall"
 
     function pollContainerStats() {
@@ -412,10 +412,14 @@
                     var containerId = c.container_id || 0;
                     var methods = c.methods || [];
                     var lr = c.learning_rate || 0;
+                    // A pool can host several containers on one node (its own
+                    // plus recovered ones), each with its own model, so the
+                    // card identity must include the container id.
+                    var cardKey = poolId + ":" + containerId;
 
                     var card = document.createElement("div");
                     card.className = "container-card";
-                    if (expandedContainers[poolId]) card.className += " expanded";
+                    if (expandedContainers[cardKey]) card.className += " expanded";
 
                     // Filter to methods with non-empty names
                     var activeMethods = methods.filter(function (m) {
@@ -465,10 +469,10 @@
                         var isExpanded = card.classList.contains("expanded");
                         if (isExpanded) {
                             card.classList.remove("expanded");
-                            delete expandedContainers[poolId];
+                            delete expandedContainers[cardKey];
                         } else {
                             card.classList.add("expanded");
-                            expandedContainers[poolId] = true;
+                            expandedContainers[cardKey] = true;
                         }
                     });
 
