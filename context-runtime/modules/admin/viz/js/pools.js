@@ -21,6 +21,59 @@ async function post(path, fields) {
   }
 }
 
+/**
+ * One-line statistics summary for a pool card.
+ *
+ * Prefers the well-known keys from the pool's own Monitor("stats") payload
+ * (capacity, latency, array shape, CTE holdings), then pads with whatever
+ * other scalars the module reported; a pool whose module answers no stats
+ * falls back to its task-model training state so every card says something.
+ */
+function statsSummary(s, modelEntry) {
+  const parts = [];
+  if (s) {
+    if (s.total_capacity !== undefined && s.remaining_capacity !== undefined) {
+      parts.push(`${bytes(s.remaining_capacity)} free of ${bytes(s.total_capacity)}`);
+    }
+    if (s.read_latency_us !== undefined) parts.push(`read ${num(s.read_latency_us)} µs`);
+    if (s.write_latency_us !== undefined) parts.push(`write ${num(s.write_latency_us)} µs`);
+    if (s.data_count !== undefined) {
+      parts.push(`${s.data_count} data + ${s.parity_level ?? 0} parity`);
+    }
+    if (Number(s.recovery_active) === 1) parts.push('RECOVERING');
+    if (s.num_targets !== undefined) {
+      parts.push(`${s.num_targets} targets · ${s.num_tags} tags · ${s.num_blobs} blobs`);
+    }
+    if (parts.length === 0) {
+      Object.entries(s)
+        .filter(([, v]) => typeof v === 'number')
+        .slice(0, 3)
+        .forEach(([k, v]) => parts.push(`${k} ${Number.isInteger(v) ? v : num(v, 2)}`));
+    }
+  }
+  if (parts.length === 0 && modelEntry) {
+    const trained = (modelEntry.methods || [])
+      .filter((m) => m.name && (m.mape > 0 || m.wall_mape > 0)).length;
+    const total = (modelEntry.methods || []).filter((m) => m.name).length;
+    parts.push(`model: ${trained}/${total} methods trained`);
+  }
+  return parts.slice(0, 3).join(' · ') || 'no statistics reported';
+}
+
+/** Fetch Monitor("stats") for every pool at once; failures leave gaps. */
+async function statsForPools(pools) {
+  const byId = {};
+  await Promise.all(pools.map(async (p) => {
+    try {
+      const data = await API.get(
+        `/api/pools/${encodeURIComponent(p.pool_id)}/monitor?query=stats&routing=local`);
+      const values = Object.values(data.results || {}).filter((v) => v && typeof v === 'object');
+      if (values.length) byId[p.pool_id] = values[0];
+    } catch (e) { /* pool mid-destroy or module without stats */ }
+  }));
+  return byId;
+}
+
 /** Where a pool card navigates: the module's own website (with the pool
  *  preselected via ?pool=), or the generic pool page when it ships none. */
 function poolHref(pool) {
@@ -47,12 +100,16 @@ async function destroyPool(poolId, poolName) {
 }
 
 async function renderPools() {
-  const [data, mods] = await Promise.all([
+  const [data, mods, containers] = await Promise.all([
     API.get('/api/pools'),
     API.get('/api/routes'),
+    API.get('/api/nodes/local/containers'),
   ]);
   PAGED_MODS = {};
   (mods.mounts || []).forEach((m) => { PAGED_MODS[m.mod_name] = m.url_prefix; });
+  const stats = await statsForPools(data.pools || []);
+  const models = {};
+  (containers.containers || []).forEach((c) => { models[c.pool_id] = c; });
 
   // One section per ChiMod, cards inside.
   const groups = {};
@@ -77,6 +134,7 @@ async function renderPools() {
           <h3>${esc(p.pool_name)}</h3>
           <div class="sub"><span class="badge">${esc(p.pool_id)}</span>
             container ${esc(p.container_id)}</div>
+          <div class="sub">${esc(statsSummary(stats[p.pool_id], models[p.pool_id]))}</div>
         </div>`;
       }).join('');
     return `<h2>${esc(mod)} <span class="badge">${groups[mod].length}</span></h2>

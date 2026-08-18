@@ -838,6 +838,16 @@ TEST_CASE("Viz CTE website: targets register and unregister by name",
   REQUIRE(Contains(targets.body, "ram::viz_cte_tier"));
   REQUIRE(Contains(targets.body, "\"remaining_space\":"));
 
+  // The pool-card summary reads Monitor("stats"); the CTE now answers it with
+  // what it is holding.
+  HttpReply cte_stats =
+      HttpGet(port, "/api/pools/4970.0/monitor?query=stats&routing=local");
+  Explain("CTE monitor stats", cte_stats);
+  REQUIRE(cte_stats.status == 200);
+  REQUIRE(Contains(cte_stats.body, "\"num_targets\":1"));
+  REQUIRE(Contains(cte_stats.body, "\"num_tags\":"));
+  REQUIRE(Contains(cte_stats.body, "\"num_blobs\":"));
+
   // And gone again.
   HttpReply unregistered = HttpPostForm(
       port, "/api/mod/clio_cte_core/4970.0/unregister_target",

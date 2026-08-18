@@ -35,6 +35,7 @@
 #include <clio_cte/core/core_config.h>
 #include <clio_cte/core/dpe/dpe.h>
 #include <clio_cte/core/core_runtime.h>
+#include <clio_ctp/serialize/msgpack_wrapper.h>
 
 #include <algorithm>
 #include <chrono>
@@ -7527,6 +7528,22 @@ clio::run::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
 
 clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (task->query_ == "stats") {
+    // The pool-level shape every ChiMod's dashboard card summarizes (#990):
+    // what this CTE instance is holding. The map size() calls are atomic
+    // loads, so no locks are taken here.
+    msgpack::sbuffer sbuf;
+    msgpack::packer<msgpack::sbuffer> pk(sbuf);
+    pk.pack_map(4);
+    pk.pack("pool_name");   pk.pack(pool_name_);
+    pk.pack("num_targets");
+    pk.pack(static_cast<clio::run::u64>(registered_targets_.size()));
+    pk.pack("num_tags");
+    pk.pack(static_cast<clio::run::u64>(tag_id_to_info_.size()));
+    pk.pack("num_blobs");
+    pk.pack(static_cast<clio::run::u64>(tag_blob_name_to_info_.size()));
+    task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+  }
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
