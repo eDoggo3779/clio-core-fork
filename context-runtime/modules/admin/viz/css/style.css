@@ -122,8 +122,35 @@ h2 {
 .card.clickable:hover { border-color: var(--accent-secondary); }
 .card.dead { opacity: 0.55; }
 
-/* Pool cards: room for the shutdown "x" in the corner. */
-.pool-card { position: relative; padding-right: 2.25rem; }
+/* Pool cards: room for the shutdown "x" in the corner, and a FIXED footprint —
+   the grid track decides the width and long content never widens the card.
+   Long values (a file-backed pool's name is a filesystem path) crop at the
+   card edge and scroll horizontally instead. */
+.pool-card {
+  position: relative;
+  padding-right: 2.25rem;
+  min-width: 0;          /* grid items default to min-width:auto, which lets
+                            content stretch the track — pin it */
+  min-height: 5rem;      /* uniform card height across a section */
+  overflow: hidden;
+}
+
+.pool-card h3,
+.pool-card .sub {
+  display: block;
+  white-space: nowrap;
+  overflow-x: auto;      /* crop + scroll, never wrap or spill */
+  scrollbar-width: thin;
+  padding-bottom: 2px;   /* keep the scrollbar off the glyphs */
+}
+
+.pool-card h3::-webkit-scrollbar,
+.pool-card .sub::-webkit-scrollbar { height: 4px; }
+.pool-card h3::-webkit-scrollbar-thumb,
+.pool-card .sub::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 2px;
+}
 
 .card-close {
   position: absolute;

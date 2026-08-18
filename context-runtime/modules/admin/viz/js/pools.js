@@ -69,7 +69,9 @@ async function renderPools() {
           `<button class="card-close" title="Shut down this pool"
              onclick="event.stopPropagation();
                       destroyPool('${esc(p.pool_id)}','${esc(p.pool_name)}')">&times;</button>`;
-        return `<div class="card clickable pool-card"
+        // title = the full name: long ones (file-backed pools are paths) crop
+        // and scroll inside the fixed-size card, so hover shows it whole.
+        return `<div class="card clickable pool-card" title="${esc(p.pool_name)}"
                      onclick="location.href='${poolHref(p)}'">
           ${closer}
           <h3>${esc(p.pool_name)}</h3>
