@@ -237,14 +237,26 @@ function markNav() {
   });
 }
 
-/** Run `fn` now and every `ms`, keeping the navbar status in sync. */
+/** Run `fn` now and every `ms`, keeping the navbar status in sync. A failing
+ *  tick also raises a visible banner in #errors (a tiny navbar note is easy to
+ *  miss on a page that just stays blank) and clears it when a later tick
+ *  succeeds. */
 function poll(fn, ms) {
   const tick = async () => {
+    const err = document.getElementById('errors');
     try {
       await fn();
       setStatus('connected', 'ok');
+      if (err && err.dataset.pollError) {
+        err.innerHTML = '';
+        delete err.dataset.pollError;
+      }
     } catch (e) {
       setStatus(String(e.message || e), 'bad');
+      if (err) {
+        showError('errors', `refresh failed: ${e.message || e}`);
+        err.dataset.pollError = '1';
+      }
     }
   };
   tick();

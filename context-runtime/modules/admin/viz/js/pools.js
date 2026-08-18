@@ -77,7 +77,10 @@ async function statsForPools(pools) {
 /** Where a pool card navigates: the module's own website (with the pool
  *  preselected via ?pool=), or the generic pool page when it ships none. */
 function poolHref(pool) {
-  const prefix = PAGED_MODS[pool.chimod_name];
+  // The admin module's "page" is the dashboard shell itself, not a pool view,
+  // so the admin pool uses the generic pool page like any module without one.
+  const prefix = pool.chimod_name === 'clio_admin'
+    ? null : PAGED_MODS[pool.chimod_name];
   const page = prefix ? `${prefix}/index.html` : '/viz/clio_admin/pool.html';
   return `${page}?pool=${encodeURIComponent(pool.pool_id)}`;
 }
@@ -100,16 +103,22 @@ async function destroyPool(poolId, poolName) {
 }
 
 async function renderPools() {
-  const [data, mods, containers] = await Promise.all([
-    API.get('/api/pools'),
-    API.get('/api/routes'),
-    API.get('/api/nodes/local/containers'),
-  ]);
+  // Only the pool list itself is load-bearing. The extras -- module-page
+  // mounts, per-pool models, per-pool stats -- each degrade independently: a
+  // slow or failing Monitor must never blank the whole tab.
+  const data = await API.get('/api/pools');
+  const degraded = [];
   PAGED_MODS = {};
-  (mods.mounts || []).forEach((m) => { PAGED_MODS[m.mod_name] = m.url_prefix; });
-  const stats = await statsForPools(data.pools || []);
+  try {
+    const mods = await API.get('/api/routes');
+    (mods.mounts || []).forEach((m) => { PAGED_MODS[m.mod_name] = m.url_prefix; });
+  } catch (e) { degraded.push(`module pages: ${e.message || e}`); }
   const models = {};
-  (containers.containers || []).forEach((c) => { models[c.pool_id] = c; });
+  try {
+    const containers = await API.get('/api/nodes/local/containers');
+    (containers.containers || []).forEach((c) => { models[c.pool_id] = c; });
+  } catch (e) { degraded.push(`models: ${e.message || e}`); }
+  const stats = await statsForPools(data.pools || []);
 
   // One section per ChiMod, cards inside.
   const groups = {};
@@ -140,8 +149,10 @@ async function renderPools() {
     return `<h2>${esc(mod)} <span class="badge">${groups[mod].length}</span></h2>
             <div class="grid">${cards}</div>`;
   });
+  const note = degraded.length
+    ? `<div class="sub">degraded: ${esc(degraded.join(' · '))}</div>` : '';
   document.getElementById('pools').innerHTML = sections.length
-    ? sections.join('')
+    ? note + sections.join('')
     : '<div class="empty">No pools composed on this node.</div>';
 }
 
