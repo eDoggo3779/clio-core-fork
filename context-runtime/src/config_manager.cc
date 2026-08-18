@@ -432,7 +432,7 @@ void ConfigManager::LoadDefault() {
   viz_enabled_explicit_ = false;
   viz_port_ = 8080;
   viz_bind_addr_ = "127.0.0.1";
-  viz_max_threads_ = 4;
+  viz_max_threads_ = 16;
 }
 
 void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {

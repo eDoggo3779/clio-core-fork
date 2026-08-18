@@ -60,29 +60,63 @@ function statsSummary(s, modelEntry) {
   return parts.slice(0, 3).join(' · ') || 'no statistics reported';
 }
 
-/** Fetch Monitor("stats") for every pool at once; failures leave gaps. */
-async function statsForPools(pools) {
-  const byId = {};
-  await Promise.all(pools.map(async (p) => {
-    try {
-      const data = await API.get(
-        `/api/pools/${encodeURIComponent(p.pool_id)}/monitor?query=stats&routing=local`);
-      const values = Object.values(data.results || {}).filter((v) => v && typeof v === 'object');
-      if (values.length) byId[p.pool_id] = values[0];
-    } catch (e) { /* pool mid-destroy or module without stats */ }
-  }));
-  return byId;
-}
+// ---- Progressive card rendering ---------------------------------------------
+//
+// The pool list itself is one cheap node-local call, so the cards paint
+// IMMEDIATELY from it. Everything slower streams in afterwards and updates
+// cards in place as it lands: each pool's Monitor("stats") fills that card's
+// summary (and its expanded table) the moment it answers, the model fetch
+// upgrades the fallback summaries, and the route table upgrades card targets.
+// The DOM is rebuilt only when the pool SET changes, so open "more" panels,
+// scroll position and hover survive the refresh ticks.
+
+let POOL_SIG = '';           // structure signature of the last build
+let POOLS = [];              // last pool list
+const EXPANDED = new Set();  // pool ids with their stats panel open
+const LAST_STATS = {};       // pool_id -> last Monitor("stats") payload
+const LAST_MODELS = {};      // pool_id -> containers entry (task model)
 
 /** Where a pool card navigates: the module's own website (with the pool
- *  preselected via ?pool=), or the generic pool page when it ships none. */
+ *  preselected via ?pool=), or the generic pool page when it ships none. The
+ *  admin module's "page" is the dashboard shell itself, so the admin pool
+ *  uses the generic pool page too. */
 function poolHref(pool) {
-  // The admin module's "page" is the dashboard shell itself, not a pool view,
-  // so the admin pool uses the generic pool page like any module without one.
   const prefix = pool.chimod_name === 'clio_admin'
     ? null : PAGED_MODS[pool.chimod_name];
   const page = prefix ? `${prefix}/index.html` : '/viz/clio_admin/pool.html';
   return `${page}?pool=${encodeURIComponent(pool.pool_id)}`;
+}
+
+// eslint-disable-next-line no-unused-vars
+function openPool(poolId) {
+  const pool = POOLS.find((p) => p.pool_id === poolId);
+  if (pool) window.location.href = poolHref(pool);
+}
+
+/** Refresh one card's summary line and, when expanded, its full stats table. */
+function updateCard(poolId) {
+  const sum = document.getElementById(`sum-${poolId}`);
+  if (sum) sum.textContent = statsSummary(LAST_STATS[poolId], LAST_MODELS[poolId]);
+  const panel = document.getElementById(`stats-${poolId}`);
+  const toggle = document.getElementById(`more-${poolId}`);
+  if (!panel || !toggle) return;
+  if (EXPANDED.has(poolId)) {
+    panel.style.display = 'block';
+    toggle.textContent = 'hide statistics ▴';
+    panel.innerHTML = LAST_STATS[poolId]
+      ? kvTable(LAST_STATS[poolId], ['pool_name'])
+      : '<div class="empty">no statistics reported</div>';
+  } else {
+    panel.style.display = 'none';
+    toggle.textContent = 'read more ▾';
+  }
+}
+
+// eslint-disable-next-line no-unused-vars
+function toggleStats(poolId) {
+  if (EXPANDED.has(poolId)) EXPANDED.delete(poolId);
+  else EXPANDED.add(poolId);
+  updateCard(poolId);
 }
 
 // eslint-disable-next-line no-unused-vars
@@ -99,30 +133,14 @@ async function destroyPool(poolId, poolName) {
   } catch (e) {
     msg.textContent = `shutdown failed: ${e.message}`;
   }
+  POOL_SIG = '';  // pool set changed: force a structure rebuild
   renderPools();
 }
 
-async function renderPools() {
-  // Only the pool list itself is load-bearing. The extras -- module-page
-  // mounts, per-pool models, per-pool stats -- each degrade independently: a
-  // slow or failing Monitor must never blank the whole tab.
-  const data = await API.get('/api/pools');
-  const degraded = [];
-  PAGED_MODS = {};
-  try {
-    const mods = await API.get('/api/routes');
-    (mods.mounts || []).forEach((m) => { PAGED_MODS[m.mod_name] = m.url_prefix; });
-  } catch (e) { degraded.push(`module pages: ${e.message || e}`); }
-  const models = {};
-  try {
-    const containers = await API.get('/api/nodes/local/containers');
-    (containers.containers || []).forEach((c) => { models[c.pool_id] = c; });
-  } catch (e) { degraded.push(`models: ${e.message || e}`); }
-  const stats = await statsForPools(data.pools || []);
-
-  // One section per ChiMod, cards inside.
+/** Build the section/card structure. Only called when the pool set changed. */
+function buildCards(pools) {
   const groups = {};
-  (data.pools || []).forEach((p) => {
+  pools.forEach((p) => {
     (groups[p.chimod_name] = groups[p.chimod_name] || []).push(p);
   });
   const sections = Object.keys(groups).sort().map((mod) => {
@@ -138,22 +156,60 @@ async function renderPools() {
         // title = the full name: long ones (file-backed pools are paths) crop
         // and scroll inside the fixed-size card, so hover shows it whole.
         return `<div class="card clickable pool-card" title="${esc(p.pool_name)}"
-                     onclick="location.href='${poolHref(p)}'">
+                     onclick="openPool('${esc(p.pool_id)}')">
           ${closer}
           <h3>${esc(p.pool_name)}</h3>
           <div class="sub"><span class="badge">${esc(p.pool_id)}</span>
             container ${esc(p.container_id)}</div>
-          <div class="sub">${esc(statsSummary(stats[p.pool_id], models[p.pool_id]))}</div>
+          <div class="sub pool-summary" id="sum-${esc(p.pool_id)}">loading statistics…</div>
+          <div class="pool-more">
+            <a id="more-${esc(p.pool_id)}"
+               onclick="event.stopPropagation(); toggleStats('${esc(p.pool_id)}')">read more ▾</a>
+            <div class="pool-stats" id="stats-${esc(p.pool_id)}" style="display:none;"></div>
+          </div>
         </div>`;
       }).join('');
     return `<h2>${esc(mod)} <span class="badge">${groups[mod].length}</span></h2>
-            <div class="grid">${cards}</div>`;
+            <div class="grid pool-grid">${cards}</div>`;
   });
-  const note = degraded.length
-    ? `<div class="sub">degraded: ${esc(degraded.join(' · '))}</div>` : '';
   document.getElementById('pools').innerHTML = sections.length
-    ? note + sections.join('')
+    ? sections.join('')
     : '<div class="empty">No pools composed on this node.</div>';
+  pools.forEach((p) => updateCard(p.pool_id));
+}
+
+async function renderPools() {
+  // The load-bearing call: fast, node-local, no Monitor round trips.
+  const data = await API.get('/api/pools');
+  POOLS = data.pools || [];
+  const sig = POOLS.map((p) => `${p.pool_id}/${p.chimod_name}/${p.pool_name}`)
+    .sort().join('|');
+  if (sig !== POOL_SIG) {
+    POOL_SIG = sig;
+    buildCards(POOLS);
+  }
+
+  // Everything below streams in and updates cards in place; failures leave
+  // the previous values standing rather than blanking anything.
+  API.get('/api/routes').then((mods) => {
+    PAGED_MODS = {};
+    (mods.mounts || []).forEach((m) => { PAGED_MODS[m.mod_name] = m.url_prefix; });
+  }).catch(() => {});
+  API.get('/api/nodes/local/containers').then((c) => {
+    (c.containers || []).forEach((entry) => { LAST_MODELS[entry.pool_id] = entry; });
+    POOLS.forEach((p) => updateCard(p.pool_id));
+  }).catch(() => {});
+  POOLS.forEach((p) => {
+    API.get(`/api/pools/${encodeURIComponent(p.pool_id)}/monitor?query=stats&routing=local`)
+      .then((d) => {
+        const values = Object.values(d.results || {})
+          .filter((v) => v && typeof v === 'object');
+        if (values.length) {
+          LAST_STATS[p.pool_id] = values[0];
+          updateCard(p.pool_id);
+        }
+      }).catch(() => { /* mid-destroy or module without stats */ });
+  });
 }
 
 // ---- Add Pool flow ---------------------------------------------------------

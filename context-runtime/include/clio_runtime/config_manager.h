@@ -563,7 +563,7 @@ class ConfigManager : public ctp::BaseConfig {
   bool viz_enabled_explicit_ = false;
   u32 viz_port_ = 8080;
   std::string viz_bind_addr_ = "127.0.0.1";
-  u32 viz_max_threads_ = 4;
+  u32 viz_max_threads_ = 16;
 
   // Compose configuration
   ComposeConfig compose_config_;

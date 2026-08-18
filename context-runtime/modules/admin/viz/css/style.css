@@ -126,13 +126,35 @@ h2 {
    the grid track decides the width and long content never widens the card.
    Long values (a file-backed pool's name is a filesystem path) crop at the
    card edge and scroll horizontally instead. */
+/* Pool sections use wider tracks than the default grid: the cards carry a
+   stats summary and an expandable statistics table, so they get more room. */
+.pool-grid {
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+
 .pool-card {
   position: relative;
   padding-right: 2.25rem;
   min-width: 0;          /* grid items default to min-width:auto, which lets
                             content stretch the track — pin it */
-  min-height: 5rem;      /* uniform card height across a section */
+  min-height: 8rem;      /* uniform card height across a section */
   overflow: hidden;
+}
+
+/* The "read more" toggle and its statistics panel. */
+.pool-more { margin-top: 0.4rem; }
+
+.pool-more a {
+  cursor: pointer;
+  font-size: 0.75rem;
+  color: var(--accent-secondary);
+  user-select: none;
+}
+
+.pool-stats {
+  margin-top: 0.4rem;
+  max-height: 14rem;
+  overflow-y: auto;      /* long stat lists scroll inside the card */
 }
 
 .pool-card h3,

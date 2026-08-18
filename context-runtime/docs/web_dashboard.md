@@ -26,7 +26,7 @@ viz:
   enabled: true
   port: 8080
   bind: "127.0.0.1"
-  max_threads: 4
+  max_threads: 16
 ```
 
 Or in the environment, which overrides the file: `CLIO_VIZ_ENABLE`,

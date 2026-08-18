@@ -63,7 +63,10 @@ runtime:
 #   bind: "127.0.0.1"                  # loopback by default: the dashboard
 #                                      # exposes runtime internals, so binding
 #                                      # 0.0.0.0 publishes them to the network
-#   max_threads: 4                     # HTTP request threads
+#   max_threads: 16                    # HTTP request threads. Thread-per-
+#                                      # connection: a browser parks ~6
+#                                      # keep-alive sockets, so keep this
+#                                      # comfortably above that.
 
 # -- Compose ------------------------------------------------------------------
 # Modules started automatically with the runtime.

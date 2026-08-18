@@ -788,6 +788,15 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
     params->setMaxThreads(static_cast<int>(std::max<u32>(max_threads, 1)));
     params->setMaxQueued(64);
     params->setKeepAlive(true);
+    // Poco serves thread-per-CONNECTION, and a kept-alive connection PARKS its
+    // thread between requests -- for the default keepAliveTimeout (15s) if the
+    // client sends nothing more. A browser holds ~6 keep-alive sockets, so a
+    // small pool starves in 15s waves the moment a dashboard tab is open
+    // (measured: with 4 threads, 10 concurrent GETs answer 4x11ms / 4x15s /
+    // 2x30s). Park briefly instead, and cap requests per connection so a
+    // misbehaving client cannot own a thread forever.
+    params->setKeepAliveTimeout(Poco::Timespan(2, 0));
+    params->setMaxKeepAliveRequests(100);
     impl->server = std::make_unique<Poco::Net::HTTPServer>(
         new PocoVizHandlerFactory(this), impl->socket, params);
     impl->server->start();
