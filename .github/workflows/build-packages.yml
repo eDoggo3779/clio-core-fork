@@ -21,6 +21,7 @@ jobs:
   check-version:
     name: Check tag matches version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
     - name: Checkout repository
@@ -52,6 +53,7 @@ jobs:
   build-deb:
     name: Build Debian package (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     needs: [check-version]
     if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
     strategy:
@@ -119,6 +121,7 @@ jobs:
   build-rpm:
     name: Build RPM package (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container: fedora:40
     needs: [check-version]
     if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
@@ -188,6 +191,7 @@ jobs:
   build-appimage:
     name: Build AppImage (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     needs: [check-version]
     if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
     strategy:
@@ -259,6 +263,7 @@ jobs:
     name: Test DEB install (${{ matrix.arch }})
     needs: [build-deb]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container: ubuntu:24.04
     if: always() && needs.build-deb.result == 'success'
     strategy:
@@ -326,6 +331,7 @@ jobs:
     name: Test RPM install (${{ matrix.arch }})
     needs: [build-rpm]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container: fedora:40
     if: always() && needs.build-rpm.result == 'success'
     strategy:
@@ -389,6 +395,7 @@ jobs:
     name: Test AppImage (${{ matrix.arch }})
     needs: [build-appimage]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     if: always() && needs.build-appimage.result == 'success'
     strategy:
       fail-fast: false
@@ -455,6 +462,7 @@ jobs:
   build-windows:
     name: Build Windows package (x86_64)
     runs-on: windows-latest
+    timeout-minutes: 45
     needs: [check-version]
     if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
     steps:
@@ -525,6 +533,7 @@ jobs:
     name: Test Windows package (x86_64)
     needs: [build-windows]
     runs-on: windows-latest
+    timeout-minutes: 45
     if: always() && needs.build-windows.result == 'success'
     steps:
     - name: Download Windows package
@@ -600,6 +609,7 @@ jobs:
     name: Publish to GitHub Release
     needs: [build-deb, build-rpm, build-appimage, build-windows, test-deb, test-rpm, test-appimage, test-windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
