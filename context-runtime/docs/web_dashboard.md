@@ -6,9 +6,9 @@ may register HTTP routes. Nothing about it is collective: each node answers from
 its own state, or forwards an explicitly-addressed query, so N nodes serve the
 same UI without coordinating.
 
-This replaces the need to run the separate Python `context-visualizer` process,
-which is still present and still works — it talks to the runtime as an ordinary
-client.
+This replaces the retired Python `context-visualizer` process entirely — the
+dashboard, its module pages, and the management actions all live in the
+runtime now.
 
 ## Running it
 

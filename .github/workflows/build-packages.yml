@@ -79,9 +79,9 @@ jobs:
 
     - name: Configure with CMake
       run: |
-        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings), but the
-        # pure-Python context visualizer ships as a standard feature via
-        # CLIO_CORE_ENABLE_VISUALIZER (default ON, set explicitly for clarity).
+        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings). The web
+        # dashboard is served by the runtime itself (issue #990); its assets
+        # install via clio_add_viz_assets, no Python involved.
         # Cache + replication chimods already default ON (#886); pin them
         # explicitly so a future default flip cannot silently drop them
         # from published packages (#899).
@@ -89,7 +89,6 @@ jobs:
           -DCLIO_CORE_ENABLE_DEB_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
-          -DCLIO_CORE_ENABLE_VISUALIZER=ON \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -DCLIO_CTE_ENABLE_CACHE=ON \
           -DCLIO_CTE_ENABLE_REPLICATION=ON \
@@ -148,15 +147,13 @@ jobs:
 
     - name: Configure with CMake
       run: |
-        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings), but the
-        # pure-Python context visualizer ships as a standard feature via
-        # CLIO_CORE_ENABLE_VISUALIZER (default ON, set explicitly for clarity).
+        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings). The web
+        # dashboard is served by the runtime itself (issue #990).
         # Cache + replication pins: same rationale as build-deb (#899).
         cmake -B build-rpm \
           -DCLIO_CORE_ENABLE_RPM_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
-          -DCLIO_CORE_ENABLE_VISUALIZER=ON \
           -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -DCLIO_CTE_ENABLE_CACHE=ON \
@@ -292,16 +289,6 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
-        echo "=== context-visualizer (standard feature) ==="
-        # Launcher must be on PATH and the package importable. --help exits 0
-        # via argparse; only a signal-level death indicates a real problem
-        # (e.g. a missing Python runtime dep the package failed to declare).
-        context-visualizer --help; rc=$?
-        if [ "$rc" -ge 128 ] || [ "$rc" -lt 0 ]; then
-          echo "FAIL: context-visualizer --help died with exit code $rc"
-          exit 1
-        fi
-        python3 -c "import context_visualizer; print('context_visualizer import OK')"
         echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
         # The .deb now declares libfuse3-dev + fuse3, so the apt install
         # above must have pulled libfuse3.so.3 — a load failure here means
@@ -355,16 +342,6 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
-        echo "=== context-visualizer (standard feature) ==="
-        # Launcher must be on PATH and the package importable. --help exits 0
-        # via argparse; only a signal-level death indicates a real problem
-        # (e.g. a missing Python runtime dep the package failed to declare).
-        context-visualizer --help; rc=$?
-        if [ "$rc" -ge 128 ] || [ "$rc" -lt 0 ]; then
-          echo "FAIL: context-visualizer --help died with exit code $rc"
-          exit 1
-        fi
-        python3 -c "import context_visualizer; print('context_visualizer import OK')"
         echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
         # The .rpm now requires fuse3-devel + fuse3, so dnf must have
         # pulled libfuse3.so.3 — a load failure here means the dependency

@@ -261,6 +261,74 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
          resp.Json(w.Str());
        }});
 
+  // ---- Replace + recover a failed member -----------------------------------
+  // The repair flow: compose a fresh member bdev and rebuild the failed
+  // member's rows onto it. Recovery itself runs in the background; the
+  // Monitor("stats") recovery_* counters (which the page's Recovery panel
+  // polls) report its progress.
+  viz.AddRoute(
+      {"POST", "/api/mod/" + mod_name + "/{pool}/replace_member", mod_name,
+       "Replace a failed member with a fresh bdev and recover onto it "
+       "(fields: failed_pool_id, member_name, capacity[, bdev_type, node_id])",
+       [mod_name](const Request &req, Response &resp) {
+         clio::run::PoolId pool_id;
+         if (!ResolveSafePool(req, mod_name, &pool_id, resp)) {
+           return;
+         }
+         JsonWriter errors;
+         errors.BeginObject();
+         size_t error_count = 0;
+         auto fail = [&errors, &error_count](const std::string &field,
+                                             const std::string &message) {
+           errors.Field(field, message);
+           ++error_count;
+         };
+         const std::string failed_str = req.Param("failed_pool_id");
+         clio::run::PoolId failed_id;
+         try {
+           failed_id = clio::run::PoolId::FromString(failed_str);
+           if (failed_id.IsNull()) {
+             fail("failed_pool_id", "must not be null");
+           }
+         } catch (const std::exception &e) {
+           fail("failed_pool_id", std::string("unparseable: ") + e.what());
+         }
+         const std::string member_name = req.Param("member_name");
+         clio::run::PoolId member_id;
+         ResolveMemberBdev(member_name, req.Param("bdev_type", "file"),
+                           req.Param("capacity"), errors, &error_count,
+                           &member_id);
+         const clio::run::u32 node_id = static_cast<clio::run::u32>(
+             std::strtoul(req.Param("node_id", "0").c_str(), nullptr, 10));
+         errors.EndObject();
+         if (error_count > 0) {
+           ReplyErrors(resp, errors);
+           return;
+         }
+
+         Client safe(pool_id);
+         auto future = safe.AsyncRecoverBdev(clio::run::PoolQuery::Dynamic(),
+                                             failed_id, member_name, node_id,
+                                             member_id);
+         if (!future.Wait(kActionTimeoutSec)) {
+           resp.Error(503, "RecoverBdev timed out");
+           return;
+         }
+         if (future->GetReturnCode() != 0) {
+           resp.Error(500, "RecoverBdev failed with rc=" +
+                               std::to_string(future->GetReturnCode()));
+           return;
+         }
+         JsonWriter w;
+         w.BeginObject();
+         w.Field("ok", true);
+         w.Field("failed_pool_id", failed_str);
+         w.Field("member_name", member_name);
+         w.Field("member_pool_id", member_id.ToString());
+         w.EndObject();
+         resp.Json(w.Str());
+       }});
+
   // ---- Remove member -------------------------------------------------------
   viz.AddRoute(
       {"POST", "/api/mod/" + mod_name + "/{pool}/remove_member", mod_name,

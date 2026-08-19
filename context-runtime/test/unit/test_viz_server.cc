@@ -793,6 +793,29 @@ TEST_CASE("Viz safe-bdev website: create, add and remove members", "[viz]") {
   REQUIRE(removed.status == 200);
   REQUIRE(Contains(removed.body, "\"ok\":true"));
 
+  // Repair flow: mark a data member faulty, then replace + recover onto a
+  // fresh bdev the handler creates on the spot. Recovery of an empty array
+  // finishes immediately; the roster shows the replacement.
+  {
+    HttpReply faulted = HttpPostForm(
+        port, "/api/mod/clio_safe_bdev/4960.0/remove_member",
+        "member_pool_id=4950.0&was_faulty=1");
+    Explain("safe-bdev remove (faulty)", faulted);
+    REQUIRE(faulted.status == 200);
+
+    HttpReply replaced = HttpPostForm(
+        port, "/api/mod/clio_safe_bdev/4960.0/replace_member",
+        "failed_pool_id=4950.0&member_name=ram::viz_safe_repl&capacity=16MB"
+        "&bdev_type=ram");
+    Explain("safe-bdev replace_member", replaced);
+    REQUIRE(replaced.status == 200);
+    REQUIRE(Contains(replaced.body, "\"ok\":true"));
+
+    HttpReply after = HttpGet(
+        port, "/api/pools/4960.0/monitor?query=stats&routing=local");
+    REQUIRE(Contains(after.body, "viz_safe_repl"));
+  }
+
   // Error paths: a missing member name, and a pool that is not a safe-bdev.
   HttpReply no_member = HttpPostForm(
       port, "/api/mod/clio_safe_bdev/4960.0/add_member", "member_name=");

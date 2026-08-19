@@ -1,6 +1,6 @@
 /*
  * Clio dashboard -- served by the admin ChiMod out of the running daemon.
- * Palette matches the Python context-visualizer so both look like one product.
+ * Palette inherited from the retired Python context-visualizer for continuity.
  * No external assets: a daemon on an isolated cluster node must render offline.
  */
 

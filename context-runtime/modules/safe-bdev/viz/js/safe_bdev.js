@@ -84,7 +84,7 @@ function renderMembers(members) {
     ['state', 'state', (v) => memberBadge(v)],
     ['pool_id_str', '', (v, row) => (row.state === 'active'
       ? `<button onclick="removeMember('${esc(v)}','${esc(row.role)}')">Remove</button>`
-      : '')],
+      : `<button onclick="replaceMember('${esc(v)}')">Replace + recover</button>`)],
   ]);
 }
 
@@ -111,6 +111,26 @@ async function removeMember(poolId, role) {
     msg.textContent = `removed ${poolId}`;
   } catch (e) {
     msg.textContent = `remove failed: ${e.message}`;
+  }
+  refresh();
+}
+
+// eslint-disable-next-line no-unused-vars
+async function replaceMember(failedPoolId) {
+  const path = window.prompt('Backing path for the replacement bdev:', '/mnt/replacement.dat');
+  if (!path) return;
+  const msg = document.getElementById('am-msg');
+  try {
+    const body = await post(
+      `/api/mod/${MOD}/${encodeURIComponent(CUR_POOL)}/replace_member`, {
+        failed_pool_id: failedPoolId,
+        member_name: path,
+        capacity: '256MB',
+        bdev_type: 'file',
+      });
+    msg.textContent = `recovering onto ${body.member_name} (${body.member_pool_id})`;
+  } catch (e) {
+    msg.textContent = `replace failed: ${e.message}`;
   }
   refresh();
 }

@@ -355,7 +355,7 @@ class Runtime : public clio::run::Container {
   //==========================================================================
   // Recovery observability. RecoverBdev rebuilds a failed member's chunk for
   // EVERY slot it participates in; each such slot is one "recovery operation".
-  // These atomics let Monitor() -- and the context-visualizer safe-bdev
+  // These atomics let Monitor() -- and the dashboard safe-bdev
   // dashboard -- report live rebuild progress. Reset at the start of every
   // RecoverBdev. Atomic because Monitor() may run on a different worker fiber
   // than the in-progress rebuild.
