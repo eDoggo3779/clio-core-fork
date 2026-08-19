@@ -106,6 +106,29 @@ namespace {
 
 constexpr const char *kTagRefPrefix = "$tagid{";
 
+// ExtendBlob/ResizeBlob placement failure codes. These are the RAW allocator
+// codes; PutBlob surfaces them to clients as 10 + code, which is the 11-13
+// band the HDF5 adapters key on.
+constexpr clio::run::u32 kCteAllocNoTargetSpace = 1;    // -> 11
+constexpr clio::run::u32 kCteAllocNoHealthyTarget = 2;  // -> 12
+constexpr clio::run::u32 kCteAllocExhausted = 3;        // -> 13
+
+// All three mean the tier could not hold the bytes, and all three are
+// retryable. Code 2 reads like a device-health rejection, but ExtendBlob sets
+// it whenever the placement engine returns no target able to hold the request
+// -- which is what an ordinary out-of-space tier looks like -- so excluding it
+// disables the retry for the common case.
+//
+// 4 and up are defects, not placement, and must never cost data.
+constexpr bool CteAllocIsCapacityFailure(clio::run::u32 rc) {
+  return rc >= kCteAllocNoTargetSpace && rc <= kCteAllocExhausted;
+}
+
+// min_tier_score for the make-room eviction: 0.0 offers every tier as a
+// candidate. Scoping it to the tier that actually failed would need the
+// placement engine's target choice, which is not exposed here.
+constexpr float kCteEvictAnyTier = 0.0f;
+
 // #680 per-blob write-token re-check period (microseconds). Default 10us: a
 // loser is parked ONLY during active same-blob write contention, where a fast
 // hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest
@@ -1671,6 +1694,35 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
 
+    // Droppability: decided at creation, never revisited. Both branches run
+    // under the write token, like every other mutation of this blob.
+    // See kCtePutDroppable.
+    if (blob_info_ptr->droppable_ != 0 &&
+        !(task->flags_ & kCtePutDroppable)) {
+      task->return_code_ = kCteDroppabilityConflictRc;
+      CLIO_CO_RETURN;
+    }
+    // Mark at creation only. The emptiness check covers the case where this
+    // task created the blob but another writer took the token first and wrote
+    // to it: a blob that already holds bytes is never marked.
+    if ((task->flags_ & kCtePutDroppable) && !blob_found &&
+        blob_info_ptr->GetTotalSize() == 0) {
+      blob_info_ptr->droppable_ = 1;
+      // Persist it. The create record is written before the token is acquired
+      // and cannot carry this, so droppability needs its own record or it is
+      // lost on replay. Logged once per blob, at the transition.
+      if (!task->context_.emulate_ && !blob_txn_logs_.empty()) {
+        clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+        TxnSetBlobDroppable txn;
+        txn.tag_major_ = tag_id.major_;
+        txn.tag_minor_ = tag_id.minor_;
+        txn.blob_name_ = blob_name;
+        txn.droppable_ = blob_info_ptr->droppable_;
+        blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(
+            TxnType::kSetBlobDroppable, txn);
+      }
+    }
+
     // Replica-targeted put (issue #886): Context::replica_ == N > 0 diverts
     // this ENTIRE write to replica N's block layout — the primary's blocks,
     // size, tag accounting, and SHM mirror are untouched, which is the whole
@@ -1730,7 +1782,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
             ? blob_info_ptr->blocks_[old_num_blocks - 1].size_
             : 0;
 
-    // Step 1+2: size the blob to fit the write.
+    // Step 1+2: size the blob to fit the write, making room if the tier is
+    // full. See PlaceBlobBytes.
     //  - default (partial modify): grow to cover [offset, offset+size) but
     //    NEVER shrink — writing must not truncate the tail (POSIX write
     //    semantics). This is what makes out-of-order / descending partial
@@ -1740,16 +1793,10 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     //  - kCtePutReplace (wholesale replace): resize to exactly offset+size,
     //    shrinking if needed, via the shared ResizeBlob helper.
     clio::run::u32 alloc_result = 0;
-    if (task->flags_ & kCtePutReplace) {
-      CLIO_CO_AWAIT(ResizeBlob(*blob_info_ptr, offset + size, blob_score,
-                          alloc_result,
-                          task->context_.min_persistence_level_));
-    } else {
-      CLIO_CO_AWAIT(ExtendBlob(*blob_info_ptr, offset, size, blob_score,
-                          alloc_result,
-                          task->context_.min_persistence_level_,
-                          task->context_.preallocate_));
-    }
+    CLIO_CO_AWAIT(PlaceBlobBytes(*blob_info_ptr, task->flags_, offset, size,
+                                 blob_score,
+                                 task->context_.min_persistence_level_,
+                                 task->context_.preallocate_, alloc_result));
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
       CLIO_CO_RETURN;
@@ -3595,6 +3642,8 @@ clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
   CLIO_TASK_BODY_BEGIN
   const float min_tier_score = task->min_tier_score_;
   const clio::run::u64 target_bytes = task->bytes_;
+  // Only blobs marked expendable may be taken. See kCtePutDroppable.
+  const bool droppable_only = (task->droppable_only_ != 0);
   task->bytes_evicted_ = 0;
   task->blobs_evicted_ = 0;
 
@@ -3637,7 +3686,22 @@ clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
     tag_blob_name_to_info_.for_each(
         [&](const std::string &composite_key,
             const std::shared_ptr<BlobInfo> &blob_info_sp) {
+          // Never evict a blob under an active write. Reclaiming one takes
+          // its write token, and a caller awaiting this eviction may be the
+          // holder -- which would spin forever, since the token cannot be
+          // released until the eviction returns.
+          if (blob_info_sp->IsWriteLocked()) {
+            return;
+          }
           const BlobInfo &blob_info = *blob_info_sp;
+          // Reclaiming a cache replica is correctness-free -- it is a second
+          // copy the authoritative chain can refill -- but under
+          // droppable_only it is still limited to blobs whose writer
+          // volunteered them, so a write cannot drain another subsystem's
+          // cache to make room for itself.
+          if (droppable_only && blob_info.droppable_ == 0) {
+            return;
+          }
           for (size_t ri = 0; ri < blob_info.replicas_.size(); ++ri) {
             const Replica &rep = blob_info.replicas_[ri];
             if (!(rep.flags_ & REPLICA_CACHE) || rep.blocks_.empty()) {
@@ -3707,7 +3771,16 @@ clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
   tag_blob_name_to_info_.for_each(
       [&](const std::string &composite_key,
           const std::shared_ptr<BlobInfo> &blob_info_sp) {
+        // See the write-lock note in the cache-replica loop above.
+        if (blob_info_sp->IsWriteLocked()) {
+          return;
+        }
         const BlobInfo &blob_info = *blob_info_sp;
+        // A whole-blob eviction destroys the only copy, so under
+        // droppable_only it is limited to blobs marked expendable.
+        if (droppable_only && blob_info.droppable_ == 0) {
+          return;
+        }
         clio::run::u64 evict_bytes = 0;
         for (const auto &block : blob_info.blocks_) {
           if (on_qualifying_target(block.bdev_client_.pool_id_)) {
@@ -4901,17 +4974,22 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     // Write BlobInfo entries (entry_type 2; see below)
     tag_blob_name_to_info_.for_each([&](const std::string &key,
                                         const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
-      // Entry type 2 == blob record carrying transform_flags_ (issue #818).
-      // A NEW type rather than an extra field on type 1, because this log has
-      // no version header: an old reader given an appended field would parse it
+      // Entry type 2 == blob record carrying transform_flags_ (issue #818);
+      // type 3 additionally carries droppable_. A NEW type each time rather
+      // than an extra field on the previous one, because this log has no
+      // version header: an old reader given an appended field would parse it
       // as block data and silently reconstruct garbage placement, whereas an
       // unknown entry type stops the restore loudly.
-      uint8_t entry_type = 2;
+      //
+      // droppable_ belongs here as well as in the WAL, which is truncated once
+      // folded into this snapshot.
+      uint8_t entry_type = 3;
       uint32_t key_len = static_cast<uint32_t>(key.size());
       uint32_t blob_name_len =
           static_cast<uint32_t>(blob_info.blob_name_.size());
       float score = blob_info.score_;
       uint32_t transform_flags = blob_info.transform_flags_;
+      uint32_t droppable = blob_info.droppable_;
       int32_t compress_lib = blob_info.compress_lib_;
       int32_t compress_preset = blob_info.compress_preset_;
       clio::run::u64 trace_key = blob_info.trace_key_;
@@ -4927,6 +5005,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       ofs.write(reinterpret_cast<const char *>(&score), sizeof(score));
       ofs.write(reinterpret_cast<const char *>(&transform_flags),
                 sizeof(transform_flags));
+      ofs.write(reinterpret_cast<const char *>(&droppable), sizeof(droppable));
       ofs.write(reinterpret_cast<const char *>(&compress_lib),
                 sizeof(compress_lib));
       ofs.write(reinterpret_cast<const char *>(&compress_preset),
@@ -5334,11 +5413,13 @@ void Runtime::RestoreMetadataFromLog() {
       }
       tags_restored++;
 
-    } else if (entry_type == 1 || entry_type == 2) {
+    } else if (entry_type == 1 || entry_type == 2 || entry_type == 3) {
       // BlobInfo entry. Type 1 is the pre-#818 layout with no transform_flags_;
-      // type 2 carries it. Both are accepted so an existing metadata log still
-      // restores after an upgrade.
-      const bool has_transform_flags = (entry_type == 2);
+      // type 2 carries it; type 3 additionally carries droppable_. All are
+      // accepted so an existing metadata log still restores after an upgrade;
+      // older layouts restore as non-droppable.
+      const bool has_transform_flags = (entry_type >= 2);
+      const bool has_droppable = (entry_type >= 3);
       uint32_t key_len;
       ifs.read(reinterpret_cast<char *>(&key_len), sizeof(key_len));
       std::string composite_key(key_len, '\0');
@@ -5352,9 +5433,13 @@ void Runtime::RestoreMetadataFromLog() {
       float score;
       ifs.read(reinterpret_cast<char *>(&score), sizeof(score));
       uint32_t transform_flags = 0;
+      uint32_t droppable = 0;
       if (has_transform_flags) {
         ifs.read(reinterpret_cast<char *>(&transform_flags),
                  sizeof(transform_flags));
+      }
+      if (has_droppable) {
+        ifs.read(reinterpret_cast<char *>(&droppable), sizeof(droppable));
       }
       int32_t compress_lib;
       ifs.read(reinterpret_cast<char *>(&compress_lib), sizeof(compress_lib));
@@ -5374,6 +5459,7 @@ void Runtime::RestoreMetadataFromLog() {
       blob_info.compress_lib_ = compress_lib;
       blob_info.compress_preset_ = compress_preset;
       blob_info.trace_key_ = trace_key;
+      blob_info.droppable_ = droppable;
       if (has_transform_flags) {
         blob_info.transform_flags_ = transform_flags;
       } else if (compress_lib != 0) {
@@ -5616,6 +5702,10 @@ void Runtime::ReplayTransactionLogs() {
               tag_blob_name_to_info_.get(composite_key);
           if (existing) {
             blob_info.transform_flags_ = existing->transform_flags_;
+            // Carry DROPPABILITY too -- same outlives-the-flush hazard.
+            // Replaying the create record would reset it, and the field is
+            // write-once so nothing could mark it again.
+            blob_info.droppable_ = existing->droppable_;
             // Carry the REPLICAS too (issue #886) — same outlives-the-flush
             // hazard as the transform mark: the metadata snapshot (or an
             // earlier WAL shard's kExtendReplica) restored this blob's
@@ -5747,6 +5837,20 @@ void Runtime::ReplayTransactionLogs() {
             tag_blob_name_to_info_.get(composite_key);
         if (blob_info_ptr) {
           blob_info_ptr->transform_flags_ |= txn.transform_flags_;
+          MirrorBlobToShm(composite_key, *blob_info_ptr);
+          blobs_replayed++;
+        }
+
+      } else if (type == TxnType::kSetBlobDroppable) {
+        auto txn = TransactionLog::DeserializeSetBlobDroppable(payload);
+        TagId tag_id{txn.tag_major_, txn.tag_minor_};
+        std::string composite_key = std::to_string(tag_id.major_) + "." +
+                                    std::to_string(tag_id.minor_) + "." +
+                                    txn.blob_name_;
+        std::shared_ptr<BlobInfo> blob_info_ptr =
+            tag_blob_name_to_info_.get(composite_key);
+        if (blob_info_ptr) {
+          blob_info_ptr->droppable_ = txn.droppable_;
           MirrorBlobToShm(composite_key, *blob_info_ptr);
           blobs_replayed++;
         }
@@ -6125,15 +6229,95 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
   return blob_info_ptr;
 }
 
-clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset,
-                                    clio::run::u64 size, float blob_score,
-                                    clio::run::u32 &error_code,
-                                    int min_persistence_level,
-                                    clio::run::u64 preallocate) {
+clio::run::TaskResume Runtime::PlaceBlobBytesOnce(
+    BlobInfo &blob_info, clio::run::u32 put_flags, clio::run::u64 offset,
+    clio::run::u64 size, float blob_score, int min_persistence_level,
+    clio::run::u64 preallocate, clio::run::u32 &error_code,
+    clio::run::u64 &shortfall) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
+  if (put_flags & kCtePutReplace) {
+    CLIO_CO_AWAIT(ResizeBlob(blob_info, offset + size, blob_score, error_code,
+                             min_persistence_level, &shortfall));
+  } else {
+    CLIO_CO_AWAIT(ExtendBlob(blob_info, offset, size, blob_score, error_code,
+                             min_persistence_level, preallocate, &shortfall));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::PlaceBlobBytes(
+    BlobInfo &blob_info, clio::run::u32 put_flags, clio::run::u64 offset,
+    clio::run::u64 size, float blob_score, int min_persistence_level,
+    clio::run::u64 preallocate, clio::run::u32 &error_code) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  clio::run::u64 shortfall = 0;
+  error_code = 0;
+  CLIO_CO_AWAIT(PlaceBlobBytesOnce(blob_info, put_flags, offset, size,
+                                   blob_score, min_persistence_level,
+                                   preallocate, error_code, shortfall));
+
+  // Placement failed. Make room and try once more, but only for a put whose
+  // bytes are expendable and only by reclaiming other expendable bytes: CTE
+  // core also stores blobs that ARE the data, and evicting those to admit a
+  // write would destroy bytes their owner still expects. A put without the
+  // flag fails here exactly as it would have without this path.
+  //
+  // One retry. Either eviction freed enough or it did not, and looping turns a
+  // full tier into a treadmill.
+  if (!(put_flags & kCtePutDroppable) ||
+      !CteAllocIsCapacityFailure(error_code) || shortfall == 0) {
+    CLIO_CO_RETURN;
+  }
+
+  auto evict = client_.AsyncEvict(kCteEvictAnyTier, shortfall,
+                                  clio::run::PoolQuery::Broadcast(),
+                                  /*droppable_only=*/1);
+  CLIO_CO_AWAIT(evict);
+  const clio::run::u64 reclaimed = evict->bytes_evicted_;
+  if (reclaimed == 0) {
+    CLIO_CO_RETURN;  // nothing expendable; keep the original error_code
+  }
+
+  HLOG(kInfo,
+       "PutBlob: tier could not place {} byte(s) (rc={}); evicted {} byte(s) "
+       "across {} blob(s), retrying",
+       shortfall, error_code, reclaimed, evict->blobs_evicted_);
+
+  // Re-issue the same call. Both paths are resumable: a partial extend keeps
+  // the blocks it placed and resyncs the size cache, so the retry asks only
+  // for the remainder.
+  error_code = 0;
+  shortfall = 0;
+  CLIO_CO_AWAIT(PlaceBlobBytesOnce(blob_info, put_flags, offset, size,
+                                   blob_score, min_persistence_level,
+                                   preallocate, error_code, shortfall));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset,
+                                    clio::run::u64 size, float blob_score,
+                                    clio::run::u32 &error_code,
+                                    int min_persistence_level,
+                                    clio::run::u64 preallocate,
+                                    clio::run::u64 *shortfall) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  // Every exit below is either a success (nothing outstanding) or sets this to
+  // the bytes it could not place; default it once here so no path leaks a
+  // stale value from the caller.
+  if (shortfall != nullptr) {
+    *shortfall = 0;
+  }
   // Calculate required additional space
   clio::run::u64 current_blob_size = blob_info.GetTotalSize();
   clio::run::u64 required_size = offset + size;
@@ -6203,6 +6387,9 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
     }
   }
   if (available_targets.empty()) {
+    if (shortfall != nullptr) {
+      *shortfall = additional_size;
+    }
     error_code = 1;
     CLIO_CO_RETURN;
   }
@@ -6254,6 +6441,9 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
        ordered_targets.size());
 
   if (ordered_targets.empty()) {
+    if (shortfall != nullptr) {
+      *shortfall = additional_size;
+    }
     error_code = 2;
     CLIO_CO_RETURN;
   }
@@ -6357,8 +6547,14 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   // space
   if (remaining_to_allocate > 0) {
     // Partial allocation left blocks_ inconsistent; resync the size cache from
-    // the authoritative sum before bailing (cold error path).
+    // the authoritative sum before bailing (cold error path). The blocks that
+    // DID land are kept, so a retry recomputes additional_size against the
+    // grown blob and asks only for what is still missing -- which is exactly
+    // remaining_to_allocate.
     blob_info.RecomputeTotalSize();
+    if (shortfall != nullptr) {
+      *shortfall = remaining_to_allocate;
+    }
     error_code = 3;
     CLIO_CO_RETURN;
   }
@@ -6374,12 +6570,16 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
 
 clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 new_size,
                                     float blob_score, clio::run::u32 &error_code,
-                                    int min_persistence_level) {
+                                    int min_persistence_level,
+                                    clio::run::u64 *shortfall) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   error_code = 0;
+  if (shortfall != nullptr) {
+    *shortfall = 0;
+  }
   clio::run::u64 current_size = blob_info.GetTotalSize();
   if (new_size == current_size) {
     CLIO_CO_RETURN;
@@ -6387,7 +6587,8 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
   if (new_size > current_size) {
     // Grow: allocate appended blocks up to new_size (shared with ExtendBlob)...
     CLIO_CO_AWAIT(ExtendBlob(blob_info, 0, new_size, blob_score, error_code,
-                             min_persistence_level));
+                             min_persistence_level, /*preallocate=*/0,
+                             shortfall));
     if (error_code != 0) {
       CLIO_CO_RETURN;
     }

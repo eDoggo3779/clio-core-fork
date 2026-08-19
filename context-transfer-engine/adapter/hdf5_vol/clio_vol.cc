@@ -186,6 +186,19 @@ static clio_dataset_t *make_dataset_wrapper(void *under, hid_t under_vol_id,
    holding less than it believes it does, so the caller invalidates the
    dataset's cache rather than leave a partially-staged image that a later read
    would treat as a hit. The native file is authoritative and unaffected. */
+/* Flags on every CTE put this connector makes.
+ *
+ * kCtePutDroppable marks the bytes expendable: the connector is
+ * native-preserving, so every write reaches the HDF5 file first and a CTE blob
+ * here is never the only copy. Unconditional rather than configurable --
+ * it describes what the data is, not a preference.
+ *
+ * Includes the coherence stamp. A discarded stamp reads back as absent, which
+ * already fails closed to a cache miss; excluding stamps would instead pin one
+ * unevictable blob per file ever cached. */
+static constexpr clio::run::u32 kCliovolPutFlags =
+    clio::cte::core::kCtePutDroppable;
+
 /* CTE PutBlob return codes this adapter can say something useful about.
    core_runtime.cc sets `return_code_ = 10 + alloc_result`, so 11-13 are one
    band -- "the tier could not place these bytes" -- with ExtendBlob's three
@@ -227,6 +240,11 @@ static const char *clio_put_rc_meaning(int rc) {
  * When a put fails because the tier is out of space, stop offering: skip the
  * staging path until a cooldown elapses, then let one attempt through as a
  * probe. Success reopens the gate; failure re-arms it.
+ *
+ * These puts are droppable, so the tier has already tried to reclaim space and
+ * retry before reporting failure. A placement failure reaching here therefore
+ * means space could not be reclaimed at all, which is exactly when backing off
+ * is right.
  *
  * Scope is process-wide because fullness is a property of the TIER, which
  * every file in this process shares; a per-dataset latch would re-learn the
@@ -377,11 +395,10 @@ static clio::cte::core::Client *get_cte_client() {
      client singleton is unbound and the first AsyncGetOrCreateTag segfaults.
      Config comes from CLIO_SERVER_CONF, same as the runtime.
 
-     Returns nullptr when the runtime is unreachable. Callers MUST check: the
-     attach result was previously discarded, so an absent runtime faulted inside
-     H5Fcreate. There is always a correct fallback -- pass everything through to
-     the native VOL -- because the native file is authoritative and the CTE tier
-     is a performance layer, not a correctness one. */
+     Returns nullptr when the runtime is unreachable. Callers MUST check, and
+     fall back to passing everything through to the native VOL: the native file
+     is authoritative and the CTE tier is a performance layer, not a
+     correctness one. */
   static std::once_flag once;
   static bool attached = false;
   std::call_once(once, []() {
@@ -663,8 +680,8 @@ static void *clio_wrap_object(void *under_obj, H5I_type_t obj_type,
   void *under_wrap_ctx = ctx ? ctx->under_wrap_ctx : nullptr;
 
   /* Let the underlying (native) VOL wrap the raw iteration object first.
-     Skipping this step — as the old code did — left the object unusable by the
-     native VOL and made link/object iteration abort. */
+     Without this the object is unusable by the native VOL and link/object
+     iteration aborts. */
   void *under = H5VLwrap_object(under_obj, obj_type, under_vol_id,
                                 under_wrap_ctx);
   if (!under) return nullptr;
@@ -674,7 +691,7 @@ static void *clio_wrap_object(void *under_obj, H5I_type_t obj_type,
      non-empty path) and their transfers fall back to the native VOL. But the
      parent file IS known via the wrap context, so thread it through: a wrapped
      dataset then inherits file->trace and its reads/writes are recorded by
-     CLIO_VOL_TRACE (previously they were silently dropped). */
+     CLIO_VOL_TRACE. */
   clio_file_t *parent_file = ctx ? ctx->parent_file : nullptr;
   if (obj_type == H5I_DATASET) {
     return make_dataset_wrapper(under, under_vol_id, parent_file, nullptr);
@@ -718,7 +735,7 @@ static void *clio_unwrap_object(void *obj) {
   /* Symmetric with clio_wrap_object()'s H5VLwrap_object(): peel the native
      wrapper back off before discarding our wrapper. */
   void *under = H5VLunwrap_object(o->under_object, o->under_vol_id);
-  /* Free the wrapper either way -- returning NULL previously leaked it. */
+  /* Free the wrapper either way; returning NULL must not leak it. */
   clio_destroy_wrapper(o);
   return under;
 }
@@ -743,8 +760,7 @@ static herr_t clio_free_wrap_ctx(void *_wrap_ctx) {
  * ======================================================================== */
 
 /* Resolve the per-open connector config in ONE place so create and open cannot
-   disagree (open previously never read the info struct at all, so a chunk_size
-   set through H5Pset_vol was honoured on create and ignored on open).
+   disagree about a setting made through H5Pset_vol.
 
    chunk_size: connector info, overridden by CLIO_VOL_CHUNK_SIZE, else default.
    cache: an explicit "off" from EITHER the info struct or the environment wins;
@@ -834,8 +850,8 @@ static void clio_stat_mtime(const struct stat &st, long long *sec,
  *
  * std::chrono::system_clock rather than clock_gettime(CLOCK_REALTIME): MSVC has
  * neither the function nor the macro, and system_clock is the same wall clock
- * on every implementation this builds against. It is also unfailing, which
- * removes the "cannot read the clock" arm the caller used to need. */
+ * on every implementation this builds against. It also cannot fail, so callers
+ * need no "clock unreadable" arm. */
 static long long clio_realtime_now_ns() {
   return static_cast<long long>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -847,12 +863,10 @@ static long long clio_realtime_now_ns() {
    being replaced (a new inode at the same path -- h5repack, rsync, mv); size
    and mtime catch it being modified in place.
 
-   The leading "2:" is the cache-layout version. Chunk blobs used to be written
-   at their absolute image offset; they are now written at blob offset 0.
-   A tier populated by the old layout would read back hole-zeros under the new
-   one while the file itself is unchanged -- the one staleness the file
-   identity cannot catch -- so a layout change must bump this and let the
-   mismatch drop the tag. */
+   The leading "2:" is the cache-layout version. A tier populated under a
+   different blob layout reads back hole-zeros while the file itself is
+   unchanged -- the one staleness file identity cannot catch -- so any layout
+   change must bump this and let the mismatch drop the tag. */
 static std::string clio_file_stamp(const char *path) {
   struct stat st;
   if (!path || stat(path, &st) != 0) return std::string();
@@ -947,9 +961,8 @@ static uint64_t clio_stamp_granularity_ns() {
  * cross a tick boundary, which is why it looked flaky rather than broken.
  *
  * True means "cannot tell", and the caller withholds the stamp so the next
- * open fails closed. This is the same rule the rest of the stamp path already
- * follows -- absent, unreadable and unstattable all mean do-not-trust -- with
- * one more case that used to take the confident-yes path by omission. */
+ * open fails closed -- the same rule the rest of the stamp path follows, where
+ * absent, unreadable and unstattable all mean do-not-trust. */
 static bool clio_stamp_ambiguous(const char *path) {
   struct stat st;
   if (!path || stat(path, &st) != 0) return true;
@@ -1006,15 +1019,13 @@ static void clio_write_stamp(clio::cte::core::Client *cte_client,
   }
   std::memcpy(buffer.ptr_, stamp.data(), stamp.size());
   ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
-  /* score: -1.0f is "unknown / let the tier place it". The documented domain is
-     -1.0 or [0.0, 1.0]; anything outside it is REJECTED. Passing an increasing
-     counter here (an attempt at recency ordering) made every put after the
-     second fail, which silently disabled caching for every file after the
-     first -- see the regression test. Score is a PLACEMENT hint, not a
-     priority; do not repurpose it. */
+  /* score: -1.0f is "unknown / let the tier place it". The domain is -1.0 or
+     [0.0, 1.0] and anything outside it is REJECTED, which fails the put. Score
+     is a PLACEMENT hint, not a priority; do not repurpose it. */
   auto put = cte_client->AsyncPutBlob(tag_id, kStampBlobName, 0, stamp.size(),
                                       blob_data, -1.0f,
-                                      clio::cte::core::Context(), 0);
+                                      clio::cte::core::Context(),
+                                      kCliovolPutFlags);
   put.Wait();  /* the stamp must land before the tag is reused */
   if (put->GetReturnCode() != 0) {
     /* Checked, and loudly. An unchecked failure here is invisible at the moment
@@ -1679,9 +1690,9 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
     }
     auto *cte_client = get_cte_client();
 
-    /* Compute total data size from memory dataspace. When we had to ask the
-       native dataset for its space we own that hid_t and must close it -- the
-       previous code leaked one per whole-dataset write. */
+    /* Compute total data size from memory dataspace. Asking the native dataset
+       for its space yields an hid_t this code owns and must close, or it leaks
+       one per whole-dataset write. */
     hid_t space = mem_space_id[d];
     hid_t owned_space = H5I_INVALID_HID;
     if (space == H5S_ALL) {
@@ -1752,7 +1763,7 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
          this. */
       auto future = cte_client->AsyncPutBlob(
           dataset->file->tag_id, blob_name, 0, this_size,
-          blob_data, -1.0f, clio::cte::core::Context(), 0);
+          blob_data, -1.0f, clio::cte::core::Context(), kCliovolPutFlags);
 
       dataset->pending_puts.push_back(std::move(future));
       dataset->pending_buffers.push_back(std::move(buffer));
@@ -2056,7 +2067,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
                                                  dxpl_id) &&
                           !clio_is_collective(dxpl_id);
     if (!cacheable_flat) {
-      /* Propagate the native status: a failed read previously returned success
+      /* Propagate the native status, so a failed read cannot report success
          with the user's buffer untouched. */
       herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                         dataset->obj.under_vol_id,
@@ -2188,7 +2199,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
            lives in the name. See the comment there. */
         auto fut = cte_client->AsyncPutBlob(
             dataset->file->tag_id, blob_name, 0, this_size, blob_data,
-            -1.0f, clio::cte::core::Context(), 0);
+            -1.0f, clio::cte::core::Context(), kCliovolPutFlags);
         fut.Wait();
         const int put_rc = fut->GetReturnCode();
         if (put_rc != 0) {
@@ -2246,9 +2257,8 @@ static herr_t clio_dataset_specific(void *obj,
   auto *dset = static_cast<clio_dataset_t *>(obj);
   /* Safe mode: H5Dflush is a durability barrier at DATASET granularity, and the
      spec names it alongside H5Fflush -- so drain this dataset's pending CTE puts
-     before delegating, exactly as file_specific does for the whole file. This
-     was previously a bare pass-through, so H5Dflush returned with async puts
-     still in flight.
+     before delegating, exactly as file_specific does for the whole file,
+     so H5Dflush cannot return with async puts still in flight.
 
      H5Dset_extent changes the dataset's element count, which is what the linear
      blob image is sized by, so the cached image no longer describes the dataset:
@@ -2636,9 +2646,8 @@ static herr_t clio_introspect_get_conn_cls(void *obj,
 static herr_t clio_introspect_get_cap_flags(const void *info,
                                               uint64_t *cap_flags) {
   (void)info;
-  /* Same constant the class advertises. These previously disagreed -- the class
-     literal omitted LINK_BASIC and OBJECT_BASIC that this callback reported --
-     so what the connector claimed depended on which one HDF5 asked. */
+  /* Same constant the class advertises: if the two disagree, what the
+     connector claims depends on which one HDF5 asks. */
   *cap_flags = CLIO_VOL_CAP_FLAGS;
   return 0;
 }

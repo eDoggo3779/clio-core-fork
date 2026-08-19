@@ -2411,11 +2411,13 @@ class Client : public clio::run::ContainerClient {
    */
   clio::run::Future<EvictTask> AsyncEvict(
       float min_tier_score, clio::run::u64 bytes,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast(),
+      clio::run::u32 droppable_only = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<EvictTask>(clio::run::CreateTaskId(),
                                                 pool_id_, pool_query,
-                                                min_tier_score, bytes);
+                                                min_tier_score, bytes,
+                                                droppable_only);
     return ipc_manager->Send(task);
   }
 
