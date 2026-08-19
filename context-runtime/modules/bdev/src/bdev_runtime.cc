@@ -148,11 +148,11 @@ void Runtime::LoadPerfStats() {
   }
   perf_metrics_ = m;
   // Seed the learned wall-clock model so InferWallClockTime (which GetStats
-  // derives its bandwidth from) starts warm instead of at the 1.0 seed.
-  // SetMethodWallCoef writes through to the pool's model owner (the static
-  // container) — writing method_model_wall_ directly would land on this
-  // container's own now-unused table and the seed would be invisible to both
-  // inference and the monitor (issue #956).
+  // derives its bandwidth from) starts warm instead of at the 1.0 seed. The
+  // model is per container (issue #994), so this seeds exactly the table this
+  // bdev's own tasks are scheduled and reinforced against — a second bdev
+  // container on the node (recovered from a peer, backing another device)
+  // keeps its own profile.
   if (wall_read > 0.0f) {
     SetMethodWallCoef(Method::kRead, wall_read);
   }

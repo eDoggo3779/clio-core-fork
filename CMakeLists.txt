@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.2.0 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.2.1 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -172,6 +172,18 @@ option(CLIO_CTE_ENABLE_NVIDIA_GDS_ADAPTER "Enable NVIDIA GDS adapter" OFF)
 option(CLIO_CTE_ENABLE_ADIOS2_ADAPTER "Enable ADIOS2 adapter" OFF)
 option(CLIO_CTE_ENABLE_FUSE_ADAPTER "Enable FUSE3 adapter" OFF)
 option(CLIO_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 1.14)" OFF)
+
+# Link libhdf5 into components that READ or WRITE real .h5 files but are not the
+# VOL connector -- today that is CAE (the HDF5 assimilator, and ExportData, which
+# exports a CTE tag as an .h5).
+#
+# This option is what context-assimilation-engine/CMakeLists.txt has always
+# derived CLIO_CAE_ENABLE_HDF5 from, but it was never actually DECLARED anywhere,
+# so it silently evaluated as empty/false and CAE's entire HDF5 path -- including
+# the pre-existing ExportData -- compiled out to "HDF5 support not compiled in".
+# Declaring it makes that code reachable. It stays OFF by default: HDF5 is an
+# optional system dependency and nothing in the default build needs it.
+option(CLIO_CORE_ENABLE_HDF5 "Enable HDF5 support in CAE (assimilator + .h5 export)" OFF)
 
 #------------------------------------------------------------------------------
 # CAE (context-assimilation-engine) Options
@@ -797,7 +809,7 @@ if(CLIO_CORE_ENABLE_LIBFABRIC)
 endif()
 
 # HDF5 (optional - for CAE HDF5 assimilator and CTE HDF5 VOL connector)
-if(CLIO_CTE_ENABLE_HDF5_VOL)
+if(CLIO_CTE_ENABLE_HDF5_VOL OR CLIO_CORE_ENABLE_HDF5)
     # Try CONFIG mode first (for HDF5 installed to non-standard cmake/ directory)
     find_package(HDF5 COMPONENTS C QUIET CONFIG)
     if(NOT HDF5_FOUND)
@@ -1259,14 +1271,58 @@ if(CLIO_CORE_ENABLE_TESTS)
     # after every test that requires the fixture, even if those tests fail
     # or crash, ensuring temp files do not persist between runs.
     # -----------------------------------------------------------------------
+    # Freeing the runtime ports is the load-bearing half of this fixture, and it
+    # was a silent no-op wherever `fuser` is absent -- which includes the
+    # project's own dev container. `2>/dev/null` swallowed "command not found"
+    # and the trailing `exit 0` made the fixture report success regardless, so
+    # the next test to start an embedded runtime hit
+    #   Failed to start main server on 127.0.0.1:9413 - Address already in use
+    # and died in ~0.02 s. Reproduced at 4 failures in 5 consecutive runs of
+    # `ctest -R "vfd|cte_hdf5_vol_io_"`, while the same tests pass 12/12 in
+    # isolation -- i.e. it presents as a flaky test and is actually a
+    # deterministic missing dependency.
+    #
+    # Try fuser, then ss, then lsof, and say so when none of them exists rather
+    # than pretending the port is clear.
+    #
+    # The per-user IPC dir below is expanded by the SHELL, not by CMake. It was
+    # `${USER}` -- a bare CMake variable, which CMake does not define -- so the
+    # generated command was literally `rm -rf /tmp/clio_`, and the directory it
+    # was meant to clear was never touched on any platform. The spelling here
+    # mirrors SystemInfo::GetMemfdDir exactly, fallback included: CLIO_MEMFD_DIR
+    # override, else /tmp/clio_$USER, else the literal "unknown" that the
+    # runtime itself uses when USER is unset. Guessing a different fallback (the
+    # real uid, say) would clean a directory the runtime never writes to.
+    set(_clio_port_kill
+        # 10620 is the HDF5 VOL I/O suite. Any test moved off the default port
+        # has to be listed here too, or it silently loses the stray-listener
+        # sweep that moving off the default was meant to make unnecessary.
+        # Still missing: 10500/10613/10615/10617 and the 10596-10599 range,
+        # whose suites moved off 9413 without being added here.
+        "_clio_ports='5555 5558 9413 9414 9416 10620'; \
+         if command -v fuser >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do fuser -k \$_p/tcp >/dev/null 2>&1; done; \
+         elif command -v ss >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do \
+             ss -tlnpH \"sport = :\$_p\" 2>/dev/null \
+               | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u \
+               | while read -r _pid; do [ -n \"\$_pid\" ] && kill -9 \"\$_pid\" 2>/dev/null; done; \
+           done; \
+         elif command -v lsof >/dev/null 2>&1; then \
+           for _p in \$_clio_ports; do lsof -ti tcp:\$_p 2>/dev/null | xargs -r kill -9 2>/dev/null; done; \
+         else \
+           echo 'clio cleanup: no fuser/ss/lsof; cannot free runtime ports -- back-to-back embedded-runtime tests may fail to bind' >&2; \
+         fi")
+
     set(_clio_cleanup_cmd
-        "fuser -k 5555/tcp 5558/tcp 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
+        "${_clio_port_kill}; \
          rm -f /tmp/clio_*.ipc 2>/dev/null; \
          rm -f /tmp/clio_server_timing.log 2>/dev/null; \
          rm -rf /tmp/clio_memfd 2>/dev/null; \
-         rm -rf /tmp/clio_${USER} 2>/dev/null; \
+         rm -rf \"\${CLIO_MEMFD_DIR:-/tmp/clio_\${USER:-unknown}}\" 2>/dev/null; \
          rm -f /dev/shm/sm_segment.* 2>/dev/null; \
          rm -f /dev/shm/test_buddy_bench_* 2>/dev/null; \
+         rm -f /tmp/test_bdev_* /tmp/cae_error_test_storage.dat /tmp/safe_cons_* 2>/dev/null; \
          rm -f \"${CMAKE_BINARY_DIR}\"/cte_*.dat* \"${CMAKE_BINARY_DIR}\"/cte_*.yaml \"${CMAKE_BINARY_DIR}\"/*stress*.bin* \"${CMAKE_BINARY_DIR}\"/*reorganize*.bin* \"${CMAKE_BINARY_DIR}\"/*reorganize*.yaml \"${CMAKE_BINARY_DIR}\"/temp_unregister_test.dat 2>/dev/null; \
          rm -rf \"${CMAKE_BINARY_DIR}\"/cee_test_data 2>/dev/null; \
          exit 0")
@@ -1300,9 +1356,20 @@ if(CLIO_CORE_ENABLE_TESTS)
       # stale rule never fails the whole suite. Build artifacts under
       # ${CMAKE_BINARY_DIR}/bin are scrubbed the same way the POSIX path scrubs
       # ${CMAKE_BINARY_DIR}/cte_*.dat etc.
+      #
+      # %TEMP% is scrubbed too, mirroring the POSIX path's /tmp cleanup. Several
+      # tests write bdev backing files under temp_directory_path() and never
+      # delete them, so each suite run leaked GBs onto the system drive:
+      #   test_bdev_*                  10MB, some 100MB (bdev ChiMod tests)
+      #   cae_error_test_storage.dat   1GB   (CAE error-handling test)
+      #   safe_cons_*.bin/.alog        16MB  (safe-bdev consumer tests)
+      # Left alone that eventually fills C:, and the failures it causes are
+      # baffling: tests fail, or ctest dies mid-run, with no disk-space message
+      # anywhere in the output.
       set(_clio_cleanup_cmd_win
           "$ErrorActionPreference='Continue'; \
            Get-Process | Where-Object { $_.Path -and $_.Path -like '${CMAKE_BINARY_DIR}/bin/*' } | Stop-Process -Force -ErrorAction SilentlyContinue; \
+           Get-ChildItem (Join-Path $env:TEMP '*') -File -Include 'test_bdev_*','cae_error_test_storage.dat','safe_cons_*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue; \
            Get-ChildItem '${CMAKE_BINARY_DIR}' -Filter 'cte_*.dat*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue; \
            Get-ChildItem '${CMAKE_BINARY_DIR}' -Filter 'cte_*.yaml' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue; \
            Get-ChildItem '${CMAKE_BINARY_DIR}' -Filter '*stress*.bin*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue; \
@@ -1329,18 +1396,20 @@ if(CLIO_CORE_ENABLE_TESTS)
       )
 
       # Pre-allow every test binary through Windows Defender Firewall so ctest
-      # doesn't pop a per-binary "Allow access?" prompt. The script self-elevates
-      # only when new binaries appear (it caches the allowed set in a marker), so
-      # a normal "build once, run ctest repeatedly" loop triggers at most one UAC
-      # prompt right after a fresh build. It is best-effort (always exits 0), and
-      # is a SETUP for the shared fixture so it runs before any networked test.
+      # doesn't pop a per-binary "Allow access?" prompt. Adding rules needs
+      # Administrator, but the script never elevates on its own: an unanswerable
+      # UAC dialog would block until this fixture hit its TIMEOUT. Unelevated it
+      # just reports which binaries still need rules; apply them by running
+      # scripts/windows/allow_firewall.ps1 once from an elevated prompt. It is
+      # best-effort (always exits 0), and is a SETUP for the shared fixture so it
+      # runs before any networked test.
       add_test(
           NAME cr_firewall_allow
           COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                   -File "${CMAKE_SOURCE_DIR}/scripts/windows/allow_firewall.ps1"
       )
       set_tests_properties(cr_firewall_allow PROPERTIES
-          TIMEOUT 300
+          TIMEOUT 240
           FIXTURES_SETUP clio_test_cleanup_fixture
       )
     endif()
@@ -1517,22 +1586,56 @@ if(CLIO_CORE_ENABLE_TESTS)
     endforeach()
 
     # -----------------------------------------------------------------------
-    # Apply the cleanup fixture to every component test so that the
-    # cr_post_test_cleanup hook runs after the whole suite, even when
-    # individual tests fail. Excludes the cleanup fixtures themselves.
+    # Per-test DEFAULTS: what every test gets unless it opts out.
+    #
+    # Two things. The cleanup fixture, so cr_post_test_cleanup runs after the
+    # suite even when individual tests fail. And isolation from process-global
+    # CLIO state, because the default was the other way round and that is the
+    # expensive half of this tree's debugging cost.
+    #
+    # The specific case: RuntimeManager replays ~/.clio/restart_log.bin on EVERY
+    # startup (manager.cc), re-composing whatever is registered there through the
+    # admin client. That file is HOME-scoped and shared by every test, every
+    # local `clio_run compose start`, and every previous session. 61 test files
+    # stand up a runtime; 7 isolated the WAL by hand. The other 54 inherited
+    # whatever the machine happened to be carrying -- and a foreign entry
+    # composes pool 512.0 with create-params that are not theirs.
+    #
+    # Isolating it per test here rather than per test file means a NEW test is
+    # isolated by default and sharing is what you opt into, which is the way
+    # round it should have been. Tests that genuinely want shared state can
+    # still set the variable themselves.
+    #
+    # PREPENDED, not appended: ctest applies ENVIRONMENT entries in order and the
+    # last assignment wins, so a test that sets the same variable keeps its own
+    # value. (Tests that setenv() in C++ override the process env regardless.)
+    #
+    # Not stamped here, deliberately:
+    #   CLIO_PORT -- would override the port in a test's own CLIO_SERVER_CONF
+    #     yaml (env beats yaml in ConfigManager), pointing the client at a
+    #     different port than the runtime it just started. Isolation that breaks
+    #     working tests is not isolation.
+    #   CLIO_REQUIRE_RUNTIME -- plenty of tests legitimately run with no runtime
+    #     (the *_no_runtime binaries exist to prove the connectors survive that).
+    #     It belongs on suites that mean to measure a live tier, not on all.
     # -----------------------------------------------------------------------
-    function(_clio_require_cleanup_fixture_recursive dir)
+    function(_clio_apply_test_defaults_recursive dir)
         get_directory_property(_tests DIRECTORY "${dir}" TESTS)
         foreach(_t ${_tests})
             if(NOT _t STREQUAL "cr_pre_test_cleanup" AND
                NOT _t STREQUAL "cr_post_test_cleanup")
                 set_property(TEST ${_t} DIRECTORY "${dir}" APPEND PROPERTY
                     FIXTURES_REQUIRED clio_test_cleanup_fixture)
+                get_property(_env TEST ${_t} DIRECTORY "${dir}"
+                             PROPERTY ENVIRONMENT)
+                set_property(TEST ${_t} DIRECTORY "${dir}" PROPERTY ENVIRONMENT
+                    "CLIO_RESTART_LOG=${CMAKE_BINARY_DIR}/test_isolation/${_t}.restart.bin"
+                    ${_env})
             endif()
         endforeach()
         get_directory_property(_subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
         foreach(_sub ${_subdirs})
-            _clio_require_cleanup_fixture_recursive("${_sub}")
+            _clio_apply_test_defaults_recursive("${_sub}")
         endforeach()
     endfunction()
 
@@ -1546,10 +1649,88 @@ if(CLIO_CORE_ENABLE_TESTS)
         list(GET _pair 0 _component_dir)
         list(GET _pair 1 _component_flag)
         if(${_component_flag} AND IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
-            _clio_require_cleanup_fixture_recursive(
+            _clio_apply_test_defaults_recursive(
                 "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
         endif()
     endforeach()
+
+    # -----------------------------------------------------------------------
+    # Per-test environment applied to every component test.
+    #
+    # 1. CLIO_TEST_MODE=1 makes the test hermetic: the runtime then ignores the
+    #    developer's ~/.clio/clio.yaml (see ConfigManager::GetServerConfigPath)
+    #    and defaults to a loopback bind. Without it, whatever happens to be in
+    #    that file leaks into every test -- a real cluster hostfile makes each
+    #    test come up as a peer and block on nodes that aren't running, and a
+    #    `capacity: 0g` RAM bdev sizes itself at 80% of DRAM and falls back to
+    #    the slow private-heap path. Both look like tests that time out locally
+    #    but pass in CI, which has no such file. Tests needing a specific config
+    #    set CLIO_SERVER_CONF (in ENVIRONMENT or via setenv), which still wins.
+    #
+    # 2. On Windows with icx, prepend the compiler's own runtime DLL directory.
+    #    Those binaries import the Intel runtime (libmmdd.dll and friends) from
+    #    there, and nothing copies it next to our executables, so the tests only
+    #    run if oneAPI's setvars.bat ran in the launching shell AND succeeded.
+    #    When it hasn't, the loader raises a MODAL "System Error" dialog: the
+    #    test does not fail, it blocks until ctest's TIMEOUT expires (a 1500s
+    #    hang for ctp_sub_alloc, with no output to explain it), and the dialog
+    #    waits for a human that a dashboard run does not have. Deriving the
+    #    directory from CMAKE_CXX_COMPILER keeps this correct for any oneAPI
+    #    install location.
+    #
+    # APPEND so these compose with the LSAN_OPTIONS set above.
+    # -----------------------------------------------------------------------
+    # ENVIRONMENT_MODIFICATION needs CMake >= 3.22, above this project's
+    # declared 3.20 floor, so gate on it explicitly.
+    if(NOT CMAKE_VERSION VERSION_LESS 3.22)
+        set(_clio_test_env_mods "CLIO_TEST_MODE=set:1")
+
+        if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+            get_filename_component(_clio_icx_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+            if(IS_DIRECTORY "${_clio_icx_bin}")
+                list(APPEND _clio_test_env_mods
+                     "PATH=path_list_prepend:${_clio_icx_bin}")
+                message(STATUS
+                    "Tests: prepending Intel runtime DLL dir to PATH: ${_clio_icx_bin}")
+            endif()
+        endif()
+
+        function(_clio_append_test_env_recursive dir mods)
+            get_directory_property(_tests DIRECTORY "${dir}" TESTS)
+            foreach(_t ${_tests})
+                set_property(TEST ${_t} DIRECTORY "${dir}" APPEND PROPERTY
+                    ENVIRONMENT_MODIFICATION "${mods}")
+            endforeach()
+            get_directory_property(_subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
+            foreach(_sub ${_subdirs})
+                _clio_append_test_env_recursive("${_sub}" "${mods}")
+            endforeach()
+        endfunction()
+
+        # Same guard as the loops above: a component's source directory can
+        # exist on disk while being disabled, in which case CMake never
+        # processed it and get_directory_property() would error out.
+        foreach(_component_dir_pair
+                "context-transport-primitives:CLIO_CORE_ENABLE_TESTS"
+                "context-runtime:CLIO_CORE_ENABLE_RUNTIME"
+                "context-transfer-engine:CLIO_CORE_ENABLE_CTE"
+                "context-assimilation-engine:CLIO_CORE_ENABLE_CAE"
+                "context-exploration-engine:CLIO_CORE_ENABLE_CEE")
+            string(REPLACE ":" ";" _pair "${_component_dir_pair}")
+            list(GET _pair 0 _component_dir)
+            list(GET _pair 1 _component_flag)
+            if(${_component_flag} AND
+               IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
+                _clio_append_test_env_recursive(
+                    "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}"
+                    "${_clio_test_env_mods}")
+            endif()
+        endforeach()
+    else()
+        message(WARNING
+            "CMake < 3.22: tests will read the per-user ~/.clio/clio.yaml and "
+            "may hang or time out if it configures a cluster or a 0g capacity")
+    endif()
 endif()
 
 # IOWarp KV Cache + Weight Offload libraries (clio_llm_kvcache, clio_llm_weights).
