@@ -43,6 +43,7 @@
 #include "clio_runtime/module_manager.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/task_stat_model.h"
+#include "clio_runtime/viz/viz_server.h"
 
 #include <algorithm>
 #include <chrono>
@@ -236,20 +237,31 @@ bool PoolManager::RegisterContainer(PoolId pool_id, ContainerId container_id,
   }
   RestoreModel(chimod_name, pool_name, container);
 
-  PoolMetaWriteLock lock(pool_metadata_mutex_);
-  auto it = pool_metadata_.find(pool_id);
-  if (it == pool_metadata_.end()) {
-    return false;
+  {
+    PoolMetaWriteLock lock(pool_metadata_mutex_);
+    auto it = pool_metadata_.find(pool_id);
+    if (it == pool_metadata_.end()) {
+      return false;
+    }
+
+    PoolInfo &info = it->second;
+    // Publish the (already-built) DynamicContainer handle. Copies are by value, so
+    // any handle already cached in a RunContext keeps pointing at the same
+    // ModuleManager-owned container. Store is serialized by pool_metadata_mutex_.
+    info.containers_[container_id] = container;
+
+    if (!info.local_container_.IsValid()) {
+      info.local_container_ = info.containers_[container_id];
+    }
   }
 
-  PoolInfo &info = it->second;
-  // Publish the (already-built) DynamicContainer handle. Copies are by value, so
-  // any handle already cached in a RunContext keeps pointing at the same
-  // ModuleManager-owned container. Store is serialized by pool_metadata_mutex_.
-  info.containers_[container_id] = container;
-
-  if (!info.local_container_.IsValid()) {
-    info.local_container_ = info.containers_[container_id];
+  // Let the ChiMod publish its web-dashboard assets and routes (issue #990).
+  // Outside the metadata lock: a RegisterViz() override is module code that may
+  // read pool metadata itself, and holding a write lock across it would
+  // deadlock. Registration is idempotent, so being called once per container is
+  // fine.
+  if (auto *viz = CLIO_VIZ) {
+    viz->OnContainerRegistered(chimod_name, *container.get());
   }
 
   return true;

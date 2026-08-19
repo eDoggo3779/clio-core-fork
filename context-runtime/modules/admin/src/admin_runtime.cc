@@ -72,6 +72,12 @@ namespace clio::run::admin {
 // Method implementations
 //===========================================================================
 
+// NOTE: no dashboard teardown here. Every viz handler is stateless (no
+// container capture -- see Container::RegisterViz), so an admin container can
+// be destroyed and re-created under a running server; requests in the gap get
+// error responses from a dead pool, not use-after-free. This destructor must
+// also stay trivial because ModuleManager destroys a throwaway prototype
+// instance right after load-time route registration.
 Runtime::~Runtime() {}
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
@@ -147,6 +153,17 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       CTP_MALLOC, kSystemStatsRingSize);
   prev_cpu_times_ = ctp::SystemInfo::GetCpuTimes();
   client_.AsyncSystemMonitor(clio::run::PoolQuery::Local(), 1000000);  // 1s
+
+  // Spawn the web dashboard (issue #990). One server per node -- the routes it
+  // serves are all node-local reads or explicitly-addressed Monitor queries, so
+  // there is no collective here and every node can serve the same UI. Our
+  // routes were already registered by PoolManager::RegisterContainer (which
+  // runs before this Create), and any ChiMod composed later adds its own as it
+  // comes up. Start() is a no-op unless the dashboard is enabled, and never
+  // fatal: a taken port disables the dashboard, it does not fail the runtime.
+  if (auto *viz = CLIO_VIZ) {
+    viz->Start();
+  }
 
   HLOG(kDebug,
        "Admin: Container created and initialized for pool: {} (ID: {}, count: "

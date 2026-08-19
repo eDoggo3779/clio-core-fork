@@ -99,6 +99,15 @@ public:
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
+   * Register the CTE dashboard page's endpoints (issue #990): the pool index,
+   * the target roster, register/unregister-target actions, and the create
+   * form. The page ships in this module's viz/ directory. Defined in
+   * core_viz.cc.
+   */
+  void RegisterViz(clio::run::viz::VizServer &viz,
+                   const std::string &mod_name) override;
+
+  /**
    * Destroy the container (Method::kDestroy)
    */
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
