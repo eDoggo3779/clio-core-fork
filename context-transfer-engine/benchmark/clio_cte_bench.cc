@@ -334,9 +334,20 @@ class CTEBenchmark {
         // position, so a time-limited run never rewrites (or unboundedly
         // grows) a blob. The nonzero pacing wall covers SHIPPED bytes only;
         // open sieve pages ride their own per-blob/global budgets.
+        // CLIO_BENCH_STREAM_REGION=<bytes> wraps each thread's stream so
+        // later passes REWRITE the same offsets — measuring the warm-page
+        // path (reused bdev blocks, no first-touch faults) instead of the
+        // ever-fresh one.
+        static const clio::run::u64 stream_region = [] {
+          const char *e = std::getenv("CLIO_BENCH_STREAM_REGION");
+          return e != nullptr ? std::strtoull(e, nullptr, 10) : 0ULL;
+        }();
         for (long j = 0; j < batch; ++j) {
           clio::run::u64 pos =
               static_cast<clio::run::u64>(i + j) * a_.io_size;
+          if (stream_region != 0) {
+            pos %= stream_region;
+          }
           long seg = static_cast<long>(pos / kStreamBlobBytes);
           clio::run::u64 off = pos % kStreamBlobBytes;
           int rc = cte->AsyncPutBlobDefer(
