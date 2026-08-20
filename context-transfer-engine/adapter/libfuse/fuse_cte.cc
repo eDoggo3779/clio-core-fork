@@ -1581,6 +1581,16 @@ static int cte_fuse_getxattr(const char *path, const char *name, char *value,
   // user.*), so answering locally saves a chimod round trip PER CREATE —
   // one of the four per-file waits that made kernel checkouts 20x slower
   // than ext4.
+  // CLIO_FUSE_XATTR=0: answer -ENOSYS, which the kernel latches PER MOUNT —
+  // it stops sending xattr ops entirely (a checkout issued 71k GETXATTR
+  // probes, each a full FUSE transition). Default keeps xattrs working.
+  static const bool xattr_enosys = [] {
+    const char *e = getenv("CLIO_FUSE_XATTR");
+    return e != nullptr && *e == '0';
+  }();
+  if (xattr_enosys) {
+    return -ENOSYS;
+  }
   if (strncmp(name, "security.", 9) == 0 || strncmp(name, "system.", 7) == 0) {
     return -ENODATA;
   }
