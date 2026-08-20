@@ -6137,12 +6137,30 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
   std::string composite_key = std::to_string(tag_id.major_) + "." +
                               std::to_string(tag_id.minor_) + "." + blob_name;
 
-  // Store the shared_ptr; the map holds its own reference while we keep our
-  // copy as the returned handle (safe against a concurrent erase).
-  std::shared_ptr<BlobInfo> blob_info_ptr = new_blob_info;
-  {
-    tag_blob_name_to_info_.insert_or_assign(composite_key, new_blob_info);
-  }  // Release lock immediately after insertion
+  // Insert IF ABSENT and adopt whoever won. insert_or_assign here was a
+  // silent data-loss bug: two puts to a not-yet-existing blob can run in
+  // TRUE parallel on different workers (the elastic scheduler moves lanes;
+  // the "no intervening co_await" argument only serializes tasks sharing a
+  // worker), and the second create REPLACED the first put's BlobInfo — its
+  // just-written blocks orphaned, every later read seeing hole-zeros where
+  // its bytes were, and each racer holding a token on a DIFFERENT BlobInfo
+  // so the per-blob write lock excluded nothing. Measured on a FUSE kernel
+  // checkout as ~1-6 zeroed leading blocks per 245 MB of fresh pages.
+  // Adopting the existing entry sends both racers through ONE BlobInfo,
+  // whose write token then serializes them as designed.
+  const bool won =
+      tag_blob_name_to_info_.insert(composite_key, new_blob_info).inserted;
+  // Re-fetch through get(): it copies the shared_ptr UNDER the map's read
+  // lock (the InsertResult's value pointer is only stable while the bucket
+  // lock is held, and a concurrent DelBlob may erase the node).
+  std::shared_ptr<BlobInfo> blob_info_ptr =
+      tag_blob_name_to_info_.get(composite_key);
+  if (blob_info_ptr == nullptr) {
+    return nullptr;  // created-then-deleted race; caller reports failure
+  }
+  if (!won) {
+    return blob_info_ptr;  // lost the create race; the winner's blob IS the
+  }                        //   blob (skip the duplicate WAL create record)
   // issue #783: mirror into the SHM cache. Best-effort and AFTER the
   // authoritative insert, so the cache can only ever lag, never lead.
   // NOTE: deliberately NOT mirrored here. The blob has no blocks and no size
