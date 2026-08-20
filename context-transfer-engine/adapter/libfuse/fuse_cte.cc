@@ -125,8 +125,13 @@ CfsHandle *GetHandle(struct fuse_file_info *fi) {
 // skip the queue and close detached immediately — the common case for
 // read-only opens.
 struct PendingClose {
-  clio::run::u64 fh;
+  enum Kind { kClose, kUtimens };
+  Kind kind = kClose;
+  clio::run::u64 fh = 0;
   std::string path;
+  clio::run::u64 atime_ns = 0;  // kUtimens payload
+  clio::run::u64 mtime_ns = 0;
+  clio::run::u32 flags = 0;
 };
 std::mutex g_closer_mtx;
 std::condition_variable g_closer_cv;
@@ -145,9 +150,20 @@ void CloserMain() {
     PendingClose pc = std::move(g_closer_q.front());
     g_closer_q.pop_front();
     lk.unlock();
+    // Order the metadata op AFTER the file's in-flight writes land. A
+    // fire-and-forget task racing them is how a detached close dropped
+    // writes on a dead handle, and how a detached utimens republished the
+    // mirror with a size read BEFORE a concurrent write advanced it —
+    // regressing the published size and truncating subsequent reads
+    // (git's .git/config came back garbage).
     clio::cte::core::Client::DeferAwaitKey(
         clio::cte::filesystem::Client::FileKey(pc.path));
-    CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
+    if (pc.kind == PendingClose::kClose) {
+      CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
+    } else {
+      CLIO_CFS_CLIENT->AsyncUtimensDetached(pc.path, pc.atime_ns, pc.mtime_ns,
+                                            pc.flags);
+    }
     lk.lock();
   }
 }
@@ -175,7 +191,7 @@ void MaybeDirectIo(struct fuse_file_info *fi) {
   }
 }
 
-void EnqueueClose(clio::run::u64 fh, std::string path) {
+void EnqueueDrainOrdered(PendingClose pc) {
   {
     std::lock_guard<std::mutex> lk(g_closer_mtx);
     if (!g_closer_started) {
@@ -183,9 +199,17 @@ void EnqueueClose(clio::run::u64 fh, std::string path) {
       g_closer = std::thread(CloserMain);
       g_closer.detach();  // process-lifetime thread; the mount owns it
     }
-    g_closer_q.push_back(PendingClose{fh, std::move(path)});
+    g_closer_q.push_back(std::move(pc));
   }
   g_closer_cv.notify_one();
+}
+
+void EnqueueClose(clio::run::u64 fh, std::string path) {
+  PendingClose pc;
+  pc.kind = PendingClose::kClose;
+  pc.fh = fh;
+  pc.path = std::move(path);
+  EnqueueDrainOrdered(std::move(pc));
 }
 }  // namespace
 
@@ -352,18 +376,10 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
     stbuf->st_size = static_cast<cte_off_t>(t->size_);  // target length
   } else {
     stbuf->st_mode = S_IFREG | (have_mode ? perm : 0644u);
-    // POSIX link count = canonical name (1) + tag-level hard-link aliases.
-    // Ask the CTE core how many extra names are bound to this tag.
-    nlink_t nlink = 1;
-    auto *cte = CLIO_CTE_CLIENT;
-    if (cte != nullptr) {
-      auto na = cte->AsyncGetNumAliases(p);
-      na.Wait();
-      if (na->return_code_ == 0 && na->found_) {
-        nlink = static_cast<nlink_t>(na->num_aliases_) + 1;
-      }
-    }
-    stbuf->st_nlink = nlink;
+    // POSIX link count, computed by the chimod inside the Getattr task —
+    // the separate alias round trip this replaced ran on EVERY regular-file
+    // stat (2+ times per file on a checkout).
+    stbuf->st_nlink = static_cast<nlink_t>(t->nlink_);
     // cte_off_t is off_t on Linux; the WinFsp shim maps it for Windows.
     stbuf->st_size = static_cast<cte_off_t>(t->size_);
     // A deferred write that extended the file may not have advanced the
@@ -488,7 +504,21 @@ static int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
     return e == nullptr || *e != '0';
   }();
   if (async_utimens) {
-    cfs->AsyncUtimensDetached(std::string(path), atime_ns, mtime_ns, flags);
+    std::string p(path);
+    if (clio::cte::core::Client::DeferKeyPending(
+            clio::cte::filesystem::Client::FileKey(p))) {
+      // Writes in flight: the stamp must EXECUTE after they land (see
+      // CloserMain) — but this caller need not wait for that.
+      PendingClose pc;
+      pc.kind = PendingClose::kUtimens;
+      pc.path = std::move(p);
+      pc.atime_ns = atime_ns;
+      pc.mtime_ns = mtime_ns;
+      pc.flags = flags;
+      EnqueueDrainOrdered(std::move(pc));
+    } else {
+      cfs->AsyncUtimensDetached(p, atime_ns, mtime_ns, flags);
+    }
     return 0;
   }
   auto t = cfs->AsyncUtimens(std::string(path), atime_ns, mtime_ns, flags);

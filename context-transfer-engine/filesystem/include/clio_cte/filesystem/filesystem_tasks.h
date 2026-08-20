@@ -262,21 +262,25 @@ struct GetattrTask : public clio::run::Task {
   OUT clio::run::u32 uid_;  // chown'd owner uid; 0xFFFFFFFF = defer to default
   OUT clio::run::u32 gid_;  // chown'd owner gid; 0xFFFFFFFF = defer to default
   OUT clio::run::u32 mode_;  // chmod'd/created mode bits; 0xFFFFFFFF = default
+  // POSIX link count (canonical name + hard-link aliases), computed
+  // server-side so getattr costs ONE round trip — the adapter previously
+  // issued a separate alias query per regular-file stat.
+  OUT clio::run::u32 nlink_;
   GetattrTask()
       : clio::run::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0),
         ino_(0), ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
-        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu) {}
+        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1) {}
   explicit GetattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query, const std::string &path)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetattr),
         path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0), ino_(0),
         ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
-        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu) {}
+        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu), nlink_(1) {}
   void Copy(const ctp::ipc::FullPtr<GetattrTask>& o) {
     path_ = o->path_; exists_ = o->exists_; is_dir_ = o->is_dir_;
     size_ = o->size_; ino_ = o->ino_; ctime_ = o->ctime_;
     mtime_ = o->mtime_; atime_ = o->atime_; is_symlink_ = o->is_symlink_;
-    uid_ = o->uid_; gid_ = o->gid_; mode_ = o->mode_;
+    uid_ = o->uid_; gid_ = o->gid_; mode_ = o->mode_; nlink_ = o->nlink_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
@@ -284,7 +288,7 @@ struct GetattrTask : public clio::run::Task {
   template <typename Ar> void SerializeOut(Ar &ar) {
     Task::SerializeOut(ar);
     ar(exists_, is_dir_, size_, ino_, ctime_, mtime_, atime_, is_symlink_,
-       uid_, gid_, mode_);
+       uid_, gid_, mode_, nlink_);
   }
 };
 

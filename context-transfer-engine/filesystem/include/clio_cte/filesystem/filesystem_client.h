@@ -987,8 +987,22 @@ class Client : public clio::cte::core::Client {
     return 0;
   }
 
+  /** Kill switch for the zero-IPC read fast path (diagnostics: forces every
+   *  read through the authoritative RPC so mirror-record corruption can be
+   *  discriminated from store corruption). */
+  static bool ShmReadFastPathEnabled() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_CFS_SHM_READ");
+      return e == nullptr || *e != '0';
+    }();
+    return v;
+  }
+
   ssize_t TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
+    if (!ShmReadFastPathEnabled()) {
+      return -1;
+    }
     // Attach lazily, and RETRY when not yet attached, rather than latching
     // the result of one attempt at init. A client can legitimately come up
     // before its pool has been composed (or before the chimod has registered

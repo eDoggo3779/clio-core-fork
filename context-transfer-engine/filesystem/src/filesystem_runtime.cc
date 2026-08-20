@@ -529,9 +529,18 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     // container hit reclaim. 2x the written extent (floor 8 KiB, cap 64 KiB)
     // keeps appends amortized (O(log n) allocations) at ~1.5x file size.
     static constexpr clio::run::u64 kFsPreallocCap = 64ull * 1024;
-    const clio::run::u64 prealloc = std::min<clio::run::u64>(
-        kFsPreallocCap,
-        std::max<clio::run::u64>(2 * (page_off + to_write), 8192));
+    // Diagnostic knob: CLIO_CFS_PREALLOC overrides the doubling policy with a
+    // flat byte count (repro bisection of the fresh-page zero-block loss).
+    static const clio::run::u64 flat_prealloc = [] {
+      const char *e = std::getenv("CLIO_CFS_PREALLOC");
+      return e != nullptr ? std::strtoull(e, nullptr, 10) : 0ULL;
+    }();
+    const clio::run::u64 prealloc =
+        flat_prealloc != 0
+            ? flat_prealloc
+            : std::min<clio::run::u64>(
+                  kFsPreallocCap,
+                  std::max<clio::run::u64>(2 * (page_off + to_write), 8192));
     auto p = cte_.AsyncPutBlob(tag_id, PageName(cur), page_off, to_write,
                                src + done,
                                /*score*/ -1.0f,
@@ -768,6 +777,15 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
         task->gid_ = ov_gid;
         // chmod/create mode override (0xFFFFFFFF => adapter synthesizes 0644).
         task->mode_ = ov_mode;
+        // nlink computed HERE so the adapter's stat is one round trip — it
+        // previously issued a separate alias query per regular-file getattr.
+        {
+          auto na = cte_.AsyncGetNumAliases(path);
+          CLIO_CO_AWAIT(na);
+          if (na->GetReturnCode() == 0 && na->found_) {
+            task->nlink_ = static_cast<clio::run::u32>(na->num_aliases_) + 1;
+          }
+        }
         task->return_code_ = 0;
         CLIO_CO_RETURN;
       }
@@ -848,6 +866,13 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
     if (sm->GetReturnCode() == 0 && sm->size_ > 0) {
       task->is_symlink_ = 1;
       task->size_ = sm->size_;
+    } else {
+      // nlink server-side (see the open-handle fast path above).
+      auto na = cte_.AsyncGetNumAliases(path);
+      CLIO_CO_AWAIT(na);
+      if (na->GetReturnCode() == 0 && na->found_) {
+        task->nlink_ = static_cast<clio::run::u32>(na->num_aliases_) + 1;
+      }
     }
   } else {
     task->exists_ = 0; task->is_dir_ = 0; task->size_ = 0;
