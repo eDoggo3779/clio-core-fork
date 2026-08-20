@@ -35,6 +35,10 @@
 
 #include <algorithm>
 #include <climits>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -111,6 +115,78 @@ struct CfsHandle {
 CfsHandle *GetHandle(struct fuse_file_info *fi) {
   return reinterpret_cast<CfsHandle *>(fi->fh);
 }
+
+// Lazy closer (deferred writes x async close): a CloseTask that reaches the
+// chimod while the file's deferred WriteTasks are still in flight races them
+// — scheduler order decides whether a write lands on a closed handle and is
+// DROPPED (this corrupted git index-pack output). release() therefore hands
+// write-pending handles to this thread, which drains the file's writes and
+// only then sends the (fire-and-forget) close. Handles with nothing pending
+// skip the queue and close detached immediately — the common case for
+// read-only opens.
+struct PendingClose {
+  clio::run::u64 fh;
+  std::string path;
+};
+std::mutex g_closer_mtx;
+std::condition_variable g_closer_cv;
+std::deque<PendingClose> g_closer_q;
+std::thread g_closer;
+bool g_closer_started = false;
+bool g_closer_stop = false;
+
+void CloserMain() {
+  std::unique_lock<std::mutex> lk(g_closer_mtx);
+  while (!g_closer_stop) {
+    if (g_closer_q.empty()) {
+      g_closer_cv.wait(lk, [] { return g_closer_stop || !g_closer_q.empty(); });
+      continue;
+    }
+    PendingClose pc = std::move(g_closer_q.front());
+    g_closer_q.pop_front();
+    lk.unlock();
+    clio::cte::core::Client::DeferAwaitKey(
+        clio::cte::filesystem::Client::FileKey(pc.path));
+    CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
+    lk.lock();
+  }
+}
+
+// Per-file direct_io for WRITE-ONLY opens: in write-through mode the page
+// cache hands us ONE 4 KiB FUSE WRITE per dirtied page (a clone's 2.1 GB of
+// writes became ~525k ops); direct_io passes each write() through at its
+// full size instead. Scoped to O_WRONLY because such fds cannot be mmap'd
+// (the #597 direct_io+mmap hazard needs a readable fd) and the page cache
+// keeps serving all read opens. Write-once-then-rename creators — compilers,
+// git, archivers — are exactly this shape. CLIO_FUSE_DIRECT_WRONLY=0
+// disables (a reader concurrently caching a file ANOTHER fd is direct-io
+// writing can read stale until reopen; the write-once pattern never does).
+bool DirectWronlyEnabled() {
+  static const bool v = [] {
+    const char *e = getenv("CLIO_FUSE_DIRECT_WRONLY");
+    return e == nullptr || *e != '0';
+  }();
+  return v;
+}
+
+void MaybeDirectIo(struct fuse_file_info *fi) {
+  if (DirectWronlyEnabled() && (fi->flags & O_ACCMODE) == O_WRONLY) {
+    fi->direct_io = 1;
+  }
+}
+
+void EnqueueClose(clio::run::u64 fh, std::string path) {
+  {
+    std::lock_guard<std::mutex> lk(g_closer_mtx);
+    if (!g_closer_started) {
+      g_closer_started = true;
+      g_closer = std::thread(CloserMain);
+      g_closer.detach();  // process-lifetime thread; the mount owns it
+    }
+    g_closer_q.push_back(PendingClose{fh, std::move(path)});
+  }
+  g_closer_cv.notify_one();
+}
 }  // namespace
 
 // ============================================================================
@@ -134,14 +210,52 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   // write() still reaches the chimod synchronously and the exact logical size
   // is preserved; only mmap dirty pages flush lazily, which is inherent to mmap.
   cfg->direct_io = 0;
-  // Disable the kernel attribute/entry caches. Metadata (size, and especially
-  // st_nlink for hard links) can change without this FUSE process being the one
-  // that triggered the change, and there is no upcall to invalidate the cache.
-  // Without this, e.g. `ln a b; stat a` returns a's stale cached nlink. Every
-  // getattr/lookup goes to the chimod, which is the source of truth.
-  cfg->attr_timeout = 0;
-  cfg->entry_timeout = 0;
-  cfg->negative_timeout = 0;
+  // Kernel attribute/entry caching, default 1 second (what sshfs/NFS-style
+  // filesystems ship). A zero-TTL cache sends EVERY path-component lookup and
+  // EVERY stat to the chimod as its own round trip — measured ~0.3-0.8 ms
+  // each, which made a kernel-tree checkout (95k files, deep paths) 20-30x
+  // slower than ext4: the lookup storm alone dominated the clone.
+  //
+  // Coherence trade, stated plainly: metadata changed WITHOUT this FUSE
+  // process seeing it (another mount/process on the same store, or nlink
+  // after a hard link) can read stale for up to the TTL. Workloads that need
+  // strict coherence run with CLIO_FUSE_ATTR_CACHE_S=0, which restores the
+  // old every-op-goes-to-the-chimod behavior exactly.
+  double attr_ttl = 1.0;
+  if (const char *ttl_env = getenv("CLIO_FUSE_ATTR_CACHE_S")) {
+    if (*ttl_env != '\0') attr_ttl = atof(ttl_env);
+  }
+  cfg->attr_timeout = attr_ttl;
+  cfg->entry_timeout = attr_ttl;
+  cfg->negative_timeout = attr_ttl;
+  // Writeback cache: OFF by default. Enabling it batches write()s in the
+  // kernel page cache, but the kernel then requires the filesystem to be a
+  // bystander on file size — and the chimod's published size lags dirty
+  // pages, so the kernel's open-time revalidation truncated its view of
+  // files whose writes had not flushed yet. Measured: git clone corrupted
+  // its pack ("invalid index-pack output") with writeback on, and completed
+  // clean with it off, all other optimizations unchanged. Opt in with
+  // CLIO_FUSE_WRITEBACK=1 only for single-writer workloads that fsync.
+  bool writeback = false;
+  if (const char *wb_env = getenv("CLIO_FUSE_WRITEBACK")) {
+    writeback = (*wb_env == '1');
+  }
+  if (writeback && (conn->capable & FUSE_CAP_WRITEBACK_CACHE)) {
+    conn->want |= FUSE_CAP_WRITEBACK_CACHE;
+  }
+  // Let the kernel clear suid/sgid/caps itself instead of asking us: without
+  // this it sends a GETXATTR("security.capability") before EVERY write-out —
+  // measured as exactly one extra round trip per WRITE (71k of 149k ops in a
+  // clone's pack phase were these probes).
+#ifdef FUSE_CAP_HANDLE_KILLPRIV_V2
+  if (conn->capable & FUSE_CAP_HANDLE_KILLPRIV_V2) {
+    conn->want |= FUSE_CAP_HANDLE_KILLPRIV_V2;
+  }
+#endif
+  // Bigger transfers per op where the kernel allows it.
+  if (conn->max_write < (1u << 20)) {
+    conn->max_write = 1u << 20;
+  }
 
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
@@ -252,6 +366,15 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
     stbuf->st_nlink = nlink;
     // cte_off_t is off_t on Linux; the WinFsp shim maps it for Windows.
     stbuf->st_size = static_cast<cte_off_t>(t->size_);
+    // A deferred write that extended the file may not have advanced the
+    // published size yet, but the write(2) it came from already returned —
+    // stat must see it. High-water pending end, no drain (same rule as the
+    // cfs client's GetAttr).
+    clio::run::u64 pend = clio::cte::core::Client::DeferMaxPendingEnd(
+        clio::cte::filesystem::Client::FileKey(p));
+    if (pend > static_cast<clio::run::u64>(stbuf->st_size)) {
+      stbuf->st_size = static_cast<cte_off_t>(pend);
+    }
   }
   // Report the 512-byte block count backing the file so stat(2) st_blocks is
   // non-zero for files that hold data (generic/615 asserts a buffered/direct
@@ -355,6 +478,19 @@ static int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
   flags |= 0x4u | 0x8u;
 #endif
   auto *cfs = CLIO_CFS_CLIENT;
+  // Fire-and-forget by default: the kernel's writeback SETATTR stamps mtime
+  // on EVERY dirtied file at flush time, and awaiting each one put a full
+  // round trip per file on checkout-shaped workloads. A utimens on a missing
+  // path is silently dropped in detached mode (the next getattr tells the
+  // truth); CLIO_FUSE_ASYNC_UTIMENS=0 restores the awaited call.
+  static const bool async_utimens = [] {
+    const char *e = getenv("CLIO_FUSE_ASYNC_UTIMENS");
+    return e == nullptr || *e != '0';
+  }();
+  if (async_utimens) {
+    cfs->AsyncUtimensDetached(std::string(path), atime_ns, mtime_ns, flags);
+    return 0;
+  }
   auto t = cfs->AsyncUtimens(std::string(path), atime_ns, mtime_ns, flags);
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
@@ -510,6 +646,7 @@ static int cte_fuse_create(const char *path, cte_mode_t mode,
   handle->fh = t->handle_;
   handle->path = p;
   fi->fh = reinterpret_cast<uint64_t>(handle);
+  MaybeDirectIo(fi);
   MaybeTruncateOnOpen(cfs, p, fi->flags);
   return 0;
 }
@@ -528,22 +665,32 @@ static int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   handle->fh = t->handle_;
   handle->path = p;
   fi->fh = reinterpret_cast<uint64_t>(handle);
+  MaybeDirectIo(fi);
   MaybeTruncateOnOpen(cfs, p, fi->flags);
   return 0;
 }
 
-// Writes go straight through to the chimod (each AsyncWrite is awaited), so
-// there is nothing to drain on flush/fsync — they are durability no-ops.
+// Writes are DEFERRED through the cfs client's write-behind pipeline (see
+// cte_fuse_write): fsync is the durability point that drains them; flush
+// (close(2)) deliberately does NOT drain — the kernel page cache makes the
+// same trade — but it does surface any failure a completed deferred write
+// already latched against the file.
 static int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
-  (void)path;
-  (void)fi;
-  return 0;
+  auto *handle = GetHandle(fi);
+  const std::string p = handle ? handle->path : std::string(path ? path : "");
+  if (p.empty()) return 0;
+  int err = clio::cte::core::Client::DeferTakeKeyError(
+      clio::cte::filesystem::Client::FileKey(p));
+  return err != 0 ? -err : 0;
 }
 
 static int cte_fuse_fsync(const char *path, int /*datasync*/,
                           struct fuse_file_info *fi) {
-  (void)path;
-  (void)fi;
+  auto *handle = GetHandle(fi);
+  const std::string p = handle ? handle->path : std::string(path ? path : "");
+  if (p.empty()) return 0;
+  auto *cfs = CLIO_CFS_CLIENT;
+  if (cfs->Flush(p) != 0) return -errno;
   return 0;
 }
 
@@ -552,9 +699,35 @@ static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
   if (!handle) return 0;
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncClose(handle->fh);
-  t.Wait();
-  int rc = (t->GetReturnCode() == 0) ? 0 : -EIO;
+  // Fire-and-forget by default: every write was already awaited (or flushed
+  // by the kernel before release under writeback caching), so Close's only
+  // effect is server-side handle bookkeeping — and release() runs once per
+  // file, which made its round trip ~30% of the per-file cost on a kernel
+  // checkout. release's return code is not delivered to close(2) by FUSE
+  // anyway. CLIO_FUSE_ASYNC_CLOSE=0 restores the awaited close.
+  static const bool async_close = [] {
+    const char *e = getenv("CLIO_FUSE_ASYNC_CLOSE");
+    return e == nullptr || *e != '0';
+  }();
+  int rc = 0;
+  if (async_close) {
+    // Writes in flight for this file? The close must EXECUTE after they
+    // land (a close racing them server-side drops writes on a closed
+    // handle), but release() need not wait for that — the lazy closer
+    // orders it off the caller's path.
+    if (clio::cte::core::Client::DeferKeyPending(
+            clio::cte::filesystem::Client::FileKey(handle->path))) {
+      EnqueueClose(handle->fh, handle->path);
+    } else {
+      cfs->AsyncCloseDetached(handle->fh);
+    }
+  } else {
+    clio::cte::core::Client::DeferAwaitKey(
+        clio::cte::filesystem::Client::FileKey(handle->path));
+    auto t = cfs->AsyncClose(handle->fh);
+    t.Wait();
+    rc = (t->GetReturnCode() == 0) ? 0 : -EIO;
+  }
   delete handle;
   fi->fh = 0;
   return rc;
@@ -574,25 +747,15 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
 
-  auto *ipc = CLIO_IPC;
-  ctp::ipc::FullPtr<char> shm_buf = ipc->AllocateBuffer(size);
-  if (shm_buf.IsNull()) return -ENOMEM;
-  ctp::ipc::ShmPtr<> shm_ptr(shm_buf.shm_);
-
+  // The cfs client's tiered read: in-flight deferred writes served from
+  // their staging (read-your-own-writes, no wait), settled bytes from the
+  // shared-memory mirror (zero IPC), RPC only as the fallback — the raw
+  // AsyncRead round trip this replaced paid ~0.3 ms on every read.
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncRead(handle->fh, static_cast<clio::run::u64>(offset), size,
-                          shm_ptr);
-  t.Wait();
-  int rc;
-  if (t->GetReturnCode() == 0) {
-    size_t got = static_cast<size_t>(t->bytes_read_);
-    if (got > 0) memcpy(buf, shm_buf.ptr_, got);
-    rc = static_cast<int>(got);
-  } else {
-    rc = -EIO;
-  }
-  ipc->FreeBuffer(shm_buf);
-  return rc;
+  ssize_t got = cfs->Read(handle->fh, handle->path,
+                          static_cast<clio::run::u64>(offset), buf, size);
+  if (got < 0) return -EIO;
+  return static_cast<int>(got);
 }
 
 static int cte_fuse_write(const char *path, const char *buf, size_t size,
@@ -605,24 +768,17 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
 
-  auto *ipc = CLIO_IPC;
-  ctp::ipc::FullPtr<char> shm_buf = ipc->AllocateBuffer(size);
-  if (shm_buf.IsNull()) return -ENOMEM;
-  memcpy(shm_buf.ptr_, buf, size);
-  ctp::ipc::ShmPtr<> shm_ptr(shm_buf.shm_);
-
+  // Deferred write-behind through the cfs client (same pipeline as the POSIX
+  // adapter): stages through the recycled pool, submits WITHOUT waiting, and
+  // registers the write for read-your-own-writes and for the fsync drain.
+  // The awaited-per-write path this replaced put a full round trip on every
+  // page-cache flush; kernel-checkout files paid it once per file at close.
+  // A latched failure surfaces at fsync/flush, exactly like kernel writeback.
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncWrite(handle->fh, static_cast<clio::run::u64>(offset), size,
-                           shm_ptr);
-  t.Wait();
-  int rc;
-  if (t->GetReturnCode() == 0) {
-    rc = static_cast<int>(t->bytes_written_);
-  } else {
-    rc = -EIO;
-  }
-  ipc->FreeBuffer(shm_buf);
-  return rc;
+  ssize_t wrote = cfs->Write(handle->fh, handle->path,
+                             static_cast<clio::run::u64>(offset), buf, size);
+  if (wrote < 0) return -errno;
+  return static_cast<int>(wrote);
 }
 
 // ============================================================================
@@ -631,6 +787,11 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
 
 static int cte_fuse_unlink(const char *path) {
   auto *cfs = CLIO_CFS_CLIENT;
+  // Deferred writes racing the unlink would land on a deleted file and latch
+  // spurious errors; drain first (no-op unless this file has writes in
+  // flight, which an unlink-after-write pattern rarely does).
+  clio::cte::core::Client::DeferAwaitKey(
+      clio::cte::filesystem::Client::FileKey(std::string(path)));
   auto t = cfs->AsyncUnlink(std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/EISDIR/EIO
@@ -641,6 +802,10 @@ static int cte_fuse_truncate(const char *path, cte_off_t size,
                              struct fuse_file_info *fi) {
   (void)fi;
   auto *cfs = CLIO_CFS_CLIENT;
+  // Order against in-flight deferred writes: a truncate applied before a
+  // pending write lands would resurrect the truncated range (or vice versa).
+  clio::cte::core::Client::DeferAwaitKey(
+      clio::cte::filesystem::Client::FileKey(std::string(path)));
   auto t = cfs->AsyncTruncate(std::string(path), static_cast<clio::run::u64>(size));
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
@@ -789,6 +954,16 @@ static int cte_fuse_getxattr(const char *path, const char *name, char *value,
                              size_t size) {
   // Read xattr `name` of `path`. Return the value length (POSIX getxattr);
   // size==0 is a length query. Missing attribute -> -ENODATA.
+  //
+  // security.* / system.* short-circuit: the kernel probes
+  // security.capability before every write-out and system.posix_acl_* on
+  // permission checks. We never store either namespace (setxattr callers use
+  // user.*), so answering locally saves a chimod round trip PER CREATE —
+  // one of the four per-file waits that made kernel checkouts 20x slower
+  // than ext4.
+  if (strncmp(name, "security.", 9) == 0 || strncmp(name, "system.", 7) == 0) {
+    return -ENODATA;
+  }
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncGetxattr(std::string(path), std::string(name));
   t.Wait();
@@ -875,6 +1050,11 @@ static int cte_fuse_removexattr(const char *path, const char *name) {
 static int cte_fuse_rename(const char *from, const char *to,
                            unsigned int flags) {
   auto *cfs = CLIO_CFS_CLIENT;
+  // Deferred writes are keyed by PATH; a rename racing them would let the
+  // writes land under the old name. Drain `from` first (git's
+  // write-tmp-then-rename pattern hits this on every object file).
+  clio::cte::core::Client::DeferAwaitKey(
+      clio::cte::filesystem::Client::FileKey(std::string(from)));
   // RENAME_NOREPLACE: the rename must fail with EEXIST if `to` already exists.
   // Probe for the destination then fall through to a plain rename. This is the
   // standard high-level-FUSE approach (a tiny TOCTOU window vs a truly atomic

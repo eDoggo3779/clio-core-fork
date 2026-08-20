@@ -544,7 +544,11 @@ class Client : public clio::run::ContainerClient {
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_name,
         tag_id);
 
-    return ipc_manager->Send(task);
+    // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
+    // lookups from co-located chimods (clio-fs Open does three in a
+    // row) each paid a queue+schedule+wake hop; inline they run on
+    // the calling fiber. Falls back to Send everywhere else.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -3280,7 +3284,11 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<GetTagSizeTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id);
 
-    return ipc_manager->Send(task);
+    // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
+    // lookups from co-located chimods (clio-fs Open does three in a
+    // row) each paid a queue+schedule+wake hop; inline they run on
+    // the calling fiber. Falls back to Send everywhere else.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -3450,7 +3458,11 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<TagQueryTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_regex, max_tags);
 
-    return ipc_manager->Send(task);
+    // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
+    // lookups from co-located chimods (clio-fs Open does three in a
+    // row) each paid a queue+schedule+wake hop; inline they run on
+    // the calling fiber. Falls back to Send everywhere else.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**

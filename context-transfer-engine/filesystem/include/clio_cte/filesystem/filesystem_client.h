@@ -221,6 +221,22 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /** Fire-and-forget close: the task carries TASK_FIRE_AND_FORGET, so no
+   *  response is produced and the returned future is complete immediately.
+   *  close(2) is not a durability point — data durability lives in the
+   *  awaited writes / fsync — and Close's only output is server-side handle
+   *  bookkeeping, so metadata-heavy workloads (one close per file) need not
+   *  pay a full round trip for it. */
+  void AsyncCloseDetached(clio::run::u64 handle) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
+                                        clio::run::PoolQuery::Local(), handle);
+    // Flag must be set before Send (same ordering rule as the PutBlob
+    // staging flags).
+    task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);
+    ipc->Send(task);
+  }
+
   clio::run::Future<ReadTask> AsyncRead(clio::run::u64 handle, clio::run::u64 offset,
                                   clio::run::u64 size, ctp::ipc::ShmPtr<> data) {
     auto *ipc = CLIO_CPU_IPC;
@@ -280,6 +296,20 @@ class Client : public clio::cte::core::Client {
                                           clio::run::PoolQuery::Local(), path,
                                           atime_ns, mtime_ns, flags);
     return ipc->Send(task);
+  }
+
+  /** Fire-and-forget utimens (TASK_FIRE_AND_FORGET; see AsyncCloseDetached).
+   *  Timestamp stamping is pure metadata with no caller-visible output — the
+   *  kernel's writeback SETATTR issues one per dirtied file, and paying a
+   *  round trip for each put a wait on every file of a checkout. */
+  void AsyncUtimensDetached(const std::string &path, clio::run::u64 atime_ns,
+                            clio::run::u64 mtime_ns, clio::run::u32 flags) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<UtimensTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(), path,
+                                          atime_ns, mtime_ns, flags);
+    task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);
+    ipc->Send(task);
   }
 
   clio::run::Future<ChownTask> AsyncChown(const std::string &path,

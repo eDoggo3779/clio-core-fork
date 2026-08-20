@@ -517,16 +517,25 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   while (done < want) {
     clio::run::u64 page_off = cur % kFsPageSize;
     clio::run::u64 to_write = std::min(kFsPageSize - page_off, want - done);
-    // Preallocate 64 KiB of blob capacity per write so a run of small appends
-    // to the same page fills the last block's spare capacity in place instead
-    // of each one triggering a fresh allocation (and bdev sub-task) under the
-    // per-blob write token — the dominant clio-fs write-latency tail.
-    static constexpr clio::run::u64 kFsPreallocBytes = 64ull * 1024;
+    // Preallocate spare blob capacity so a run of small appends to the same
+    // page fills the last block's spare room in place instead of each one
+    // triggering a fresh allocation (and bdev sub-task) under the per-blob
+    // write token — the dominant clio-fs write-latency tail.
+    //
+    // DOUBLING growth, not a flat 64 KiB: a fixed 64 KiB reservation per
+    // page-blob turned a kernel-tree checkout (95k mostly-small files) into
+    // ~6 GB of dead RAM-bdev reservation for ~1.8 GB of data — the measured
+    // memory-pressure collapse that cut clone throughput 10x once the
+    // container hit reclaim. 2x the written extent (floor 8 KiB, cap 64 KiB)
+    // keeps appends amortized (O(log n) allocations) at ~1.5x file size.
+    static constexpr clio::run::u64 kFsPreallocCap = 64ull * 1024;
+    const clio::run::u64 prealloc = std::min<clio::run::u64>(
+        kFsPreallocCap,
+        std::max<clio::run::u64>(2 * (page_off + to_write), 8192));
     auto p = cte_.AsyncPutBlob(tag_id, PageName(cur), page_off, to_write,
                                src + done,
                                /*score*/ -1.0f,
-                               clio::cte::core::Context::Preallocate(
-                                   kFsPreallocBytes),
+                               clio::cte::core::Context::Preallocate(prealloc),
                                /*flags*/ 0u, clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(p);
     if (p->GetReturnCode() != 0) { ok = false; break; }
