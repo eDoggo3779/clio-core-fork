@@ -265,6 +265,8 @@ class Runtime : public clio::run::Container {
    * a way that invalidates cached pages (truncate, rename) but the path lives
    * on. Erasing would work too; this keeps the tag binding for the next op.
    */
+  void MirrorDir(const std::string &path,
+                 const clio::cte::core::TagId &tag_id, bool complete);
   void MirrorRefuse(const std::string &path);
 
   // ---- deferred-append pipeline state ----

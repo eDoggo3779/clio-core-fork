@@ -182,6 +182,13 @@ class Client : public clio::cte::core::Client {
    * @return true if a consistent record was read. false means "not cached /
    *         could not read consistently" -- fall back to the RPC path.
    */
+  /** True once the runtime's mirror dropped ANY record for capacity: a miss
+   *  then proves nothing and authoritative negatives must not fire. */
+  bool MirrorSaturated() const {
+    return shm_fs_root_ != nullptr &&
+           shm_fs_root_->overflow_.load(std::memory_order_acquire) != 0;
+  }
+
   bool TryGetFileRecordShm(const std::string &path, ShmFileRecord *out) const {
     if (shm_fs_root_ == nullptr || out == nullptr) {
       return false;

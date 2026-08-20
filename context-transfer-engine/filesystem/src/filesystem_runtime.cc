@@ -225,7 +225,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // slot is constructed up front, at ~112 B per entry, so the 64K default is
   // ~7 MB. Paths beyond capacity are simply not mirrored and keep using RPC.
   {
-    size_t capacity = 64 * 1024;
+    // 256K default (~28 MB): a kernel checkout is ~100K files, and letting
+    // the mirror saturate now also PERMANENTLY stands down the complete-dir
+    // negative fast path (ShmFsCacheRoot::overflow_) — capacity is cheap,
+    // losing authoritative negatives is not.
+    size_t capacity = 256 * 1024;
     if (const char *env = clio::run::env::GetCompat("CFS_SHM_FILE_CAPACITY")) {
       char *end = nullptr;
       unsigned long long v = std::strtoull(env, &end, 10);
@@ -247,6 +251,9 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   HLOG(kInfo, "filesystem: Create over CTE core pool {}",
        next_pool_id_.ToString());
+  // The root of a fresh mount is COMPLETE: nothing exists yet, and every
+  // later top-level name goes through handlers that keep the mirror honest.
+  MirrorDir("/", clio::cte::core::TagId::GetNull(), /*complete=*/true);
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -278,6 +285,26 @@ void Runtime::MirrorFile(const std::string &path, const FileInfo &fi,
   rec.uid_ = fi.set_uid_;
   rec.gid_ = fi.set_gid_;
   rec.flags_ = kShmFileExists | extra_flags;
+  shm_fs_cache_.PutFile(path, rec);
+}
+
+void Runtime::MirrorDir(const std::string &path,
+                        const clio::cte::core::TagId &tag_id, bool complete) {
+  if (!shm_fs_cache_.IsEnabled()) {
+    return;
+  }
+  ShmFileRecord rec;
+  rec.tag_id_ = tag_id;
+  rec.size_ = 0;
+  rec.ino_ = InoFromTag(tag_id);
+  rec.ov_atime_ns_ = 0;
+  rec.ov_mtime_ns_ = 0;
+  rec.ov_ctime_ns_ = 0;
+  rec.mode_ = kShmFileNoOverride;
+  rec.uid_ = kShmFileNoOverride;
+  rec.gid_ = kShmFileNoOverride;
+  rec.flags_ = kShmFileExists | kShmFileIsDir |
+               (complete ? kShmDirComplete : 0u);
   shm_fs_cache_.PutFile(path, rec);
 }
 
@@ -1066,9 +1093,13 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
       fi->path_ = path;
       fi->size_.store(new_size);
       by_path_[path] = fi;
+      // Materialized names must reach the mirror, or a COMPLETE parent dir
+      // would answer authoritative ENOENT for a file that now exists.
+      MirrorFile(path, *fi);
     } else {
       it->second->tag_id_ = tag_id;
       it->second->size_.store(new_size);
+      MirrorFile(path, *it->second);
     }
   }
 
@@ -1184,6 +1215,18 @@ clio::run::TaskResume Runtime::Mkdir(clio::run::shared_ptr<MkdirTask> &task) {
   CLIO_CO_AWAIT(t);
   if (t->GetReturnCode() == 0) {
     CLIO_FS_TOUCH_DIR(ParentDir(path));  // new subdir => parent mtime/ctime
+    // A just-born dir is trivially COMPLETE in the mirror: publishing that
+    // lets a mirror miss under it answer ENOENT with no task (the negative
+    // lookup ahead of every create was the top remaining checkout cost).
+    {
+      auto dt = cte_.AsyncGetOrCreateTag(path, clio::cte::core::TagId::GetNull(),
+                                         clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(dt);
+      MirrorDir(path, dt->GetReturnCode() == 0
+                          ? dt->tag_id_
+                          : clio::cte::core::TagId::GetNull(),
+                /*complete=*/true);
+    }
     task->return_code_ = 0;
   } else {
     task->return_code_ = EIO;
@@ -1372,6 +1415,15 @@ clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
       it->second->path_ = dst;
       by_path_[dst] = it->second;
       by_path_.erase(it);
+      // Replace dst's tombstone (published by the MirrorErase above) with the
+      // rebound file's record. Leaving the tombstone made every
+      // write-tmp-then-rename file stat ENOENT the moment the mirror became
+      // client-visible (.git/HEAD, .git/config).
+      MirrorFile(dst, *by_path_[dst]);
+    } else {
+      // Untracked source (closed file, symlink): no size/type at hand — a
+      // REFUSE record clears the tombstone and routes getattr to the task.
+      MirrorRefuse(dst);
     }
   }
   // A rename changes both the source and destination directories (generic/309).
@@ -1404,6 +1456,7 @@ clio::run::TaskResume Runtime::Link(clio::run::shared_ptr<LinkTask> &task) {
   // target by path, creates `link`'s parent chain, and binds the relative key
   // for `link` to the target's tag id — so both paths share the same data.
   // found_ == 0 means the target did not exist.
+  MirrorRefuse(ParentDir(link));  // BEFORE the alias name exists (see Symlink)
   auto a = cte_.AsyncGetOrCreateTagAlias(target, link, clio::run::PoolQuery::Dynamic());
   CLIO_CO_AWAIT(a);
   if (a->GetReturnCode() != 0) {
@@ -1416,6 +1469,9 @@ clio::run::TaskResume Runtime::Link(clio::run::shared_ptr<LinkTask> &task) {
     // stat; hardlinked files are rare, so refuse the fast path for them
     // rather than mirroring alias counts.
     MirrorRefuse(target);
+    // The alias NAME itself is not mirrored either — its parent loses
+    // authoritative-negative authority.
+    MirrorRefuse(ParentDir(link));
     task->return_code_ = 0;
   } else {
     task->return_code_ = ENOENT;
@@ -1428,6 +1484,10 @@ clio::run::TaskResume Runtime::Symlink(clio::run::shared_ptr<SymlinkTask> &task)
   CLIO_TASK_BODY_BEGIN
   std::string target = task->target_.str();
   std::string path = StripTrailingSlash(task->path_.str());
+  // Demote the parent's authoritative-negative authority BEFORE the name can
+  // exist: demoting only at success raced libfuse's post-op entry getattr,
+  // which read the stale COMPLETE record and ENOENT'd the just-made symlink.
+  MirrorRefuse(ParentDir(path));
 
   // A symlink must not land on an existing name.
   {
@@ -1474,6 +1534,9 @@ clio::run::TaskResume Runtime::Symlink(clio::run::shared_ptr<SymlinkTask> &task)
   }
 
   CLIO_FS_TOUCH_DIR(ParentDir(path));  // new symlink => parent dir mtime/ctime
+  // Symlinks are never mirrored: their NAME is invisible to the SHM cache,
+  // so the parent dir may no longer answer authoritative negatives.
+  MirrorRefuse(ParentDir(path));
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

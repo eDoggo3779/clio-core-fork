@@ -649,7 +649,12 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
   {
     auto *cte0 = CLIO_CTE_CLIENT;
     clio::cte::filesystem::ShmFileRecord mrec;
+    // TryGetFileRecordShm does NOT self-attach: without this the whole
+    // mirror-first path silently returns false on every call until some
+    // OTHER path (the read fast path) attaches — which a checkout-shaped
+    // workload never does early. Attach is one-time and cheap to re-check.
     if (cfs != nullptr && cte0 != nullptr &&
+        (cfs->HasShmCache() || cfs->AttachShmCache()) &&
         cfs->TryGetFileRecordShm(p, &mrec)) {
       if (!mrec.Exists()) {
         return -ENOENT;  // tombstone: authoritative absence, no task
@@ -705,6 +710,37 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
             NsBitsToTimespec(m_at, stbuf->st_atim.tv_sec,
                              stbuf->st_atim.tv_nsec);
           return 0;
+        }
+      }
+    }
+  }
+
+  // COMPLETE-DIR negative (issue #1007 follow-up): the path has NO mirror
+  // record, but its parent directory's record says the mirror reflects the
+  // ENTIRE child set — a miss is then authoritative ENOENT with no task.
+  // Negative lookups (one ahead of every create) cost 291 us each through
+  // the chimod vs ~10 us here — the largest remaining checkout cost. Only
+  // when TryGetFileRecordShm finds NOTHING: a present-but-refused record
+  // (kShmFileNoFastPath, pending appends) means the file exists and needs
+  // the task path.
+  {
+    auto *cte1 = CLIO_CTE_CLIENT;
+    clio::cte::filesystem::ShmFileRecord self;
+    if (cfs != nullptr && cte1 != nullptr && !cfs->MirrorSaturated() &&
+        !cfs->TryGetFileRecordShm(p, &self)) {
+      auto slash = p.find_last_of('/');
+      if (slash != std::string::npos) {
+        std::string parent = (slash == 0) ? "/" : p.substr(0, slash);
+        clio::cte::filesystem::ShmFileRecord prec;
+        bool have = cfs->TryGetFileRecordShm(parent, &prec);
+        if (have && prec.Exists() &&
+            (prec.flags_ & clio::cte::filesystem::kShmFileIsDir) &&
+            (prec.flags_ & clio::cte::filesystem::kShmDirComplete) &&
+            !(prec.flags_ & clio::cte::filesystem::kShmFileNoFastPath)) {
+          // NoFastPath on a dir = demoted (symlink/hard-link child): its
+          // negatives are no longer authoritative. MirrorRefuse ORs the bit
+          // into the existing record, so Complete may still be set.
+          return -ENOENT;
         }
       }
     }

@@ -37,6 +37,18 @@ enum ShmFileFlags : clio::run::u32 {
   kShmFilePendingAppend = 1u << 2,
   /** Catch-all refusal for states the fast path does not model. */
   kShmFileNoFastPath = 1u << 3,
+  /**
+   * Directory whose ENTIRE child set is reflected in the mirror: every child
+   * mutation since its mkdir published a record (create/rename) or a
+   * tombstone (unlink), so a MIRROR MISS under it is authoritative ENOENT —
+   * the negative-lookup fast path (a task round trip per miss was the
+   * dominant metadata cost of checkout workloads). Set at Mkdir (an empty
+   * new dir is trivially complete) and at the root's creation; ops that add
+   * names the mirror does not model (symlink, hard-link alias) demote the
+   * parent to kShmFileNoFastPath. Implicit dirs (never Mkdir'd) simply have
+   * no record, which reads as incomplete.
+   */
+  kShmDirComplete = 1u << 4,
 };
 
 /** Sentinel for "no stored override" in the mode/uid/gid fields. */
@@ -116,13 +128,20 @@ using ShmFsFileMap =
  * rather than competing for one slot.
  */
 struct ShmFsCacheRoot {
-  static constexpr clio::run::u32 kLayoutVersion = 1;
+  static constexpr clio::run::u32 kLayoutVersion = 2;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */
+  /**
+   * Nonzero once ANY PutFile failed to land (table full). From that moment a
+   * mirror MISS proves nothing — a real file may simply not be cached — so
+   * the COMPLETE-dir authoritative-negative fast path must stand down.
+   * Sticky by design: capacity does not come back.
+   */
+  std::atomic<clio::run::u32> overflow_;
   ShmFsFileMap path_to_file_;
 
-  ShmFsCacheRoot() : version_(0), ready_(0) {}
+  ShmFsCacheRoot() : version_(0), ready_(0), overflow_(0) {}
 };
 
 /**
@@ -206,11 +225,18 @@ class ShmFsCache {
     }
     try {
       ShmFsFileMap::BytesProbe p{path.data(), path.size()};
-      root_->path_to_file_.InsertOrAssign(
+      bool ok = root_->path_to_file_.InsertOrAssign(
           p, ShmCacheString::HashBytes(path.data(), path.size()), rec);
-      // A false return means the table is full: the path is simply not cached
-      // and clients keep using RPC for it.
+      // A false return means the table is full: the path is simply not
+      // cached and clients keep using RPC for it — and authoritative
+      // negatives must stand down forever (see overflow_).
+      if (!ok) {
+        root_->overflow_.store(1, std::memory_order_release);
+      }
     } catch (...) {
+      if (root_ != nullptr) {
+        root_->overflow_.store(1, std::memory_order_release);
+      }
     }
   }
 
