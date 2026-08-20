@@ -214,10 +214,12 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-  clio::run::Future<CloseTask> AsyncClose(clio::run::u64 handle) {
+  clio::run::Future<CloseTask> AsyncClose(clio::run::u64 handle,
+                                          clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), handle);
+                                        clio::run::PoolQuery::Local(), handle,
+                                        advance_size);
     return ipc->Send(task);
   }
 
@@ -227,10 +229,12 @@ class Client : public clio::cte::core::Client {
    *  awaited writes / fsync — and Close's only output is server-side handle
    *  bookkeeping, so metadata-heavy workloads (one close per file) need not
    *  pay a full round trip for it. */
-  void AsyncCloseDetached(clio::run::u64 handle) {
+  void AsyncCloseDetached(clio::run::u64 handle,
+                          clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), handle);
+                                        clio::run::PoolQuery::Local(), handle,
+                                        advance_size);
     // Flag must be set before Send (same ordering rule as the PutBlob
     // staging flags).
     task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);

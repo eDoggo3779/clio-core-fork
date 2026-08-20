@@ -1728,10 +1728,15 @@ template <typename CreateParamsT = CreateParams>
 struct GetOrCreateTagTask : public clio::run::Task {
   IN clio::run::priv::string tag_name_;  // Tag name (required)
   INOUT TagId tag_id_;  // Tag unique ID (default null, output on creation)
+  // Fused metadata (one round trip instead of three for callers like the
+  // clio-fs Open, which needed existence + id + size):
+  OUT clio::run::u32 created_;    // 1 = this call created the tag
+  OUT clio::run::u64 tag_size_;   // total bytes (0 for a fresh tag)
 
   // SHM constructor
   CTP_CROSS_FUN GetOrCreateTagTask()
-      : clio::run::Task(), tag_name_(CLIO_PRIV_ALLOC), tag_id_(TagId::GetNull()) {}
+      : clio::run::Task(), tag_name_(CLIO_PRIV_ALLOC), tag_id_(TagId::GetNull()),
+        created_(0), tag_size_(0) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit GetOrCreateTagTask(
@@ -1740,7 +1745,7 @@ struct GetOrCreateTagTask : public clio::run::Task {
       const TagId &tag_id = TagId::GetNull())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetOrCreateTag),
         tag_name_(CLIO_PRIV_ALLOC, tag_name),
-        tag_id_(tag_id) {
+        tag_id_(tag_id), created_(0), tag_size_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetOrCreateTag;
@@ -1763,7 +1768,7 @@ struct GetOrCreateTagTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(tag_id_);
+    ar(tag_id_, created_, tag_size_);
   }
 
   /**
@@ -1774,6 +1779,8 @@ struct GetOrCreateTagTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     tag_name_ = other->tag_name_;
     tag_id_ = other->tag_id_;
+    created_ = other->created_;
+    tag_size_ = other->tag_size_;
   }
 
   /**

@@ -110,7 +110,78 @@ namespace {
 struct CfsHandle {
   clio::run::u64 fh = 0;
   std::string path;
+  // The file's CTE tag (null when unknown): lets data ops drive page blobs
+  // through the CTE client directly — writes into the sieve buffer, reads
+  // through the tiered RYW/SHM/RPC path — instead of a chimod task per op.
+  clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();
 };
+
+// Sieve-direct data path (user directive: writes belong in the sieve
+// buffer; only namespace ops should need chimod tasks). CLIO_FUSE_SIEVE=0
+// falls back to the chimod Write/Read tasks wholesale.
+bool SieveDataEnabled() {
+  static const bool v = [] {
+    const char *e = getenv("CLIO_FUSE_SIEVE");
+    return e == nullptr || *e != '0';
+  }();
+  return v;
+}
+
+// Logical-size high-water for files with UNFLUSHED sieve writes: the chimod
+// only learns the size at close (CloseTask::advance_size_), so getattr and
+// read-clamping consult this in the meantime. Path-keyed; renames move the
+// entry, the closer erases it once the size-carrying close has been sent.
+std::mutex g_hw_mtx;
+std::unordered_map<std::string, clio::run::u64> g_hiwater;
+
+void HiwaterRaise(const std::string &path, clio::run::u64 end) {
+  std::lock_guard<std::mutex> lk(g_hw_mtx);
+  auto &v = g_hiwater[path];
+  if (end > v) v = end;
+}
+clio::run::u64 HiwaterFor(const std::string &path) {
+  std::lock_guard<std::mutex> lk(g_hw_mtx);
+  auto it = g_hiwater.find(path);
+  return it == g_hiwater.end() ? 0 : it->second;
+}
+void HiwaterErase(const std::string &path) {
+  std::lock_guard<std::mutex> lk(g_hw_mtx);
+  g_hiwater.erase(path);
+}
+// Truncate invalidates any unflushed-write extent past the new size; without
+// this, getattr's hiwater overlay kept reporting the pre-truncate size.
+void HiwaterClamp(const std::string &path, clio::run::u64 size) {
+  std::lock_guard<std::mutex> lk(g_hw_mtx);
+  auto it = g_hiwater.find(path);
+  if (it == g_hiwater.end()) return;
+  if (size == 0) {
+    g_hiwater.erase(it);
+  } else if (it->second > size) {
+    it->second = size;
+  }
+}
+void HiwaterRename(const std::string &from, const std::string &to) {
+  std::lock_guard<std::mutex> lk(g_hw_mtx);
+  auto it = g_hiwater.find(from);
+  if (it != g_hiwater.end()) {
+    clio::run::u64 v = it->second;
+    g_hiwater.erase(it);
+    auto &dst = g_hiwater[to];
+    if (v > dst) dst = v;
+  }
+}
+
+// Drain every page-blob key of `path`'s file (sieve writes register under
+// (tag, page-name), NOT under the cfs FileKey) up to `hiwater` bytes.
+void DrainSievePages(const clio::cte::core::TagId &tag,
+                     clio::run::u64 hiwater) {
+  if (tag.IsNull() || hiwater == 0) return;
+  for (clio::run::u64 off = 0; off < hiwater;
+       off += clio::cte::filesystem::kFsPageSize) {
+    clio::cte::core::Client::AwaitPendingPuts(
+        tag, clio::cte::filesystem::PageName(off));
+  }
+}
 
 CfsHandle *GetHandle(struct fuse_file_info *fi) {
   return reinterpret_cast<CfsHandle *>(fi->fh);
@@ -132,6 +203,8 @@ struct PendingClose {
   clio::run::u64 atime_ns = 0;  // kUtimens payload
   clio::run::u64 mtime_ns = 0;
   clio::run::u32 flags = 0;
+  clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();  // kClose
+  clio::run::u64 hiwater = 0;  // kClose: size to advance to (0 = none)
 };
 std::mutex g_closer_mtx;
 std::condition_variable g_closer_cv;
@@ -159,7 +232,17 @@ void CloserMain() {
     clio::cte::core::Client::DeferAwaitKey(
         clio::cte::filesystem::Client::FileKey(pc.path));
     if (pc.kind == PendingClose::kClose) {
-      CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
+      DrainSievePages(pc.tag, pc.hiwater);
+      if (pc.hiwater != 0) {
+        // AWAITED: the hiwater entry may only be dropped once the chimod
+        // has durably adopted the size, or a getattr in the gap would read
+        // the stale pre-close size.
+        auto t = CLIO_CFS_CLIENT->AsyncClose(pc.fh, pc.hiwater);
+        t.Wait();
+        HiwaterErase(pc.path);
+      } else {
+        CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
+      }
     } else {
       CLIO_CFS_CLIENT->AsyncUtimensDetached(pc.path, pc.atime_ns, pc.mtime_ns,
                                             pc.flags);
@@ -390,6 +473,12 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
         clio::cte::filesystem::Client::FileKey(p));
     if (pend > static_cast<clio::run::u64>(stbuf->st_size)) {
       stbuf->st_size = static_cast<cte_off_t>(pend);
+    }
+    // Sieve-path writes advance the chimod size only at close: overlay the
+    // local hiwater in the meantime.
+    clio::run::u64 hw = HiwaterFor(p);
+    if (hw > static_cast<clio::run::u64>(stbuf->st_size)) {
+      stbuf->st_size = static_cast<cte_off_t>(hw);
     }
   }
   // Report the 512-byte block count backing the file so stat(2) st_blocks is
@@ -675,9 +764,13 @@ static int cte_fuse_create(const char *path, cte_mode_t mode,
   auto *handle = new CfsHandle();
   handle->fh = t->handle_;
   handle->path = p;
+  handle->tag = clio::cte::core::TagId(
+      static_cast<clio::run::u32>(t->tag_packed_ >> 32),
+      static_cast<clio::run::u32>(t->tag_packed_ & 0xffffffffULL));
   fi->fh = reinterpret_cast<uint64_t>(handle);
   MaybeDirectIo(fi);
   MaybeTruncateOnOpen(cfs, p, fi->flags);
+  if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
   return 0;
 }
 
@@ -694,9 +787,13 @@ static int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   auto *handle = new CfsHandle();
   handle->fh = t->handle_;
   handle->path = p;
+  handle->tag = clio::cte::core::TagId(
+      static_cast<clio::run::u32>(t->tag_packed_ >> 32),
+      static_cast<clio::run::u32>(t->tag_packed_ & 0xffffffffULL));
   fi->fh = reinterpret_cast<uint64_t>(handle);
   MaybeDirectIo(fi);
   MaybeTruncateOnOpen(cfs, p, fi->flags);
+  if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
   return 0;
 }
 
@@ -719,6 +816,12 @@ static int cte_fuse_fsync(const char *path, int /*datasync*/,
   auto *handle = GetHandle(fi);
   const std::string p = handle ? handle->path : std::string(path ? path : "");
   if (p.empty()) return 0;
+  // Sieve-path durability: drain the file's page-blob keys. The logical
+  // size still travels on close; a stat between fsync and close is served
+  // by the hiwater overlay in getattr.
+  if (handle != nullptr) {
+    DrainSievePages(handle->tag, HiwaterFor(p));
+  }
   auto *cfs = CLIO_CFS_CLIENT;
   if (cfs->Flush(p) != 0) return -errno;
   return 0;
@@ -777,11 +880,38 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
 
-  // The cfs client's tiered read: in-flight deferred writes served from
-  // their staging (read-your-own-writes, no wait), settled bytes from the
-  // shared-memory mirror (zero IPC), RPC only as the fallback — the raw
-  // AsyncRead round trip this replaced paid ~0.3 ms on every read.
+  // SIEVE-DIRECT read: page-wise AsyncGetBlobDefer — sieve/pending bytes
+  // served from their staging (RYW, no wait), settled bytes from the SHM
+  // mirror (zero IPC), RPC as the fallback. EOF clamps against the chimod
+  // size raised by the local hiwater (bytes acknowledged to write(2) but
+  // not yet carried to the chimod by close).
+  auto *cte = CLIO_CTE_CLIENT;
   auto *cfs = CLIO_CFS_CLIENT;
+  if (SieveDataEnabled() && cte != nullptr && !handle->tag.IsNull()) {
+    bool exists = false;
+    clio::run::u64 fsize = 0;
+    cfs->GetAttr(handle->path, &exists, &fsize);
+    clio::run::u64 hw = HiwaterFor(handle->path);
+    if (hw > fsize) fsize = hw;
+    clio::run::u64 off = static_cast<clio::run::u64>(offset);
+    if (off >= fsize) return 0;
+    clio::run::u64 want = std::min<clio::run::u64>(size, fsize - off);
+    std::memset(buf, 0, want);  // holes / short pages read as zeros
+    clio::run::u64 done = 0;
+    while (done < want) {
+      clio::run::u64 cur = off + done;
+      clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
+      clio::run::u64 n = std::min<clio::run::u64>(
+          clio::cte::filesystem::kFsPageSize - page_off, want - done);
+      auto g = cte->AsyncGetBlobDefer(
+          handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
+          buf + done);
+      g.Wait();
+      done += n;
+    }
+    return static_cast<int>(want);
+  }
+  // cfs tiered read fallback.
   ssize_t got = cfs->Read(handle->fh, handle->path,
                           static_cast<clio::run::u64>(offset), buf, size);
   if (got < 0) return -EIO;
@@ -798,12 +928,31 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
 
-  // Deferred write-behind through the cfs client (same pipeline as the POSIX
-  // adapter): stages through the recycled pool, submits WITHOUT waiting, and
-  // registers the write for read-your-own-writes and for the fsync drain.
-  // The awaited-per-write path this replaced put a full round trip on every
-  // page-cache flush; kernel-checkout files paid it once per file at close.
-  // A latched failure surfaces at fsync/flush, exactly like kernel writeback.
+  // SIEVE-DIRECT (user directive): the write is a memcpy into the CTE
+  // sieve's page buffer — no task at all until a 64 KiB page fills and
+  // ships. Read-your-writes comes from the sieve's registered extents; the
+  // logical size rides the hiwater map until close carries it to the
+  // chimod. Falls back to the cfs deferred WriteTask pipeline when the tag
+  // is unknown or CLIO_FUSE_SIEVE=0.
+  auto *cte = CLIO_CTE_CLIENT;
+  if (SieveDataEnabled() && cte != nullptr && !handle->tag.IsNull()) {
+    size_t done = 0;
+    while (done < size) {
+      clio::run::u64 cur = static_cast<clio::run::u64>(offset) + done;
+      clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
+      clio::run::u64 n = std::min<clio::run::u64>(
+          clio::cte::filesystem::kFsPageSize - page_off, size - done);
+      int rc = cte->AsyncPutBlobDefer(
+          handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
+          buf + done);
+      if (rc != 0) return -EIO;
+      done += n;
+    }
+    HiwaterRaise(handle->path, static_cast<clio::run::u64>(offset) + size);
+    return static_cast<int>(size);
+  }
+  // Deferred write-behind through the cfs client (staging pool, RYW
+  // registration, fsync drain) — one submit, no wait.
   auto *cfs = CLIO_CFS_CLIENT;
   ssize_t wrote = cfs->Write(handle->fh, handle->path,
                              static_cast<clio::run::u64>(offset), buf, size);
@@ -822,6 +971,7 @@ static int cte_fuse_unlink(const char *path) {
   // flight, which an unlink-after-write pattern rarely does).
   clio::cte::core::Client::DeferAwaitKey(
       clio::cte::filesystem::Client::FileKey(std::string(path)));
+  HiwaterErase(std::string(path));
   auto t = cfs->AsyncUnlink(std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/EISDIR/EIO
@@ -834,8 +984,21 @@ static int cte_fuse_truncate(const char *path, cte_off_t size,
   auto *cfs = CLIO_CFS_CLIENT;
   // Order against in-flight deferred writes: a truncate applied before a
   // pending write lands would resurrect the truncated range (or vice versa).
-  clio::cte::core::Client::DeferAwaitKey(
-      clio::cte::filesystem::Client::FileKey(std::string(path)));
+  // Sieve-path writes live under the file's page-blob keys; drain them too
+  // (tag resolved via the SHM mirror, best-effort) and clamp the hiwater
+  // overlay so stat reflects the truncation immediately.
+  {
+    const std::string p(path);
+    clio::cte::core::Client::DeferAwaitKey(
+        clio::cte::filesystem::Client::FileKey(p));
+    clio::cte::filesystem::ShmFileRecord rec;
+    if (cfs->TryGetFileRecordShm(p, &rec) && !rec.tag_id_.IsNull()) {
+      DrainSievePages(clio::cte::core::TagId(rec.tag_id_.major_,
+                                             rec.tag_id_.minor_),
+                      HiwaterFor(p));
+    }
+    HiwaterClamp(p, static_cast<clio::run::u64>(size));
+  }
   auto t = cfs->AsyncTruncate(std::string(path), static_cast<clio::run::u64>(size));
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
@@ -1082,9 +1245,12 @@ static int cte_fuse_rename(const char *from, const char *to,
   auto *cfs = CLIO_CFS_CLIENT;
   // Deferred writes are keyed by PATH; a rename racing them would let the
   // writes land under the old name. Drain `from` first (git's
-  // write-tmp-then-rename pattern hits this on every object file).
+  // write-tmp-then-rename pattern hits this on every object file). Sieve
+  // writes are keyed by (tag, page) and the tag survives the rename, so
+  // they need no drain — but the hiwater overlay is path-keyed and moves.
   clio::cte::core::Client::DeferAwaitKey(
       clio::cte::filesystem::Client::FileKey(std::string(from)));
+  HiwaterRename(std::string(from), std::string(to));
   // RENAME_NOREPLACE: the rename must fail with EEXIST if `to` already exists.
   // Probe for the destination then fall through to a plain rename. This is the
   // standard high-level-FUSE approach (a tiny TOCTOU window vs a truly atomic

@@ -1421,17 +1421,31 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
       CLIO_CO_RETURN;
     }
 
+    // Existence probe BEFORE the chain, so the caller learns whether this
+    // call created the tag — clio-fs Open previously paid a separate
+    // TagQuery round trip for exactly this bit. (Two racing creators may
+    // both report created_=1; the callers' create-side effects are
+    // idempotent, and blob-level correctness never keys off created_.)
+    bool tag_existed;
+    if (IsHierPath(tag_name)) {
+      tag_existed = !ResolvePathToIdLocked(tag_name).IsNull();
+    } else {
+      tag_existed = (tag_name_to_id_.find(tag_name) != nullptr);
+    }
+
     // Absolute paths are created as a hierarchy ("/a/b/c" -> "/", "/a", "/a/b",
     // "/a/b/c") with each child stored relative to its parent; the returned id
     // is the deepest tag. Flat names create a single tag (legacy behavior).
     TagId tag_id = GetOrCreateTagChain(tag_name, preferred_id);
     task->tag_id_ = tag_id;
+    task->created_ = tag_existed ? 0u : 1u;
 
     auto now = GetCurrentTimeNs();
     {
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
         tag_info_ptr->last_read_ = now;
+        task->tag_size_ = tag_info_ptr->total_size_;
         LogTelemetry(CteOp::kGetOrCreateTag, 0, 0, tag_id,
                      tag_info_ptr->last_modified_, now);
       }
@@ -4787,8 +4801,24 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   tag_info.last_modified_ = creation_now;  // mtime
   tag_info.last_read_ = creation_now;      // atime
 
-  // Store mappings
-  tag_name_to_id_.insert_or_assign(tag_name, tag_id);
+  // Insert IF ABSENT and adopt the winner on a lost race — the tag-level
+  // twin of the CreateNewBlob insert_or_assign data-loss bug: two parallel
+  // creates of one name (every file create walks the SAME parent-directory
+  // tags, so a checkout races this constantly) minted two TagIds, and the
+  // second insert_or_assign rebound the name — children and blobs created
+  // under the first id were orphaned, surfacing as git refs pointing at
+  // 'nonexistent' objects. The winner's id IS the tag.
+  const bool won = tag_name_to_id_.insert(tag_name, tag_id).inserted;
+  if (!won) {
+    TagId *winner = tag_name_to_id_.find(tag_name);
+    if (winner != nullptr) {
+      return *winner;
+    }
+    // Winner erased between our insert and find (concurrent DelTag) —
+    // pathologically cold; claim the name ourselves and continue.
+    tag_name_to_id_.insert_or_assign(tag_name, tag_id);
+  }
+  // Keyed by our freshly generated unique id: no cross-task collision.
   tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(tag_info));
 
   // issue #783: mirror into the SHM cache, after the authoritative insert so

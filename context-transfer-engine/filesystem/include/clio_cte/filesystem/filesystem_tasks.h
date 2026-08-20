@@ -118,39 +118,51 @@ struct OpenTask : public clio::run::Task {
   OUT clio::run::u64 handle_;
   OUT clio::run::u64 size_;
   OUT clio::run::u32 created_;  // 1 if the file was newly created
+  // Packed TagId (major<<32|minor) of the file's tag, so adapters can drive
+  // page-blob I/O (sieve writes, RYW reads) through the CTE client directly.
+  OUT clio::run::u64 tag_packed_;
 
   OpenTask()
       : clio::run::Task(), path_(CTP_MALLOC), flags_(0), mode_(0644),
-        handle_(0), size_(0), created_(0) {}
+        handle_(0), size_(0), created_(0), tag_packed_(0) {}
   explicit OpenTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                     const clio::run::PoolQuery &pool_query, const std::string &path,
                     clio::run::u32 flags, clio::run::u32 mode)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kOpen),
         path_(CTP_MALLOC, path), flags_(flags), mode_(mode), handle_(0),
-        size_(0), created_(0) {}
+        size_(0), created_(0), tag_packed_(0) {}
   void Copy(const ctp::ipc::FullPtr<OpenTask>& o) {
     path_ = o->path_; flags_ = o->flags_; mode_ = o->mode_;
     handle_ = o->handle_; size_ = o->size_; created_ = o->created_;
+    tag_packed_ = o->tag_packed_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_, flags_, mode_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(handle_, size_, created_);
+    Task::SerializeOut(ar); ar(handle_, size_, created_, tag_packed_);
   }
 };
 
 /** Close: release a handle (drains pending writes server-side). */
 struct CloseTask : public clio::run::Task {
   IN clio::run::u64 handle_;
-  CloseTask() : clio::run::Task(), handle_(0) {}
+  // Advance the file's logical size to at least this before releasing the
+  // handle (0 = no advance). Carried on CLOSE — not a path-keyed truncate —
+  // because it must survive a rename racing a detached close: the handle's
+  // server-side FileInfo tracks the file identity across renames.
+  IN clio::run::u64 advance_size_;
+  CloseTask() : clio::run::Task(), handle_(0), advance_size_(0) {}
   explicit CloseTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
-                     const clio::run::PoolQuery &pool_query, clio::run::u64 handle)
+                     const clio::run::PoolQuery &pool_query, clio::run::u64 handle,
+                     clio::run::u64 advance_size = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kClose),
-        handle_(handle) {}
-  void Copy(const ctp::ipc::FullPtr<CloseTask>& o) { handle_ = o->handle_; }
+        handle_(handle), advance_size_(advance_size) {}
+  void Copy(const ctp::ipc::FullPtr<CloseTask>& o) {
+    handle_ = o->handle_; advance_size_ = o->advance_size_;
+  }
   template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(handle_);
+    Task::SerializeIn(ar); ar(handle_, advance_size_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };

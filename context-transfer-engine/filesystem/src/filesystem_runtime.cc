@@ -311,38 +311,43 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = task->path_.str();
 
-  // Did the tag already exist (so we can report created_)?
   bool existed = false;
-  {
-    auto q = cte_.AsyncTagQuery(ExactRe(path), 1, clio::run::PoolQuery::Dynamic());
+  clio::cte::core::TagId tag_id;
+  clio::run::u64 size = 0;
+  if (task->flags_ & O_CREAT) {
+    // Create-or-open in ONE nested task: GetOrCreateTag reports whether it
+    // created the tag and the tag's size, which this handler previously
+    // gathered with a separate existence TagQuery and a GetTagSize — three
+    // sequential round trips on the hottest path a checkout has.
+    auto t = cte_.AsyncGetOrCreateTag(path, clio::cte::core::TagId::GetNull(),
+                                      clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(t);
+    if (t->GetReturnCode() != 0) {
+      task->return_code_ = EIO;
+      CLIO_CO_RETURN;
+    }
+    tag_id = t->tag_id_;
+    existed = (t->created_ == 0);
+    size = t->tag_size_;
+  } else {
+    // Honor O_CREAT-less opens: a plain open of a missing file must fail
+    // (handle_=0 -> ENOENT), never create. The exact query resolves the id
+    // too, so only the size needs a second task.
+    auto q = cte_.AsyncTagQuery(ExactRe(path), 1,
+                                clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(q);
     existed = (q->GetReturnCode() == 0 && !q->results_.empty());
-  }
-
-  // Honor O_CREAT: a plain open of a missing file must fail. Report it by
-  // returning handle_=0 (the adapters map that to ENOENT) rather than
-  // silently creating the tag.
-  if (!existed && !(task->flags_ & O_CREAT)) {
-    task->handle_ = 0;
-    task->size_ = 0;
-    task->created_ = 0;
-    task->return_code_ = 0;
-    CLIO_CO_RETURN;
-  }
-
-  // Resolve / create the tag for this path.
-  auto t = cte_.AsyncGetOrCreateTag(path, clio::cte::core::TagId::GetNull(),
-                                    clio::run::PoolQuery::Dynamic());
-  CLIO_CO_AWAIT(t);
-  if (t->GetReturnCode() != 0) {
-    task->return_code_ = EIO;
-    CLIO_CO_RETURN;
-  }
-  clio::cte::core::TagId tag_id = t->tag_id_;
-
-  // Current physical size (best-effort baseline for the logical size).
-  clio::run::u64 size = 0;
-  {
+    if (!existed) {
+      task->handle_ = 0;
+      task->size_ = 0;
+      task->created_ = 0;
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    clio::run::u64 packed = q->result_ids_.empty() ? 0 : q->result_ids_[0];
+    tag_id = clio::cte::core::TagId(
+        static_cast<clio::run::u32>(packed >> 32),
+        static_cast<clio::run::u32>(packed & 0xffffffffULL));
     auto s = cte_.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(s);
     if (s->GetReturnCode() == 0) {
@@ -388,6 +393,8 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   task->handle_ = handle;
   task->size_ = size;
   task->created_ = existed ? 0u : 1u;
+  task->tag_packed_ = (static_cast<clio::run::u64>(tag_id.major_) << 32) |
+                      static_cast<clio::run::u64>(tag_id.minor_);
   // Creating a new file updates its parent directory's mtime/ctime.
   if (!existed) {
     CLIO_FS_TOUCH_DIR(ParentDir(path));
@@ -399,9 +406,25 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
 
 clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  std::shared_ptr<FileInfo> fi;
   {
     std::lock_guard<std::mutex> g(meta_mu_);
-    handles_.erase(task->handle_);
+    auto it = handles_.find(task->handle_);
+    if (it != handles_.end()) {
+      fi = it->second;
+      handles_.erase(it);
+    }
+  }
+  // Sieve-written files (adapter drives page blobs through the CTE client
+  // directly) advance their logical size at close: the handle's FileInfo
+  // tracks the file across renames, which a path-keyed truncate would not.
+  if (fi != nullptr && task->advance_size_ != 0) {
+    clio::run::u64 want = task->advance_size_;
+    clio::run::u64 old = fi->size_.load();
+    while (want > old && !fi->size_.compare_exchange_weak(old, want)) {
+    }
+    std::lock_guard<std::mutex> g(meta_mu_);
+    MirrorFile(fi->path_, *fi);
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
