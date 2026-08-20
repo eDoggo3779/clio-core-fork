@@ -4781,11 +4781,24 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
     return *existing_tag_id_ptr;
   }
 
-  // Assign new tag ID
+  // Assign new tag ID. A NAMELESS SEED TagInfo does not block adoption of
+  // the preferred id: a sieve page-put that ships before its file's batched
+  // MultiCreate lands materializes exactly such a seed (PutBlob creates
+  // TagInfo for size accounting), and rejecting the preferred id here FORKED
+  // the file's identity — its data stayed under the minted id while the name
+  // was bound to a fresh server id, so every read of the file returned
+  // hole-zeros under a ghost inode. Adopting merges into the seed instead,
+  // preserving the accounting the early puts already accrued.
   TagId tag_id;
-  if ((preferred_id.major_ != 0 || preferred_id.minor_ != 0) &&
-      !tag_id_to_info_.contains(preferred_id)) {
-    tag_id = preferred_id;
+  std::shared_ptr<TagInfo> seed;
+  if (preferred_id.major_ != 0 || preferred_id.minor_ != 0) {
+    seed = tag_id_to_info_.get(preferred_id);
+    if (seed == nullptr || seed->tag_name_.empty()) {
+      tag_id = preferred_id;
+    } else {
+      seed.reset();  // a real, named tag owns this id — do not adopt
+      tag_id = GenerateNewTagId();
+    }
   } else {
     tag_id = GenerateNewTagId();
   }
@@ -4818,8 +4831,26 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
     // pathologically cold; claim the name ourselves and continue.
     tag_name_to_id_.insert_or_assign(tag_name, tag_id);
   }
-  // Keyed by our freshly generated unique id: no cross-task collision.
-  tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(tag_info));
+  if (seed != nullptr) {
+    // Adopt by REPLACING the map entry with a named copy — never by renaming
+    // the live seed: tag_name_ is a heap string read lock-free by TagQuery
+    // scans and ResolveTagName (the maps self-lock per operation only), and
+    // assigning it on a live object corrupts the heap under a concurrent
+    // reader (clone-scale malloc_consolidate abort). The copy carries the
+    // seed's accounting (total_size_, put-stamped times); readers still
+    // holding the old shared_ptr see a consistent nameless seed until they
+    // re-fetch.
+    TagInfo adopted = *seed;
+    adopted.tag_name_ = tag_name;
+    adopted.tag_id_ = tag_id;
+    tag_info = adopted;  // the SHM mirror below publishes the real accounting
+    tag_id_to_info_.insert_or_assign(tag_id,
+                                     std::make_shared<TagInfo>(adopted));
+  } else {
+    // Keyed by our freshly generated unique id: no cross-task collision.
+    tag_id_to_info_.insert_or_assign(tag_id,
+                                     std::make_shared<TagInfo>(tag_info));
+  }
 
   // issue #783: mirror into the SHM cache, after the authoritative insert so
   // the cache can only lag, never lead.
@@ -6122,8 +6153,12 @@ TagId Runtime::GenerateNewTagId() {
   auto *ipc_manager = CLIO_IPC;
   clio::run::u32 node_id = ipc_manager->GetNodeId();
 
-  // Get next minor component from atomic counter
-  clio::run::u32 minor_id = next_tag_id_minor_.fetch_add(1);
+  // Get next minor component from atomic counter. The TOP BIT of the minor
+  // space is RESERVED for client-minted ids (batched sieve-flushed creation
+  // proposes ids via GetOrCreateTag's preferred_id so create(2) can return a
+  // stable inode without waiting); masking here keeps the server generator
+  // out of that partition forever.
+  clio::run::u32 minor_id = next_tag_id_minor_.fetch_add(1) & 0x7FFFFFFFu;
 
   return TagId{node_id, minor_id};
 }

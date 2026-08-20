@@ -214,6 +214,28 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /** Tag-keyed size advance (see AdvanceSizeTask). */
+  clio::run::Future<AdvanceSizeTask> AsyncAdvanceSize(
+      clio::run::u64 tag_packed, clio::run::u64 size) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AdvanceSizeTask>(clio::run::CreateTaskId(),
+                                              pool_id_,
+                                              clio::run::PoolQuery::Local(),
+                                              tag_packed, size);
+    return ipc->Send(task);
+  }
+
+  /** Batched sieve-flushed creation (see MultiCreateTask). */
+  clio::run::Future<MultiCreateTask> AsyncMultiCreate(
+      const std::string &packed) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<MultiCreateTask>(clio::run::CreateTaskId(),
+                                              pool_id_,
+                                              clio::run::PoolQuery::Local(),
+                                              packed);
+    return ipc->Send(task);
+  }
+
   clio::run::Future<CloseTask> AsyncClose(clio::run::u64 handle,
                                           clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;

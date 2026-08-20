@@ -167,6 +167,118 @@ struct CloseTask : public clio::run::Task {
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
+/**
+ * MultiCreate (batched, sieve-flushed file creation): create N files in ONE
+ * task. Each entry carries the path, the client-MINTED packed TagId (top-bit
+ * minor partition; the tag chain adopts it via preferred_id), and the create
+ * mode. create(2) itself returns without any task — the adapter's flusher
+ * ships these every tick, exactly like the write sieve ships pages.
+ */
+struct MultiCreateEnt {
+  std::string path_;
+  clio::run::u64 tag_packed_ = 0;
+  clio::run::u32 mode_ = 0644;
+};
+
+inline std::string EncodeMultiCreate(const std::vector<MultiCreateEnt> &ents) {
+  std::string out;
+  auto put32 = [&](clio::run::u32 v) {
+    out.append(reinterpret_cast<const char *>(&v), sizeof(v));
+  };
+  auto put64 = [&](clio::run::u64 v) {
+    out.append(reinterpret_cast<const char *>(&v), sizeof(v));
+  };
+  put32(static_cast<clio::run::u32>(ents.size()));
+  for (const auto &e : ents) {
+    put32(static_cast<clio::run::u32>(e.path_.size()));
+    out.append(e.path_);
+    put64(e.tag_packed_);
+    put32(e.mode_);
+  }
+  return out;
+}
+
+inline bool DecodeMultiCreate(const char *data, size_t len,
+                              std::vector<MultiCreateEnt> *out) {
+  size_t off = 0;
+  auto get32 = [&](clio::run::u32 *v) {
+    if (off + sizeof(*v) > len) return false;
+    std::memcpy(v, data + off, sizeof(*v));
+    off += sizeof(*v);
+    return true;
+  };
+  auto get64 = [&](clio::run::u64 *v) {
+    if (off + sizeof(*v) > len) return false;
+    std::memcpy(v, data + off, sizeof(*v));
+    off += sizeof(*v);
+    return true;
+  };
+  clio::run::u32 n = 0;
+  if (!get32(&n)) return false;
+  out->clear();
+  out->reserve(n);
+  for (clio::run::u32 i = 0; i < n; ++i) {
+    MultiCreateEnt e;
+    clio::run::u32 plen = 0;
+    if (!get32(&plen) || off + plen > len) return false;
+    e.path_.assign(data + off, plen);
+    off += plen;
+    if (!get64(&e.tag_packed_) || !get32(&e.mode_)) return false;
+    out->push_back(std::move(e));
+  }
+  return true;
+}
+
+struct MultiCreateTask : public clio::run::Task {
+  IN clio::run::priv::string packed_;  // EncodeMultiCreate payload
+  OUT clio::run::u32 num_ok_;
+  OUT clio::run::u32 first_rc_;
+  MultiCreateTask()
+      : clio::run::Task(), packed_(CTP_MALLOC), num_ok_(0), first_rc_(0) {}
+  explicit MultiCreateTask(const clio::run::TaskId &task_id,
+                           const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           const std::string &packed)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiCreate),
+        packed_(CTP_MALLOC, packed), num_ok_(0), first_rc_(0) {}
+  void Copy(const ctp::ipc::FullPtr<MultiCreateTask> &o) {
+    packed_ = o->packed_; num_ok_ = o->num_ok_; first_rc_ = o->first_rc_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(packed_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(num_ok_, first_rc_);
+  }
+};
+
+/**
+ * AdvanceSize: raise a file's logical size, keyed by TAG rather than path or
+ * handle. This is the rename-proof size push for sieve-minted files: a
+ * path-keyed truncate delivered after the app renamed the file RESURRECTED
+ * the old name (cfs Truncate materializes missing paths by design), and the
+ * ghost then hijacked later renames. The tag names the file's identity; the
+ * handler publishes under whatever path the file currently has.
+ */
+struct AdvanceSizeTask : public clio::run::Task {
+  IN clio::run::u64 tag_packed_;
+  IN clio::run::u64 size_;
+  AdvanceSizeTask() : clio::run::Task(), tag_packed_(0), size_(0) {}
+  explicit AdvanceSizeTask(const clio::run::TaskId &task_id,
+                           const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           clio::run::u64 tag_packed, clio::run::u64 size)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kAdvanceSize),
+        tag_packed_(tag_packed), size_(size) {}
+  void Copy(const ctp::ipc::FullPtr<AdvanceSizeTask> &o) {
+    tag_packed_ = o->tag_packed_; size_ = o->size_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(tag_packed_, size_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
 /** Read: page-loop GetBlob over [offset, offset+size). */
 struct ReadTask : public clio::run::Task {
   IN clio::run::u64 handle_;

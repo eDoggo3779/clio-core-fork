@@ -379,6 +379,8 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
       fi->path_ = path;
       fi->size_.store(size);
       by_path_[path] = fi;
+      by_tag_[(static_cast<clio::run::u64>(tag_id.major_) << 32) |
+              static_cast<clio::run::u64>(tag_id.minor_)] = fi;
     }
     // A fresh O_CREAT carries the caller's mode (cp/install rely on this to
     // make copied binaries executable — getattr otherwise synthesizes 0644).
@@ -398,6 +400,100 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   // Creating a new file updates its parent directory's mtime/ctime.
   if (!existed) {
     CLIO_FS_TOUCH_DIR(ParentDir(path));
+  }
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::AdvanceSize(
+    clio::run::shared_ptr<AdvanceSizeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  std::shared_ptr<FileInfo> fi;
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    auto it = by_tag_.find(task->tag_packed_);
+    if (it != by_tag_.end()) fi = it->second;
+  }
+  if (fi == nullptr) {
+    task->return_code_ = ENOENT;
+    CLIO_CO_RETURN;
+  }
+  clio::run::u64 want = task->size_;
+  clio::run::u64 old = fi->size_.load();
+  while (want > old && !fi->size_.compare_exchange_weak(old, want)) {
+  }
+  {
+    // Publish under the file's CURRENT path — but only while that path still
+    // maps to THIS FileInfo. A concurrent Rename erases the source's mirror
+    // record before it rewrites by_path_, and publishing into that window
+    // resurrected the old name as a ghost record (the next O_EXCL create of
+    // the path then failed EEXIST against a file that no longer exists).
+    std::lock_guard<std::mutex> g(meta_mu_);
+    auto it = by_path_.find(fi->path_);
+    if (it != by_path_.end() && it->second == fi) {
+      MirrorFile(fi->path_, *fi);
+    }
+  }
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::MultiCreate(
+    clio::run::shared_ptr<MultiCreateTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // Batched file creation (the create-side analog of MultiPutBlob): each
+  // entry's tag chain adopts the client-minted id via preferred_id, then the
+  // fs metadata, mirror record, and parent-dir touch land exactly as a
+  // synchronous Open would have done them. Per-entry failures don't stop the
+  // batch; the first is reported.
+  task->num_ok_ = 0;
+  task->first_rc_ = 0;
+  std::string packed = task->packed_.str();
+  std::vector<MultiCreateEnt> ents;
+  if (!DecodeMultiCreate(packed.data(), packed.size(), &ents)) {
+    task->return_code_ = 1;
+    CLIO_CO_RETURN;
+  }
+  for (const auto &e : ents) {
+    clio::cte::core::TagId minted(
+        static_cast<clio::run::u32>(e.tag_packed_ >> 32),
+        static_cast<clio::run::u32>(e.tag_packed_ & 0xffffffffULL));
+    auto t = cte_.AsyncGetOrCreateTag(e.path_, minted,
+                                      clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(t);
+    if (t->GetReturnCode() != 0) {
+      if (task->first_rc_ == 0) task->first_rc_ = EIO;
+      continue;
+    }
+    if (!(t->tag_id_ == minted)) {
+      // The path already existed under another id (exclusivity raced or the
+      // client's kernel-side negative lookup was stale): the client already
+      // published the minted id as the file's inode and keyed sieve pages by
+      // it, so this entry is a REAL failure, not an adoption.
+      if (task->first_rc_ == 0) task->first_rc_ = EEXIST;
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      auto it = by_path_.find(e.path_);
+      std::shared_ptr<FileInfo> fi;
+      if (it != by_path_.end()) {
+        fi = it->second;
+      } else {
+        fi = std::make_shared<FileInfo>();
+        fi->tag_id_ = minted;
+        fi->path_ = e.path_;
+        fi->size_.store(0);
+        by_path_[e.path_] = fi;
+        by_tag_[e.tag_packed_] = fi;
+      }
+      fi->set_mode_ = e.mode_ & 07777u;
+      MirrorFile(e.path_, *fi);
+    }
+    CLIO_FS_TOUCH_DIR(ParentDir(e.path_));
+    task->num_ok_++;
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -1655,11 +1751,22 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
     if (it != by_path_.end()) tag_id = it->second->tag_id_;
   }
   if (tag_id.IsNull()) {
-    auto t = cte_.AsyncGetOrCreateTag(path, clio::cte::core::TagId::GetNull(),
-                                      clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(t);
-    if (t->GetReturnCode() != 0) { task->return_code_ = EIO; CLIO_CO_RETURN; }
-    tag_id = t->tag_id_;
+    // Resolve WITHOUT creating: a timestamp stamp must never materialize a
+    // file. The old GetOrCreateTag fallback minted a fresh tag whenever a
+    // DETACHED utimens landed after its file was renamed away — the ghost
+    // then hijacked the next rename of that path (git's config read back
+    // zeros under a ghost inode, one ghost per lock/rename cycle).
+    auto q = cte_.AsyncTagQuery(ExactRe(path), 1,
+                                clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(q);
+    if (q->GetReturnCode() != 0 || q->results_.empty()) {
+      task->return_code_ = ENOENT;
+      CLIO_CO_RETURN;
+    }
+    clio::run::u64 packed = q->result_ids_.empty() ? 0 : q->result_ids_[0];
+    tag_id = clio::cte::core::TagId(
+        static_cast<clio::run::u32>(packed >> 32),
+        static_cast<clio::run::u32>(packed & 0xffffffffULL));
   }
   {
     std::lock_guard<std::mutex> g(meta_mu_);

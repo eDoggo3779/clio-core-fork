@@ -1706,14 +1706,19 @@ class Client : public clio::run::ContainerClient {
       reg.batch_descs_.push_back(std::move(d));
       reg.batch_ents_.push_back(DeferredPut::Ent{key, seq, size});
       reg.batch_used_ += size;
-    }
-    // Extent registered as soon as the bytes are copied: reads serve
-    // read-your-writes from the ACCUMULATING batch, before it even ships.
-    reg.KeyAdd(key, seq, copied, offset, size);
-    {
-      std::lock_guard<std::mutex> lk(reg.mtx_);
-      reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
-      reg.inflight_bytes_.fetch_add(size, std::memory_order_relaxed);
+      // Register BEFORE batch_mtx_ releases. The ent above is claimable the
+      // moment the lock drops: a concurrent flush ships the batch, the SHM
+      // server completes it in ~µs, and the reap's KeyRelease(key, seq)
+      // no-ops on the absent key — the late KeyAdd then plants an extent
+      // NOTHING will ever release, and every subsequent drain of this key
+      // spin-yields forever (the checkout-stress mount wedge). batch_mtx_ →
+      // shard.mtx_ is established nesting (SieveSweepPages' KeyRepoint).
+      reg.KeyAdd(key, seq, copied, offset, size);
+      {
+        std::lock_guard<std::mutex> flk(reg.mtx_);
+        reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+        reg.inflight_bytes_.fetch_add(size, std::memory_order_relaxed);
+      }
     }
     return 0;
   }
@@ -1786,12 +1791,14 @@ class Client : public clio::run::ContainerClient {
       reg.batch_descs_.push_back(std::move(d));
       reg.batch_ents_.push_back(DeferredPut::Ent{key, seq, total});
       reg.batch_used_ += total;
-    }
-    reg.KeyAdd(key, seq, copied, offset, total);
-    {
-      std::lock_guard<std::mutex> lk(reg.mtx_);
-      reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
-      reg.inflight_bytes_.fetch_add(total, std::memory_order_relaxed);
+      // Same release-before-add hazard as the scalar path above: register
+      // while batch_mtx_ still excludes the flush.
+      reg.KeyAdd(key, seq, copied, offset, total);
+      {
+        std::lock_guard<std::mutex> flk(reg.mtx_);
+        reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+        reg.inflight_bytes_.fetch_add(total, std::memory_order_relaxed);
+      }
     }
     return 0;
   }
@@ -1912,6 +1919,9 @@ class Client : public clio::run::ContainerClient {
    *  tick otherwise. The CV mutex is lifecycle-only and is dropped for the
    *  pass itself. */
   static void SieveFlusherMain() {
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "sieve-flush");
+#endif
     DeferRegistry &reg = DeferRegistry::Get();
     std::unique_lock<std::mutex> lk(reg.sieve_lc_mtx_);
     while (!reg.sieve_stop_) {
@@ -1956,6 +1966,13 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 page_off_;
     };
     std::vector<Cand> cands;
+    // READER side of sieve_rw_ for the whole scan: the lifetime rule says a
+    // SieveBlob* is valid only while a sieve_rw_ lock is held (deletes happen
+    // under WRITE mode). The probe originally relied on the map's per-bucket
+    // lock alone, and a concurrent SieveFlushKey (closer-thread drain) could
+    // delete the blob between that bucket lock and this dereference —
+    // heap-use-after-free at clone scale (ASan-confirmed, T41 vs T38).
+    reg.sieve_rw_.ReadLock(0, /*writer_priority=*/true);
     reg.sieve_.for_each(
         [&](const clio::run::u64 &k, DeferRegistry::SieveBlob *&blob) {
           std::lock_guard<std::mutex> blk(blob->mtx_);
@@ -1968,6 +1985,7 @@ class Client : public clio::run::ContainerClient {
           }
         },
         ctp::priv::ForEachLock::kShared);
+    reg.sieve_rw_.ReadUnlock();
     const bool over_cap =
         reg.sieve_pages_.load(std::memory_order_relaxed) >
         DeferRegistry::kSieveMaxPages;
@@ -2022,8 +2040,9 @@ class Client : public clio::run::ContainerClient {
     for (clio::run::u64 k : empty_keys) {
       DeferRegistry::SieveBlob **p = reg.sieve_.find(k);
       if (p != nullptr) {
-        delete *p;
-        reg.sieve_.erase(k);
+        DeferRegistry::SieveBlob *doomed = *p;
+        reg.sieve_.erase(k);  // unpublish BEFORE delete
+        delete doomed;
       }
     }
     reg.sieve_rw_.WriteUnlock();
@@ -2334,8 +2353,9 @@ class Client : public clio::run::ContainerClient {
     for (clio::run::u64 k : keys) {
       DeferRegistry::SieveBlob **p = reg.sieve_.find(k);
       if (p != nullptr) {
-        delete *p;
-        reg.sieve_.erase(k);
+        DeferRegistry::SieveBlob *doomed = *p;
+        reg.sieve_.erase(k);  // unpublish BEFORE delete
+        delete doomed;
       }
     }
     reg.sieve_rw_.WriteUnlock();
@@ -2355,8 +2375,8 @@ class Client : public clio::run::ContainerClient {
         SieveUnaccount(reg, pg);
         mine.push_back(std::move(pg));
       }
+      reg.sieve_.erase(key);  // unpublish BEFORE delete (bucket lock barrier)
       delete blob;
-      reg.sieve_.erase(key);
     }
     reg.sieve_rw_.WriteUnlock();
     SieveSweepPages(std::move(mine));
