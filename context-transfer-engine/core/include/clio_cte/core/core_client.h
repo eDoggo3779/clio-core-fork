@@ -962,10 +962,17 @@ class Client : public clio::run::ContainerClient {
     // awake on the empty->non-empty transition — NEVER per write, see the
     // #807 self-wake collapse) or by any drain that needs them.
     static constexpr clio::run::u64 kSievePage = 64 * 1024;
-    // Hard cap on dirty sieve pages (64 * 64 KiB = 4 MiB): a writer that
+    // Per-blob sieve budget: 16 open pages = 1 MiB PER BLOB (the buffer
+    // budget is per blob by design — issue #1007 discussion; the 17th page
+    // for a blob sweeps that blob's oldest). Open-page bytes are bounded by
+    // this cap and the global one below, and are therefore EXEMPT from any
+    // nonzero AwaitPutsUntilSpace pacing wall — see the wall's comment.
+    static constexpr size_t kSieveMaxBlobPages = 16;
+    // Global cap on dirty sieve pages (1024 * 64 KiB = 64 MiB, the same
+    // order as the pipeline's default 64 MiB write window): a writer that
     // would exceed it sweeps a victim page inline first, so scattered
     // patterns cannot grow the sieve without bound.
-    static constexpr size_t kSieveMaxPages = 64;
+    static constexpr size_t kSieveMaxPages = 1024;
     struct SievePage {
       TagId tag_id_;
       std::string blob_name_;
@@ -982,6 +989,9 @@ class Client : public clio::run::ContainerClient {
     // Lock-free emptiness signal, exactly like pending_count_: drains and
     // the flusher's idle check read this without touching sieve_mtx_.
     std::atomic<size_t> sieve_pages_{0};
+    // Dirty bytes currently held in OPEN pages (mutated under sieve_mtx_,
+    // read lock-free by the pacing wall to exempt them from it).
+    std::atomic<clio::run::u64> sieve_bytes_{0};
     std::condition_variable sieve_cv_;
     std::thread sieve_thread_;
     bool sieve_thread_started_ = false;
@@ -1862,7 +1872,10 @@ class Client : public clio::run::ContainerClient {
       if (aged.empty()) {
         continue;
       }
+      clio::run::u64 aged_bytes = 0;
+      for (const auto &pg : aged) aged_bytes += pg.hi_ - pg.lo_;
       reg.sieve_pages_.fetch_sub(aged.size(), std::memory_order_relaxed);
+      reg.sieve_bytes_.fetch_sub(aged_bytes, std::memory_order_relaxed);
       Client *fc = reg.flush_client_.load(std::memory_order_acquire);
       lk.unlock();  // sweeping takes batch_mtx_ and may await — never under
       if (fc != nullptr) {  //   sieve_mtx_
@@ -1870,6 +1883,15 @@ class Client : public clio::run::ContainerClient {
       }
       lk.lock();
     }
+  }
+
+  /** Release a detached page's share of the sieve counters. Callers hold
+   *  sieve_mtx_ (the extent cannot grow after detach). Born-full pages that
+   *  ship without ever being inserted are never counted, so never pass here. */
+  static void SieveUnaccount(DeferRegistry &reg,
+                             const DeferRegistry::SievePage &pg) {
+    reg.sieve_pages_.fetch_sub(1, std::memory_order_relaxed);
+    reg.sieve_bytes_.fetch_sub(pg.hi_ - pg.lo_, std::memory_order_relaxed);
   }
 
   /** Sieve one page-confined sub-write. @return 0 sieved; -3 page slice
@@ -1901,19 +1923,27 @@ class Client : public clio::run::ContainerClient {
         // sweeps the page out and re-opens it for the new range.
         sweep.push_back(std::move(pages[pi]));
         pages.erase(pages.begin() + static_cast<long>(pi));
-        reg.sieve_pages_.fetch_sub(1, std::memory_order_relaxed);
+        SieveUnaccount(reg, sweep.back());
         pi = pages.size();
       }
       if (pi == pages.size()) {
-        // Cap first: evict a victim page so scattered patterns cannot grow
-        // the sieve past kSieveMaxPages buffers.
+        // Per-blob budget first (kSieveMaxBlobPages * 64 KiB = 1 MiB per
+        // blob): a blob needing another page past its budget sweeps its
+        // own oldest page.
+        if (pages.size() >= DeferRegistry::kSieveMaxBlobPages) {
+          sweep.push_back(std::move(pages.front()));
+          pages.erase(pages.begin());
+          SieveUnaccount(reg, sweep.back());
+        }
+        // Global cap next: evict a victim page so scattered patterns cannot
+        // grow the sieve past kSieveMaxPages buffers.
         if (reg.sieve_pages_.load(std::memory_order_relaxed) >=
             DeferRegistry::kSieveMaxPages) {
           for (auto &kv : reg.sieve_) {
             if (!kv.second.empty()) {
               sweep.push_back(std::move(kv.second.front()));
               kv.second.erase(kv.second.begin());
-              reg.sieve_pages_.fetch_sub(1, std::memory_order_relaxed);
+              SieveUnaccount(reg, sweep.back());
               break;  // empty buckets are reaped by the flusher
             }
           }
@@ -1944,10 +1974,11 @@ class Client : public clio::run::ContainerClient {
             reg.inflight_bytes_.fetch_add(len, std::memory_order_relaxed);
           }
           if (pg.hi_ == page_off + DeferRegistry::kSievePage) {
-            ship = std::move(pg);  // born full (write ran to page end)
-            do_ship = true;
+            ship = std::move(pg);  // born full (write ran to page end);
+            do_ship = true;        //   never inserted, never counted
           } else {
             pages.push_back(std::move(pg));
+            reg.sieve_bytes_.fetch_add(len, std::memory_order_relaxed);
             wake =
                 reg.sieve_pages_.fetch_add(1, std::memory_order_relaxed) == 0;
           }
@@ -1966,6 +1997,7 @@ class Client : public clio::run::ContainerClient {
         pg.hi_ = new_hi;
         pg.touched_ = true;
         if (added != 0) {
+          reg.sieve_bytes_.fetch_add(added, std::memory_order_relaxed);
           std::lock_guard<std::mutex> glk(reg.mtx_);
           reg.inflight_bytes_.fetch_add(added, std::memory_order_relaxed);
         }
@@ -1976,7 +2008,7 @@ class Client : public clio::run::ContainerClient {
           ship = std::move(pg);
           do_ship = true;
           pages.erase(pages.begin() + static_cast<long>(pi));
-          reg.sieve_pages_.fetch_sub(1, std::memory_order_relaxed);
+          SieveUnaccount(reg, ship);
         }
       }
     }
@@ -2127,7 +2159,10 @@ class Client : public clio::run::ContainerClient {
         }
       }
       reg.sieve_.clear();
+      clio::run::u64 bytes = 0;
+      for (const auto &pg : all) bytes += pg.hi_ - pg.lo_;
       reg.sieve_pages_.fetch_sub(all.size(), std::memory_order_relaxed);
+      reg.sieve_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
     }
     SieveSweepPages(std::move(all));
   }
@@ -2145,7 +2180,10 @@ class Client : public clio::run::ContainerClient {
       }
       mine = std::move(it->second);
       reg.sieve_.erase(it);
+      clio::run::u64 bytes = 0;
+      for (const auto &pg : mine) bytes += pg.hi_ - pg.lo_;
       reg.sieve_pages_.fetch_sub(mine.size(), std::memory_order_relaxed);
+      reg.sieve_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
     }
     SieveSweepPages(std::move(mine));
   }
@@ -2383,7 +2421,20 @@ class Client : public clio::run::ContainerClient {
       // window pays for synchronization.
       clio::run::u64 cur =
           reg.inflight_bytes_.load(std::memory_order_relaxed);
-      if (cur <= max_inflight_bytes &&
+      // OPEN sieve pages are exempt from a NONZERO wall (issue #1007): the
+      // per-blob buffer budget is its own bound (kSieveMaxBlobPages, plus
+      // the global kSieveMaxPages), and counting open pages here made any
+      // wall smaller than one 64 KiB page a PERMANENT stall — every write
+      // entered the await path and force-flushed every open page (measured:
+      // 512 B x 8 threads collapsed ~3x at a 64 KiB wall). A wall of 0
+      // keeps its full-drain meaning: everything, sieve included, retires.
+      clio::run::u64 paced = cur;
+      if (max_inflight_bytes != 0) {
+        clio::run::u64 sieve_b =
+            reg.sieve_bytes_.load(std::memory_order_relaxed);
+        paced = cur > sieve_b ? cur - sieve_b : 0;
+      }
+      if (paced <= max_inflight_bytes &&
           reg.pending_count_.load(std::memory_order_relaxed) <=
               max_inflight_count) {
         return cur;

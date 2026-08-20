@@ -329,6 +329,52 @@ TEST_CASE("PutSieve - background flusher ships idle partial pages unaided",
   REQUIRE(clio::cte::core::Client::DeferErrorCount() == 0);
 }
 
+TEST_CASE("PutSieve - per-blob budget sweeps the oldest page inline",
+          "[cte][sieve][1007]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("sieve_budget_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  // 21 writes, each in its OWN 64 KiB page of one blob: exceeds the 16-page
+  // (1 MiB) per-blob budget, so creating pages 17..21 sweeps the blob's
+  // oldest page inline. Every write must remain readable BOTH pre-drain
+  // (swept extents serve from the batch chunk, open ones from their pages)
+  // and post-drain.
+  constexpr int kPages = 21;
+  std::vector<char> blk(512);
+  for (int i = 0; i < kPages; ++i) {
+    clio::run::u64 off = 1024 + static_cast<clio::run::u64>(i) * 65536;
+    FillPat(blk, off, 9);
+    REQUIRE(client->AsyncPutBlobDefer(tag_id, "budget", off, blk.size(),
+                                      blk.data()) == 0);
+  }
+  for (int i = 0; i < kPages; i += 4) {
+    clio::run::u64 off = 1024 + static_cast<clio::run::u64>(i) * 65536;
+    std::vector<char> got(512, 0);
+    auto fut =
+        client->AsyncGetBlobDefer(tag_id, "budget", off, 512, got.data());
+    fut.Wait();
+    std::vector<char> expect(512);
+    FillPat(expect, off, 9);
+    REQUIRE(std::memcmp(got.data(), expect.data(), 512) == 0);
+  }
+  clio::cte::core::Client::AwaitPutsUntilSpace(0);
+  REQUIRE(clio::cte::core::Client::DeferErrorCount() == 0);
+  for (int i = 0; i < kPages; ++i) {
+    clio::run::u64 off = 1024 + static_cast<clio::run::u64>(i) * 65536;
+    std::vector<char> got(512, 0);
+    auto fut = client->AsyncGetBlob(tag_id, "budget", off, 512, /*flags=*/0,
+                                    got.data());
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+    std::vector<char> expect(512);
+    FillPat(expect, off, 9);
+    REQUIRE(std::memcmp(got.data(), expect.data(), 512) == 0);
+  }
+}
+
 TEST_CASE("PutSieve - random overlapping small writes converge",
           "[cte][sieve][1007]") {
   auto *client = CLIO_CTE_CLIENT;

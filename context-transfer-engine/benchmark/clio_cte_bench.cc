@@ -332,9 +332,8 @@ class CTEBenchmark {
         // Sequential partial-object stream: op n writes [n*io_size, ...)
         // within its 16 MiB blob segment; segments advance with the byte
         // position, so a time-limited run never rewrites (or unboundedly
-        // grows) a blob. Note: a pacing wall smaller than one 64 KiB page
-        // (depth * io-size < 64 KiB) force-flushes open pages at the wall
-        // — use depth >= 64Ki/io-size to measure full-page coalescing.
+        // grows) a blob. The nonzero pacing wall covers SHIPPED bytes only;
+        // open sieve pages ride their own per-blob/global budgets.
         for (long j = 0; j < batch; ++j) {
           clio::run::u64 pos =
               static_cast<clio::run::u64>(i + j) * a_.io_size;
