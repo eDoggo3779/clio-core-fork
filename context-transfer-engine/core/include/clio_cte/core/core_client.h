@@ -370,6 +370,16 @@ class Client : public clio::run::ContainerClient {
     return shm_root_->tag_name_to_id_.TryGetBytes(tag_name.data(),
                                                   tag_name.size(), out);
   }
+
+  /** Zero-IPC tag metadata (size + timestamps) lookup — lets adapters build
+   *  a full stat from shared memory (mirror-first getattr). */
+  bool TryGetTagRecordShm(const TagId &tag_id, ShmTagRecord *out) const {
+    if (shm_root_ == nullptr || out == nullptr) {
+      return false;
+    }
+    return shm_root_->tag_id_to_info_.TryGet(
+        tag_id, ShmTagInfoMap::Hash(tag_id), out);
+  }
 #endif
 
 #if CTP_IS_HOST

@@ -432,8 +432,77 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
     return 0;
   }
 
-  // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
+  // MIRROR-FIRST stat (user directive): build the full stat from the SHM
+  // mirrors — file record (identity, size, overrides) + tag record (natural
+  // timestamps) — with no task at all. Records that are absent, refused
+  // (hardlink targets, pending appends), or missing their tag record fall
+  // through to the chimod task; a tombstone answers ENOENT immediately.
   auto *cfs = CLIO_CFS_CLIENT;
+  {
+    auto *cte0 = CLIO_CTE_CLIENT;
+    clio::cte::filesystem::ShmFileRecord mrec;
+    if (cfs != nullptr && cte0 != nullptr &&
+        cfs->TryGetFileRecordShm(p, &mrec)) {
+      if (!mrec.Exists()) {
+        return -ENOENT;  // tombstone: authoritative absence, no task
+      }
+      if (!(mrec.flags_ & (clio::cte::filesystem::kShmFileNoFastPath |
+                           clio::cte::filesystem::kShmFilePendingAppend))) {
+        clio::cte::core::ShmTagRecord trec;
+        clio::cte::core::TagId mtag(mrec.tag_id_.major_, mrec.tag_id_.minor_);
+        if (cte0->TryGetTagRecordShm(mtag, &trec)) {
+          stbuf->st_uid = (mrec.uid_ != clio::cte::filesystem::kShmFileNoOverride)
+                              ? static_cast<uid_t>(mrec.uid_) : getuid();
+          stbuf->st_gid = (mrec.gid_ != clio::cte::filesystem::kShmFileNoOverride)
+                              ? static_cast<gid_t>(mrec.gid_) : getgid();
+          stbuf->st_ino = static_cast<ino_t>(mrec.ino_);
+          const bool m_have_mode =
+              (mrec.mode_ != clio::cte::filesystem::kShmFileNoOverride);
+          const unsigned int m_perm = mrec.mode_ & 07777u;
+          if (mrec.IsDir()) {
+            stbuf->st_mode = S_IFDIR | (m_have_mode ? m_perm : 0755u);
+            stbuf->st_nlink = 2;
+            stbuf->st_size = 0;
+          } else {
+            stbuf->st_mode = S_IFREG | (m_have_mode ? m_perm : 0644u);
+            stbuf->st_nlink = 1;  // hardlinked records are refused above
+            clio::run::u64 sz = mrec.size_;
+            clio::run::u64 pend = clio::cte::core::Client::DeferMaxPendingEnd(
+                clio::cte::filesystem::Client::FileKey(p));
+            if (pend > sz) sz = pend;
+            clio::run::u64 hw = HiwaterFor(p);
+            if (hw > sz) sz = hw;
+            stbuf->st_size = static_cast<cte_off_t>(sz);
+          }
+          stbuf->st_blksize =
+              static_cast<decltype(stbuf->st_blksize)>(4096);
+          stbuf->st_blocks = static_cast<decltype(stbuf->st_blocks)>(
+              (static_cast<uint64_t>(stbuf->st_size) + 511) / 512);
+          // Natural times from the tag record; utimens overrides win for
+          // atime/mtime, ctime can only advance (same rules as the task
+          // path).
+          clio::run::u64 m_ct = trec.last_changed_;
+          clio::run::u64 m_mt = trec.last_modified_;
+          clio::run::u64 m_at = trec.last_read_;
+          if (mrec.ov_mtime_ns_ != 0) m_mt = mrec.ov_mtime_ns_;
+          if (mrec.ov_atime_ns_ != 0) m_at = mrec.ov_atime_ns_;
+          if (mrec.ov_ctime_ns_ > m_ct) m_ct = mrec.ov_ctime_ns_;
+          if (m_ct != 0)
+            NsBitsToTimespec(m_ct, stbuf->st_ctim.tv_sec,
+                             stbuf->st_ctim.tv_nsec);
+          if (m_mt != 0)
+            NsBitsToTimespec(m_mt, stbuf->st_mtim.tv_sec,
+                             stbuf->st_mtim.tv_nsec);
+          if (m_at != 0)
+            NsBitsToTimespec(m_at, stbuf->st_atim.tv_sec,
+                             stbuf->st_atim.tv_nsec);
+          return 0;
+        }
+      }
+    }
+  }
+
+  // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
   auto t = cfs->AsyncGetattr(p);
   t.Wait();
   if (t->GetReturnCode() != 0 || t->exists_ == 0) {

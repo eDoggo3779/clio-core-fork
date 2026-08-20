@@ -1306,6 +1306,10 @@ clio::run::TaskResume Runtime::Link(clio::run::shared_ptr<LinkTask> &task) {
   }
   if (a->found_ == 1) {
     CLIO_FS_TOUCH_DIR(ParentDir(link));  // new link => parent dir mtime/ctime
+    // The target's mirror record would report nlink=1 to the mirror-first
+    // stat; hardlinked files are rare, so refuse the fast path for them
+    // rather than mirroring alias counts.
+    MirrorRefuse(target);
     task->return_code_ = 0;
   } else {
     task->return_code_ = ENOENT;
