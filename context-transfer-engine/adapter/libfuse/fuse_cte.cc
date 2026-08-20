@@ -364,6 +364,14 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
     conn->max_write = 1u << 20;
   }
 
+  // This adapter always creates directories explicitly (mkdir plants the
+  // marker), so the chimod's implicit-dir child scan — the costliest part
+  // of a negative lookup — is provably unnecessary here. Opt out before the
+  // embedded runtime starts. Respect an explicit user setting.
+  if (getenv("CLIO_CFS_NO_IMPLICIT_DIRS") == nullptr) {
+    setenv("CLIO_CFS_NO_IMPLICIT_DIRS", "1", 0);
+  }
+
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
     fprintf(stderr, "ERROR: CLIO_INIT failed\n");

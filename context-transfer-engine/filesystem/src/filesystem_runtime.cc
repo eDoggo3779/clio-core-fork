@@ -833,7 +833,17 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
       CLIO_CO_AWAIT(qm);
       is_directory = (qm->GetReturnCode() == 0 && !qm->results_.empty());
     }
-    if (!is_directory) {
+    // Implicit-dir fallback: a MARKERLESS dir (created only as a descendant
+    // file's parent) needs a child scan through the trigram index — the
+    // most expensive query this handler owns, and on a checkout it ran for
+    // EVERY about-to-be-created file's negative lookup. The FUSE adapter
+    // always mkdir's (markers exist), so it disables the scan with
+    // CLIO_CFS_NO_IMPLICIT_DIRS=1; other pathways keep it.
+    static const bool implicit_dirs = [] {
+      const char *e = std::getenv("CLIO_CFS_NO_IMPLICIT_DIRS");
+      return e == nullptr || *e != '1';
+    }();
+    if (!is_directory && implicit_dirs) {
       std::string child_re = "^" + EscapeExact(dir) + "/[^/]+$";
       auto qc = cte_.AsyncTagQuery(child_re, 1, clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(qc);
