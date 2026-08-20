@@ -3786,31 +3786,71 @@ clio::run::TaskResume Runtime::MultiPutBlob(
     task->SetReturnCode(batch.descs_.empty() ? 0 : 1);
     CLIO_CO_RETURN;
   }
-  for (size_t bi = 0; bi < batch.size(); ++bi) {
-    const auto &d = batch.descs_[bi];
-    if (!batch.RecordValid(bi)) {
-      if (task->first_rc_ == 0) task->first_rc_ = 2;  // malformed batch entry
+  for (size_t bi = 0; bi < batch.size();) {
+    // RUN of consecutive records for one (tag, blob), shipped as ONE nested
+    // VECTORED put (issue #820): one write-token acquire, one blob sizing,
+    // one metadata mutation for the whole run instead of one each, with
+    // segments applied in list order — the same last-writer-wins the scalar
+    // sequence gave. Same-key streams and sieve sweeps (#1007) produce
+    // exactly these runs; distinct-key batches degrade to runs of one and
+    // keep the scalar sub-put unchanged.
+    size_t re = bi + 1;
+    while (re < batch.size() &&
+           batch.descs_[re].tag_id_ == batch.descs_[bi].tag_id_ &&
+           batch.descs_[re].blob_name_ == batch.descs_[bi].blob_name_) {
+      ++re;
+    }
+    // Collect the run's valid records. Null-allocator ShmPtr = absolute
+    // in-process address of the slice; the put's bdev write reads it
+    // directly (same contract as the private put's co-located zero-copy
+    // path).
+    std::vector<size_t> valid;
+    valid.reserve(re - bi);
+    for (size_t i = bi; i < re; ++i) {
+      if (batch.RecordValid(i)) {
+        valid.push_back(i);
+      } else if (task->first_rc_ == 0) {
+        task->first_rc_ = 2;  // malformed batch entry
+      }
+    }
+    if (valid.empty()) {
+      bi = re;
       continue;
     }
-    // Null-allocator ShmPtr = absolute in-process address of the slice; the
-    // put's bdev write reads it directly (same contract as the private put's
-    // co-located zero-copy path).
-    ctp::ipc::ShmPtr<> slice = batch.RecordSlice(bi);
+    const auto &d0 = batch.descs_[valid.front()];
     // The batch context applies to every record's nested put (replica
     // addressing, transform flags, persistence, score floors) — batches have
     // scalar-equivalent semantics, they are not context-less writes.
-    auto sub = ipc_manager->NewTask<PutBlobTask>(
-        clio::run::CreateTaskId(), task->pool_id_,
-        clio::run::PoolQuery::Local(), d.tag_id_, d.blob_name_, d.offset_,
-        d.size_, slice, /*score=*/-1.0f, task->context_, /*flags=*/0);
+    clio::run::shared_ptr<PutBlobTask> sub;
+    if (valid.size() == 1) {
+      sub = ipc_manager->NewTask<PutBlobTask>(
+          clio::run::CreateTaskId(), task->pool_id_,
+          clio::run::PoolQuery::Local(), d0.tag_id_, d0.blob_name_,
+          d0.offset_, d0.size_, batch.RecordSlice(valid.front()),
+          /*score=*/-1.0f, task->context_, /*flags=*/0);
+    } else {
+      sub = ipc_manager->NewTask<PutBlobTask>(
+          clio::run::CreateTaskId(), task->pool_id_,
+          clio::run::PoolQuery::Local(), d0.tag_id_, d0.blob_name_,
+          static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0),
+          ctp::ipc::ShmPtr<>::GetNull(), /*score=*/-1.0f, task->context_,
+          /*flags=*/0);
+      auto *t = sub.get();
+      for (size_t i : valid) {
+        const auto &d = batch.descs_[i];
+        t->segments_.push_back(
+            BlobSegment(d.offset_, d.size_, batch.RecordSlice(i)));
+      }
+    }
     sub.get()->BeginRunContext();
     CLIO_CO_AWAIT(PutBlob(sub));
     int rc = sub->GetReturnCode();
     if (rc == 0) {
-      task->num_ok_++;
+      task->num_ok_ += static_cast<clio::run::u32>(valid.size());
     } else if (task->first_rc_ == 0) {
       task->first_rc_ = rc;
     }
+    bi = re;
   }
   task->SetReturnCode(task->first_rc_ == 0 ? 0 : task->first_rc_);
   CLIO_CO_RETURN;
