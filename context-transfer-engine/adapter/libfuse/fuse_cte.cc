@@ -565,6 +565,26 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   return nullptr;
 }
 
+// Client bootstrap for alternate front ends (the low-level adapter): same
+// sequence as cte_fuse_init's tail. Safe to call once from any init hook.
+int cte_fuse_bootstrap_clients() {
+  if (getenv("CLIO_CFS_NO_IMPLICIT_DIRS") == nullptr) {
+    setenv("CLIO_CFS_NO_IMPLICIT_DIRS", "1", 0);
+  }
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
+    fprintf(stderr, "ERROR: CLIO_INIT failed\n");
+    return -1;
+  }
+  if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
+    fprintf(stderr, "ERROR: filesystem client init failed\n");
+    return -1;
+  }
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
+    fprintf(stderr, "WARNING: CTE core client init failed; statfs capacity=0\n");
+  }
+  return 0;
+}
+
 static void cte_fuse_destroy(void *private_data) {
   (void)private_data;
   clio::run::CLIO_RUNTIME_FINALIZE();
@@ -597,7 +617,7 @@ static inline void NsBitsToTimespec(clio::run::u64 bits, time_t &sec,
   nsec = static_cast<NsecT>(rem);
 }
 
-static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
+int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
                                  struct fuse_file_info *fi) {
   (void)fi;
   memset(stbuf, 0, sizeof(*stbuf));
@@ -858,7 +878,7 @@ static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
 }
 #endif
 
-static int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
+int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
                             struct fuse_file_info *fi) {
   (void)fi;
   // Translate the POSIX (atime, mtime) timespec pair into the chimod's flag
@@ -937,7 +957,7 @@ static int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
 // callers (e.g. mount's mtab updater in generic/089) still succeed. AsyncChmod
 // resolves the path and returns ENOENT for a missing file, so no separate
 // existence probe is needed.
-static int cte_fuse_chmod(const char *path, cte_mode_t mode,
+int cte_fuse_chmod(const char *path, cte_mode_t mode,
                           struct fuse_file_info *fi) {
   (void)fi;
   auto *cfs = CLIO_CFS_CLIENT;
@@ -975,7 +995,7 @@ static int cte_fuse_chmod(const char *path, cte_mode_t mode,
 // getattr (files carry no stored POSIX owner otherwise). A uid/gid of
 // (uid_t)-1 == 0xFFFFFFFF means "leave that field unchanged" (POSIX), which is
 // exactly the chimod's "unchanged" sentinel, so no translation is needed.
-static int cte_fuse_chown(const char *path, uid_t uid, gid_t gid,
+int cte_fuse_chown(const char *path, uid_t uid, gid_t gid,
                           struct fuse_file_info *fi) {
   (void)fi;
   auto *cfs = CLIO_CFS_CLIENT;
@@ -997,7 +1017,7 @@ using ClioFuseFillDirT = fuse_darwin_fill_dir_t;
 using ClioFuseFillDirT = fuse_fill_dir_t;
 #endif
 
-static int cte_fuse_readdir(const char *path, void *buf,
+int cte_fuse_readdir(const char *path, void *buf,
                             ClioFuseFillDirT filler, cte_off_t offset,
                             struct fuse_file_info *fi,
                             enum fuse_readdir_flags flags) {
@@ -1048,7 +1068,7 @@ static int cte_fuse_readdir(const char *path, void *buf,
   return 0;
 }
 
-static int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
+int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
   (void)mode;
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncMkdir(std::string(path));
@@ -1057,7 +1077,7 @@ static int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
   return rc == 0 ? 0 : -rc;
 }
 
-static int cte_fuse_rmdir(const char *path) {
+int cte_fuse_rmdir(const char *path) {
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncRmdir(std::string(path));
   t.Wait();
@@ -1088,7 +1108,7 @@ static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
   }
 }
 
-static int cte_fuse_create(const char *path, cte_mode_t mode,
+int cte_fuse_create(const char *path, cte_mode_t mode,
                            struct fuse_file_info *fi) {
   std::string p(path);
   auto *cfs = CLIO_CFS_CLIENT;
@@ -1150,7 +1170,7 @@ static int cte_fuse_create(const char *path, cte_mode_t mode,
   return 0;
 }
 
-static int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
+int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   std::string p(path);
   auto *cfs = CLIO_CFS_CLIENT;
   // A minted create that has not flushed yet is invisible to the chimod; a
@@ -1193,7 +1213,7 @@ static int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
 // (close(2)) deliberately does NOT drain — the kernel page cache makes the
 // same trade — but it does surface any failure a completed deferred write
 // already latched against the file.
-static int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
+int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
   const std::string p = handle ? handle->path : std::string(path ? path : "");
   if (p.empty()) return 0;
@@ -1202,7 +1222,7 @@ static int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   return err != 0 ? -err : 0;
 }
 
-static int cte_fuse_fsync(const char *path, int /*datasync*/,
+int cte_fuse_fsync(const char *path, int /*datasync*/,
                           struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
   const std::string p = handle ? handle->path : std::string(path ? path : "");
@@ -1219,7 +1239,7 @@ static int cte_fuse_fsync(const char *path, int /*datasync*/,
   return 0;
 }
 
-static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
+int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
   (void)path;
   auto *handle = GetHandle(fi);
   if (!handle) return 0;
@@ -1285,7 +1305,7 @@ static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
 // Read / Write — delegated to the chimod's page-based I/O
 // ============================================================================
 
-static int cte_fuse_read(const char *path, char *buf, size_t size,
+int cte_fuse_read(const char *path, char *buf, size_t size,
                          cte_off_t offset, struct fuse_file_info *fi) {
   (void)path;
   auto *handle = GetHandle(fi);
@@ -1338,7 +1358,7 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
   return static_cast<int>(got);
 }
 
-static int cte_fuse_write(const char *path, const char *buf, size_t size,
+int cte_fuse_write(const char *path, const char *buf, size_t size,
                           cte_off_t offset, struct fuse_file_info *fi) {
   (void)path;
   auto *handle = GetHandle(fi);
@@ -1384,7 +1404,7 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
 // Unlink / Truncate
 // ============================================================================
 
-static int cte_fuse_unlink(const char *path) {
+int cte_fuse_unlink(const char *path) {
   auto *cfs = CLIO_CFS_CLIENT;
   // Deferred writes racing the unlink would land on a deleted file and latch
   // spurious errors; drain first (no-op unless this file has writes in
@@ -1400,7 +1420,7 @@ static int cte_fuse_unlink(const char *path) {
   return rc == 0 ? 0 : -rc;
 }
 
-static int cte_fuse_truncate(const char *path, cte_off_t size,
+int cte_fuse_truncate(const char *path, cte_off_t size,
                              struct fuse_file_info *fi) {
   (void)fi;
   auto *cfs = CLIO_CFS_CLIENT;
@@ -1512,7 +1532,7 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
 }
 #endif  // __linux__
 
-static int cte_fuse_link(const char *from, const char *to) {
+int cte_fuse_link(const char *from, const char *to) {
   EnsureCreated(std::string(from));
   EnsureCreated(std::string(to));
   // Hard link `to` -> existing file `from`. The chimod binds both names to the
@@ -1524,7 +1544,7 @@ static int cte_fuse_link(const char *from, const char *to) {
   return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes
 }
 
-static int cte_fuse_symlink(const char *target, const char *path) {
+int cte_fuse_symlink(const char *target, const char *path) {
   // Create a symlink at `path` pointing at `target`. The chimod stores the
   // target string in a reserved marker blob under `path`'s tag.
   auto *cfs = CLIO_CFS_CLIENT;
@@ -1534,7 +1554,7 @@ static int cte_fuse_symlink(const char *target, const char *path) {
   return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes
 }
 
-static int cte_fuse_readlink(const char *path, char *buf, size_t size) {
+int cte_fuse_readlink(const char *path, char *buf, size_t size) {
   // Read the symlink target into `buf` (NUL-terminated). FUSE readlink returns
   // 0 on success (not the length).
   if (size == 0) {
@@ -1684,7 +1704,7 @@ static int cte_fuse_removexattr(const char *path, const char *name) {
 #define RENAME_EXCHANGE (1 << 1)  // ditto; referenced by the unsupported-flag test
 #endif
 
-static int cte_fuse_rename(const char *from, const char *to,
+int cte_fuse_rename(const char *from, const char *to,
                            unsigned int flags) {
   auto *cfs = CLIO_CFS_CLIENT;
   // Deferred writes are keyed by PATH; a rename racing them would let the
@@ -1741,7 +1761,7 @@ static int cte_fuse_rename(const char *from, const char *to,
 // Reporting a non-zero capacity also matters operationally: a 0-block fs is
 // hidden by `df` (which lists no path), which breaks tools that probe free
 // space and xfstests' mount detection.
-static int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
+int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
   (void)path;
   std::memset(stbuf, 0, sizeof(*stbuf));
   constexpr fsblkcnt_t kBlockSize = 4096;

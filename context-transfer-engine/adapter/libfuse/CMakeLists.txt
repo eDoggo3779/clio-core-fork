@@ -76,6 +76,30 @@ target_link_libraries(clio_cte_fuse
     clio_cte_core_client
     ctp::cxx)
 
+# EXPERIMENTAL low-level adapter (issue #1007 follow-up): same delegated
+# operations, low-level session — attrs ride in create/lookup replies and
+# readdirplus, eliminating the per-create GETATTR round trips. Linux-only.
+if(NOT WIN32)
+  add_executable(clio_cte_fuse_ll
+      fuse_cte.cc
+      fuse_cte_ll.cc)
+  target_compile_definitions(clio_cte_fuse_ll PRIVATE
+      FUSE_USE_VERSION=35
+      CLIO_CTE_FUSE_ENABLED)
+  target_include_directories(clio_cte_fuse_ll PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CLIO_CTE_ROOT}
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/filesystem/include
+      ${FUSE3_INCLUDE_DIRS}
+      ${FUSE3_INCLUDEDIR})
+  target_link_directories(clio_cte_fuse_ll PRIVATE ${FUSE3_LIBRARY_DIRS})
+  target_link_libraries(clio_cte_fuse_ll
+      ${FUSE3_LIBRARIES}
+      clio_cte_filesystem_client
+      clio_cte_core_client
+      ctp::cxx)
+endif()
+
 install(TARGETS clio_cte_fuse
     RUNTIME DESTINATION bin)
 # Also ship in the pip wheel: scikit-build-core installs only COMPONENT
