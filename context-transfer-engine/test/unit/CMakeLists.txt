@@ -939,6 +939,41 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# Client-side data sieving (issue #1007). The same binary runs twice: once
+# with the sieve (default-on) and once with CLIO_CTE_PUT_SIEVE=0, so every
+# case is also a kill-switch parity check against the plain batch pipeline.
+add_executable(test_put_sieve test_put_sieve.cc)
+target_link_libraries(test_put_sieve
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_put_sieve
+    COMMAND test_put_sieve)
+add_test(NAME cte_put_sieve_disabled
+    COMMAND test_put_sieve)
+
+set_tests_properties(
+    cte_put_sieve
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;sieve;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+set_tests_properties(
+    cte_put_sieve_disabled
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;sieve;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;CLIO_CTE_PUT_SIEVE=0"
+)
+
 # Blob replicas + replication chimod (issue #886). Gated on the module: the
 # mechanism tests also exercise the policy verbs, and the module is ON by
 # default, so the gate only matters for trimmed builds.

@@ -438,6 +438,7 @@ private:
   /** Project a BlobInfo into its cacheable form. Returns false when the blob
    *  cannot be represented (too many blocks), in which case it is not
    *  cached and clients keep using the RPC path for it. */
+  void MirrorTagShm(const TagId &tag_id, const TagInfo &info);
   bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
 
   /** Mirror one blob into the SHM cache. No-op when caching is off. */
