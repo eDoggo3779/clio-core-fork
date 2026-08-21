@@ -70,6 +70,9 @@ inline std::string ParentDir(const std::string &p) {
 // and just bumps the tag's mtime/ctime without touching any data.
 inline const char *TsTouchBlob() { return "__clio_ts_touch__"; }
 
+// Ctime-ONLY variant (link(2)): nlink changes ctime but never mtime.
+inline const char *TsCtimeBlob() { return "__clio_ts_ctime__"; }
+
 // Reserved blob under a symlink's tag holding the link target string. Its
 // presence (non-empty) is what marks a tag as a symlink (S_IFLNK) at getattr.
 inline const char *SymlinkMarker() { return "__clio_symlink__"; }
@@ -1083,20 +1086,32 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
         clio::run::u64 page_tail_end =
             std::min(kFsPageSize,
                      (t_old - boundary_page * kFsPageSize));
-        if (page_tail_end > boundary_off) {
-          clio::run::u64 zlen = page_tail_end - boundary_off;
-          auto *zipc = CLIO_IPC;
+        // CHUNKED, and a failed chunk FAILS the truncate: silently skipping
+        // (the old single up-to-1MB allocation under SHM pressure) left the
+        // stale tail alive, and fsx-dio read years-old bytes inside a hole.
+        clio::run::u64 zoff = boundary_off;
+        constexpr clio::run::u64 kZChunk = 64 * 1024;
+        auto *zipc = CLIO_IPC;
+        while (zoff < page_tail_end) {
+          clio::run::u64 zlen = std::min(kZChunk, page_tail_end - zoff);
           ctp::ipc::FullPtr<char> zbuf = zipc->AllocateBuffer(zlen);
-          if (!zbuf.IsNull()) {
-            std::memset(zbuf.ptr_, 0, zlen);
-            auto zp = cte_.AsyncPutBlob(t_tag, std::to_string(boundary_page),
-                                        boundary_off, zlen,
-                                        zbuf.shm_.template Cast<void>(),
-                                        -1.0f, clio::cte::core::Context(), 0u,
-                                        clio::run::PoolQuery::Dynamic());
-            CLIO_CO_AWAIT(zp);
-            zipc->FreeBuffer(zbuf);
+          if (zbuf.IsNull()) {
+            task->return_code_ = EIO;
+            CLIO_CO_RETURN;
           }
+          std::memset(zbuf.ptr_, 0, zlen);
+          auto zp = cte_.AsyncPutBlob(t_tag, std::to_string(boundary_page),
+                                      zoff, zlen,
+                                      zbuf.shm_.template Cast<void>(),
+                                      -1.0f, clio::cte::core::Context(), 0u,
+                                      clio::run::PoolQuery::Dynamic());
+          CLIO_CO_AWAIT(zp);
+          zipc->FreeBuffer(zbuf);
+          if (zp->GetReturnCode() != 0) {
+            task->return_code_ = EIO;
+            CLIO_CO_RETURN;
+          }
+          zoff += zlen;
         }
       }
       clio::run::u64 last_page = (t_old == 0) ? 0 : (t_old - 1) / kFsPageSize;
@@ -1589,6 +1604,19 @@ clio::run::TaskResume Runtime::Link(clio::run::shared_ptr<LinkTask> &task) {
   }
   if (a->found_ == 1) {
     CLIO_FS_TOUCH_DIR(ParentDir(link));  // new link => parent dir mtime/ctime
+    // link(2) changes the FILE's ctime too (nlink changed) — stamp it via
+    // the ctime-only sentinel, or generic/236's stat sees it unchanged.
+    {
+      auto tt = cte_.AsyncGetOrCreateTag(target,
+                                         clio::cte::core::TagId::GetNull(),
+                                         clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(tt);
+      if (tt->GetReturnCode() == 0) {
+        auto tc = cte_.AsyncTruncateBlob(tt->tag_id_, TsCtimeBlob(), 0,
+                                         clio::run::PoolQuery::Dynamic());
+        CLIO_CO_AWAIT(tc);
+      }
+    }
     // The target's mirror record would report nlink=1 to the mirror-first
     // stat; hardlinked files are rare, so refuse the fast path for them
     // rather than mirroring alias counts.
@@ -1912,7 +1940,7 @@ clio::run::TaskResume Runtime::Utimens(clio::run::shared_ptr<UtimensTask> &task)
   const bool m_set = (task->flags_ & 0x2u) != 0;
   const bool a_now = (task->flags_ & 0x4u) != 0;
   const bool m_now = (task->flags_ & 0x8u) != 0;
-  const clio::run::u64 now = clio::cte::core::GetCurrentTimeNs();
+  const clio::run::u64 now = clio::cte::core::GetWallTimeNs();
 
   // A directory isn't tracked in by_path_ (that map holds files, which getattr
   // reports as regular). For a dir, just bump its tag's ctime/mtime via a touch
@@ -2049,7 +2077,7 @@ clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
     if (task->gid_ != 0xFFFFFFFFu) fi->set_gid_ = task->gid_;
     // chmod rides the same task (uid/gid unchanged): store the permission bits.
     if (task->mode_ != 0xFFFFFFFFu) fi->set_mode_ = task->mode_ & 07777u;
-    fi->set_ctime_ = clio::cte::core::GetCurrentTimeNs();  // chown/chmod advances ctime
+    fi->set_ctime_ = clio::cte::core::GetWallTimeNs();  // chown/chmod advances ctime
     MirrorFile(path, *fi);
   }
   task->return_code_ = 0;

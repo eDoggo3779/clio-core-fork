@@ -106,6 +106,23 @@ inline Timestamp GetCurrentTimeNs() {
 }
 #endif
 
+/** UTC WALL-clock nanoseconds. For the POSIX-visible tag timestamps
+ *  (mtime/ctime served to stat) — GetCurrentTimeNs above is STEADY-clock
+ *  (process-uptime-like) and reads as 1970-era when interpreted as an
+ *  epoch: fine for relative bookkeeping (scores, LRU), wrong for stat.
+ *  Host-only paths use this; a device pass has no wall clock and the tag
+ *  metadata never lives there. */
+inline Timestamp GetWallTimeNs() {
+#if CTP_IS_GPU_COMPILER && defined(__CUDA_ARCH__)
+  return 0;
+#elif CTP_IS_SYCL_COMPILER && CTP_IS_DEVICE_PASS
+  return 0;
+#else
+  return static_cast<clio::run::u64>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+#endif
+}
+
 /**
  * CreateParams for CTE Core chimod
  * Contains configuration parameters for CTE container creation

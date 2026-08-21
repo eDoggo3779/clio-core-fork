@@ -1846,23 +1846,84 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       // (offset == old_blob_size) and overwrites (offset < old_blob_size)
       // create no hole.
       if (offset > old_blob_size) {
-        clio::run::u64 hole = offset - old_blob_size;
+        // CHUNKED (generic/112): the old whole-hole AllocateBuffer could be
+        // ~1 MiB and fail under SHM pressure — returning EIO AFTER ExtendBlob
+        // had already grown the blob left recycled, unzeroed blocks exposed
+        // as the hole's content. 64 KiB chunks make the allocation reliably
+        // small and bound what a mid-way failure can leave unzeroed.
         auto *ipc_mgr = CLIO_IPC;
-        ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(hole);
-        if (zbuf.IsNull()) {
-          task->return_code_ = 6;
-          CLIO_CO_RETURN;
+        clio::run::u64 zcur = old_blob_size;
+        while (zcur < offset) {
+          constexpr clio::run::u64 kHoleChunk = 64 * 1024;
+          clio::run::u64 zlen = std::min(kHoleChunk, offset - zcur);
+          ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(zlen);
+          if (zbuf.IsNull()) {
+            task->return_code_ = 6;
+            CLIO_CO_RETURN;
+          }
+          std::memset(zbuf.ptr_, 0, zlen);
+          clio::run::u32 zero_result = 0;
+          CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_,
+                                      zbuf.shm_.template Cast<void>(), zlen,
+                                      zcur, zero_result, hint_idx,
+                                      hint_off));
+          ipc_mgr->FreeBuffer(zbuf);
+          if (zero_result != 0) {
+            task->return_code_ = 20 + zero_result;
+            CLIO_CO_RETURN;
+          }
+          zcur += zlen;
         }
-        std::memset(zbuf.ptr_, 0, hole);
-        clio::run::u32 zero_result = 0;
-        CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_,
-                                    zbuf.shm_.template Cast<void>(), hole,
-                                    old_blob_size, zero_result, hint_idx,
-                                    hint_off));
-        ipc_mgr->FreeBuffer(zbuf);
-        if (zero_result != 0) {
-          task->return_code_ = 20 + zero_result;
-          CLIO_CO_RETURN;
+      }
+
+      // Step 2.6 (vectored): zero the INTERIOR gaps between segments that
+      // lie at or above the old end-of-blob. The extend above sized the blob
+      // to the UNION of the segments, but recycled blocks are not zero — a
+      // batch of two non-contiguous writes past the old end (fsx generic/091:
+      // two fallocate ZERO_RANGEs coalesced into one deferred put) otherwise
+      // exposes stale block bytes between them, where POSIX requires hole
+      // zeros. Gaps BELOW the old end keep their old bytes: that is
+      // partial-modify semantics, not a hole.
+      if constexpr (TaskT::kSupportsVectored) {
+        if (vectored && offset + size > old_blob_size) {
+          std::vector<std::pair<clio::run::u64, clio::run::u64>> zsegs;
+          zsegs.reserve(task->segments_.size());
+          for (size_t i = 0; i < task->segments_.size(); ++i) {
+            const auto &seg = task->segments_[i];
+            zsegs.emplace_back(seg.blob_off_, seg.blob_off_ + seg.size_);
+          }
+          std::sort(zsegs.begin(), zsegs.end());
+          clio::run::u64 zcursor = std::max(offset, old_blob_size);
+          const clio::run::u64 zuhi = offset + size;
+          auto *zipc_mgr = CLIO_IPC;
+          for (size_t i = 0; i <= zsegs.size() && zcursor < zuhi; ++i) {
+            clio::run::u64 gap_end = (i < zsegs.size())
+                                         ? std::min(zsegs[i].first, zuhi)
+                                         : zuhi;
+            while (zcursor < gap_end) {
+              constexpr clio::run::u64 kGapChunk = 64 * 1024;
+              clio::run::u64 zlen = std::min(kGapChunk, gap_end - zcursor);
+              ctp::ipc::FullPtr<char> gzbuf = zipc_mgr->AllocateBuffer(zlen);
+              if (gzbuf.IsNull()) {
+                task->return_code_ = 6;
+                CLIO_CO_RETURN;
+              }
+              std::memset(gzbuf.ptr_, 0, zlen);
+              clio::run::u32 gz_result = 0;
+              CLIO_CO_AWAIT(ModifyExistingData(
+                  blob_info_ptr->blocks_, gzbuf.shm_.template Cast<void>(),
+                  zlen, zcursor, gz_result, hint_idx, hint_off));
+              zipc_mgr->FreeBuffer(gzbuf);
+              if (gz_result != 0) {
+                task->return_code_ = 20 + gz_result;
+                CLIO_CO_RETURN;
+              }
+              zcursor += zlen;
+            }
+            if (i < zsegs.size() && zsegs[i].second > zcursor) {
+              zcursor = zsegs[i].second;
+            }
+          }
         }
       }
 
@@ -1992,16 +2053,17 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         // tag-owning container and isn't this container's concern.
         TagInfo seed;
         seed.tag_id_ = tag_id;
-        seed.last_modified_ = now;
+        seed.last_modified_ = GetWallTimeNs();
         seed.last_read_ = now;
-        seed.last_changed_ = now;
+        seed.last_changed_ = seed.last_modified_;
         seed.total_size_ = 0;
         tag_info_ptr = std::make_shared<TagInfo>(seed);
         tag_id_to_info_.insert_or_assign(tag_id, tag_info_ptr);
       }
       if (tag_info_ptr) {
-        tag_info_ptr->last_modified_ = now;
-        tag_info_ptr->last_changed_ = now;  // size change => ctime bump
+        tag_info_ptr->last_modified_ = GetWallTimeNs();
+        tag_info_ptr->last_changed_ =
+            tag_info_ptr->last_modified_;  // size change => ctime bump
         if (size_change >= 0) {
           tag_info_ptr->total_size_ += static_cast<clio::run::u64>(size_change);
         } else {
@@ -3334,6 +3396,7 @@ clio::run::TaskResume Runtime::ReorganizeBlobImpl(
 // Thin dispatchers over the *Impl<TaskT> templates above. Defining them in this
 // TU instantiates each template for both the priv::string task and its
 // fixed_string POD variant (issue #556) — the handler logic is written once.
+
 clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task) {
   return PutBlobImpl(task);
 }
@@ -3507,8 +3570,8 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
         // Deleting page-blobs is part of a truncate-down: bump BOTH mtime
         // (content shrank) and ctime (metadata changed).
         auto now = GetCurrentTimeNs();
-        tag_info_ptr->last_modified_ = now;
-        tag_info_ptr->last_changed_ = now;
+        tag_info_ptr->last_modified_ = GetWallTimeNs();
+        tag_info_ptr->last_changed_ = tag_info_ptr->last_modified_;
         MirrorTagShm(tag_id, *tag_info_ptr);
       }
     }
@@ -3911,8 +3974,12 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
       // truncate-up, which reserves no storage), so bump mtime/ctime.
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
-        auto now = GetCurrentTimeNs();
-        tag_info_ptr->last_modified_ = now;
+        auto now = GetWallTimeNs();
+        // The ctime-only sentinel (link(2): the FILE's ctime changes because
+        // nlink changed, but its mtime must NOT — generic/236 checks both).
+        if (blob_name != "__clio_ts_ctime__") {
+          tag_info_ptr->last_modified_ = now;
+        }
         tag_info_ptr->last_changed_ = now;
         MirrorTagShm(tag_id, *tag_info_ptr);
       }
@@ -3975,8 +4042,8 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
         // Truncate changes file content and size, so POSIX bumps BOTH mtime
         // (last_modified_) and ctime (last_changed_).
         auto now = GetCurrentTimeNs();
-        tag_info_ptr->last_modified_ = now;
-        tag_info_ptr->last_changed_ = now;
+        tag_info_ptr->last_modified_ = GetWallTimeNs();
+        tag_info_ptr->last_changed_ = tag_info_ptr->last_modified_;
         MirrorTagShm(tag_id, *tag_info_ptr);
       }
     }
@@ -4085,7 +4152,7 @@ clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &t
         }
         tag_name_to_id_.insert_or_assign(new_rel, tag_id);
         info->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, new_rel);
-        info->last_modified_ = GetCurrentTimeNs();
+        info->last_modified_ = GetWallTimeNs();
         info->last_changed_ = info->last_modified_;  // rename => ctime bump
 
         // Re-key this tag and its descendants in the search index from old_abs
@@ -4124,7 +4191,7 @@ clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &t
       std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
       if (info != nullptr) {
         info->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, new_name);
-        info->last_modified_ = GetCurrentTimeNs();
+        info->last_modified_ = GetWallTimeNs();
         info->last_changed_ = info->last_modified_;  // rename => ctime bump
       }
     }
@@ -4215,7 +4282,7 @@ clio::run::TaskResume Runtime::GetOrCreateTagAlias(
             info->aliases_.push_back(
                 clio::run::priv::string(CLIO_PRIV_ALLOC, alias_key));
           }
-          info->last_modified_ = GetCurrentTimeNs();
+          info->last_modified_ = GetWallTimeNs();
           info->last_changed_ = info->last_modified_;  // link added => ctime
         }
       }
@@ -4329,8 +4396,8 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
             break;
           }
         }
-        tag_info_ptr->last_changed_ = GetCurrentTimeNs();  // unlink => ctime
-        tag_info_ptr->last_modified_ = GetCurrentTimeNs();
+        tag_info_ptr->last_changed_ = GetWallTimeNs();  // unlink => ctime
+        tag_info_ptr->last_modified_ = tag_info_ptr->last_changed_;
       }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
@@ -4356,8 +4423,8 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         tag_name_to_id_.erase(resolved_key);
         tag_search_.Delete(del_abs);
         tinfo->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, new_canonical);
-        tinfo->last_changed_ = GetCurrentTimeNs();   // unlink => ctime
-        tinfo->last_modified_ = GetCurrentTimeNs();
+        tinfo->last_changed_ = GetWallTimeNs();   // unlink => ctime
+        tinfo->last_modified_ = tinfo->last_changed_;
         task->return_code_ = 0;
         CLIO_CO_RETURN;
       }
@@ -4833,7 +4900,7 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   TagInfo tag_info;
   tag_info.tag_name_ = tag_name;
   tag_info.tag_id_ = tag_id;
-  auto creation_now = GetCurrentTimeNs();
+  auto creation_now = GetWallTimeNs();
   tag_info.last_changed_ = creation_now;   // ctime
   tag_info.last_modified_ = creation_now;  // mtime
   tag_info.last_read_ = creation_now;      // atime

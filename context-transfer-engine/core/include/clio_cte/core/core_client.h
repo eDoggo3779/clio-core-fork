@@ -1083,6 +1083,31 @@ class Client : public clio::run::ContainerClient {
       std::lock_guard<std::mutex> lk(sh.mtx_);
       return sh.per_key_.find(key) != sh.per_key_.end();
     }
+    /** True iff a put still in flight for `key` (other than `excl_seq`)
+     *  overlaps [lo, hi). Conservative: an in-flight put whose payload
+     *  pointer was retired (no extent listed) reports overlap regardless of
+     *  range, because its range is unknowable here. */
+    bool KeyOverlapsPending(clio::run::u64 key, clio::run::u64 lo,
+                            clio::run::u64 hi, clio::run::u64 excl_seq) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      auto it = sh.per_key_.find(key);
+      if (it == sh.per_key_.end()) {
+        return false;
+      }
+      const KeyPending &kp = it->second;
+      for (const auto &e : kp.extents_) {
+        if (e.seq_ == excl_seq) {
+          continue;
+        }
+        if (e.offset_ < hi && lo < e.offset_ + e.size_) {
+          return true;
+        }
+      }
+      // Pending puts beyond the listed extents (payload retired): range
+      // unknown, assume overlap.
+      return kp.count_ > kp.extents_.size();
+    }
     void KeyAdd(clio::run::u64 key, clio::run::u64 seq, const char *data,
                 clio::run::u64 offset, clio::run::u64 size) {
       Shard &sh = ShardFor(key);
@@ -1636,6 +1661,19 @@ class Client : public clio::run::ContainerClient {
       AwaitPutsUntilSpace(max_inflight_bytes);
     }
     if (size >= DeferRegistry::kBatchChunk) {
+      // Ordering vs in-flight puts (see SievePutOne's -4): an overlapping
+      // put already in flight for this blob must complete BEFORE this one
+      // is issued, or the server's un-ordered write token can land the old
+      // bytes last (fsx O_DIRECT: a stale batch resurrecting overwritten
+      // data). Same rule on every deferred path — sieve, batch, and here.
+      {
+        DeferRegistry &oreg = DeferRegistry::Get();
+        clio::run::u64 okey = DeferKeyHash(tag_id, blob_name);
+        while (oreg.pending_count_.load(std::memory_order_relaxed) != 0 &&
+               oreg.KeyOverlapsPending(okey, offset, offset + size, 0)) {
+          DeferAwaitKey(okey);
+        }
+      }
       // Recycle completed puts' staging FIRST (non-blocking), so a burst
       // feeds its own pool instead of allocating fault-cold buffers.
       DeferReapCompleted();
@@ -1687,6 +1725,13 @@ class Client : public clio::run::ContainerClient {
     DeferRegistry &reg = DeferRegistry::Get();
     reg.flush_client_.store(this, std::memory_order_release);
     clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
+    // Ordering vs in-flight puts — same rule as the sieve's -4 and the
+    // large path above. Checked BEFORE batch_mtx_; a same-batch overlap is
+    // drained too (the await flushes the batch), which keeps it simple.
+    while (reg.pending_count_.load(std::memory_order_relaxed) != 0 &&
+           reg.KeyOverlapsPending(key, offset, offset + size, 0)) {
+      DeferAwaitKey(key);
+    }
     clio::run::u64 seq = reg.seq_gen_.fetch_add(1) + 1;
     const char *copied = nullptr;
     {
@@ -1758,6 +1803,15 @@ class Client : public clio::run::ContainerClient {
       AwaitPutsUntilSpace(max_inflight_bytes);
     }
     const clio::run::u64 front_off = segments.front().blob_off_;
+    // Ordering vs in-flight puts — same rule as every deferred path.
+    {
+      DeferRegistry &oreg = DeferRegistry::Get();
+      clio::run::u64 okey = DeferKeyHash(tag_id, blob_name);
+      while (oreg.pending_count_.load(std::memory_order_relaxed) != 0 &&
+             oreg.KeyOverlapsPending(okey, front_off, front_off + total, 0)) {
+        DeferAwaitKey(okey);
+      }
+    }
     if (total >= DeferRegistry::kBatchChunk) {
       // Multi-extent source: register count-only (no served extent) — a read
       // of a still-pending large record awaits it instead of composing.
@@ -2109,7 +2163,28 @@ class Client : public clio::run::ContainerClient {
           break;
         }
       }
-      if (pi < pages.size() &&
+      // Ordering vs IN-FLIGHT puts (fsx O_DIRECT stale-data races): a write
+      // overlapping a put already shipped/batched for this key must not
+      // become a SECOND in-flight put for the same bytes — the server write
+      // token serializes but does NOT order same-blob tasks, so the older
+      // put can land LAST and resurrect overwritten data. Report -4; the
+      // caller drains the key and retries. The OPEN page's own extent is
+      // exempt: merges into it happen in the buffer, in program order.
+      {
+        clio::run::u64 chk_lo = off;
+        clio::run::u64 chk_hi = off + len;
+        clio::run::u64 own_seq = 0;
+        if (pi < pages.size() &&
+            !(off > pages[pi].hi_ || off + len < pages[pi].lo_)) {
+          own_seq = pages[pi].seq_;
+          chk_lo = std::min(chk_lo, pages[pi].lo_);
+          chk_hi = std::max(chk_hi, pages[pi].hi_);
+        }
+        if (reg.KeyOverlapsPending(key, chk_lo, chk_hi, own_seq)) {
+          rc = -4;
+        }
+      }
+      if (rc == 0 && pi < pages.size() &&
           (off > pages[pi].hi_ || off + len < pages[pi].lo_)) {
         // v1 keeps ONE contiguous extent per page: an intra-page hole
         // sweeps the page out and re-opens it for the new range.
@@ -2118,7 +2193,7 @@ class Client : public clio::run::ContainerClient {
         SieveUnaccount(reg, sweep.back());
         pi = pages.size();
       }
-      if (pi == pages.size()) {
+      if (rc == 0 && pi == pages.size()) {
         // Per-blob budget (kSieveMaxBlobPages * 64 KiB = 1 MiB per blob): a
         // blob needing another page past its budget sweeps its own oldest.
         // The GLOBAL cap is the flusher's job — a writer never does
@@ -2163,7 +2238,7 @@ class Client : public clio::run::ContainerClient {
                 reg.sieve_pages_.fetch_add(1, std::memory_order_relaxed) == 0;
           }
         }
-      } else {
+      } else if (rc == 0) {
         SievePage &pg = pages[pi];
         clio::run::u64 new_lo = std::min(pg.lo_, off);
         clio::run::u64 new_hi = std::max(pg.hi_, off + len);
@@ -2230,6 +2305,12 @@ class Client : public clio::run::ContainerClient {
           std::min(remaining, page_off + DeferRegistry::kSievePage - off);
       int rc =
           SievePutOne(reg, key, tag_id, blob_name, page_off, off, src, in_page);
+      if (rc == -4) {
+        // Overlaps a put still in flight: drain the key so ORDER of the
+        // overlapping bytes is preserved, then retry this same slice.
+        DeferAwaitKey(key);
+        continue;
+      }
       if (rc != 0) {
         return rc;
       }
@@ -2528,10 +2609,14 @@ class Client : public clio::run::ContainerClient {
           task->SetComplete();
           return fut;
         }
-        if (served == -1) {
-          // Partial coverage only: the bytes outside the pending put are
-          // stale in the store until it lands. -2 (no overlap at all) needs
-          // no wait and falls straight through to the normal read.
+        if (served == -1 || served == -2) {
+          // Partial coverage (-1): bytes outside the pending put are stale
+          // in the store until it lands. NO overlap (-2) must ALSO drain:
+          // a same-blob put in flight for a DIFFERENT range still mutates
+          // the blob's block layout server-side, and GetBlob readers hold
+          // no write token — a read overlapping the extend window returned
+          // recycled-block garbage where hole zeros belong (fsx generic/112
+          // buffered+mmap, generic/091 O_DIRECT: op-N-era stale bytes).
           AwaitPendingPuts(tag_id, blob_name);
         }
       }
