@@ -1347,11 +1347,14 @@ int cte_fuse_rmdir(const char *path) {
 static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
                                        const std::string &p, int flags) {
   if (flags & O_TRUNC) {
-    // Same closer ordering as cte_fuse_truncate: a queued close's
-    // AdvanceSize landing after this truncate would resurrect the old size.
-    CloserBarrier();
-    auto tr = cfs->AsyncTruncate(p, 0);
-    tr.Wait();
+    // The FULL truncate hook, not a raw AsyncTruncate: O_TRUNC on reopen
+    // must drain the file's deferred pipelines (closer AND sieve pages)
+    // before the truncate lands, or a still-pending write from the last
+    // open session lands AFTER it and resurrects the old bytes —
+    // generic/729's dio write@0 + fsync + close + O_TRUNC reopen read the
+    // previous phase's page back out of the "empty" file.
+    (void)cfs;
+    cte_fuse_truncate(p.c_str(), 0, nullptr);
   }
 }
 
@@ -1709,6 +1712,30 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
       clio::cte::filesystem::ShmFileRecord rec;
       if (cfs->TryGetFileRecordShm(p, &rec) && !rec.tag_id_.IsNull()) {
         tr_tag = clio::cte::core::TagId(rec.tag_id_.major_, rec.tag_id_.minor_);
+      }
+    }
+    if (tr_tag.IsNull()) {
+      // Authoritative fallback (generic/729 residue): a refused/absent
+      // mirror record left the tag unresolved, the sieve drain silently
+      // skipped, and a pending write from the file's previous open session
+      // landed AFTER the truncate. Ask the server; escape the path for an
+      // exact-match regex.
+      auto *cte_q = CLIO_CTE_CLIENT;
+      if (cte_q != nullptr) {
+        std::string re = "^";
+        for (char c : p) {
+          if (std::strchr("\\^$.|?*+()[]{}", c) != nullptr) re += '\\';
+          re += c;
+        }
+        re += "$";
+        auto q = cte_q->AsyncTagQuery(re, 1);
+        q.Wait();
+        if (q->GetReturnCode() == 0 && !q->result_ids_.empty()) {
+          clio::run::u64 packed = q->result_ids_[0];
+          tr_tag = clio::cte::core::TagId(
+              static_cast<clio::run::u32>(packed >> 32),
+              static_cast<clio::run::u32>(packed & 0xffffffffULL));
+        }
       }
     }
     EnsureCreated(p);
