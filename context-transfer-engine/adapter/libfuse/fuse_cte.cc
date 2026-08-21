@@ -1683,6 +1683,7 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
   // (tag resolved via the SHM mirror, best-effort) and clamp the hiwater
   // overlay so stat reflects the truncation immediately.
   clio::cte::core::TagId tr_tag = clio::cte::core::TagId::GetNull();
+  clio::run::u64 tr_old_extent = 0;
   {
     const std::string p(path);
     // A queued asynchronous close carries the file's pre-truncate hiwater and
@@ -1716,13 +1717,15 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
     if (!tr_tag.IsNull()) {
       DrainSievePages(tr_tag, HiwaterFor(p));
     }
+    tr_old_extent = HiwaterFor(p);
     HiwaterClamp(p, static_cast<clio::run::u64>(size));
   }
   auto t = cfs->AsyncTruncate(
       std::string(path), static_cast<clio::run::u64>(size),
       tr_tag.IsNull() ? 0ULL
                       : ((static_cast<clio::run::u64>(tr_tag.major_) << 32) |
-                         static_cast<clio::run::u64>(tr_tag.minor_)));
+                         static_cast<clio::run::u64>(tr_tag.minor_)),
+      tr_old_extent);
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
 }
@@ -1783,19 +1786,14 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
     rc = cte_fuse_write_zeros(fi, offset, length);
     if (rc != 0) return rc;
     if ((mode & FALLOC_FL_KEEP_SIZE) && (offset + length) > st.st_size) {
-      auto *cfs = CLIO_CFS_CLIENT;
-      clio::run::u64 hpk =
-          (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
-          static_cast<clio::run::u64>(handle->tag.minor_);
-      auto t = cfs->AsyncTruncate(std::string(path),
-                                  static_cast<clio::run::u64>(st.st_size),
-                                  hpk);
-      t.Wait();
-      if (t->GetReturnCode() != 0) return -EIO;
-      // The zeros went through the WRITE hook, which raised the hiwater
-      // overlay past EOF; clamp it back or getattr keeps reporting the
-      // KEEP_SIZE-extended length.
-      HiwaterClamp(std::string(path), static_cast<clio::run::u64>(st.st_size));
+      // Restore EOF through the REAL truncate hook: it drains the deferred
+      // write pipelines (path-keyed cfs writes AND sieve pages) before the
+      // task. The raw AsyncTruncate raced the still-in-flight zero writes,
+      // which then re-extended the file — fstat right after a
+      // ZERO_RANGE|KEEP_SIZE reported the zero op's end as the size (fsx,
+      // sieve-off mode).
+      int trc = cte_fuse_truncate(path, st.st_size, fi);
+      if (trc != 0) return trc;
     }
     // The zeros were written DAEMON-side: the kernel only drops its own
     // cached pages for PUNCH_HOLE, so a later mmap read of this range
@@ -1816,16 +1814,10 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
   cte_off_t need = offset + length;
   if (need <= st.st_size) return 0;  // already large enough; never shrink
 
-  auto *cfs = CLIO_CFS_CLIENT;
-  auto *fh = GetHandle(fi);
-  clio::run::u64 hpk =
-      fh != nullptr ? ((static_cast<clio::run::u64>(fh->tag.major_) << 32) |
-                       static_cast<clio::run::u64>(fh->tag.minor_))
-                    : 0ULL;
-  auto t = cfs->AsyncTruncate(std::string(path),
-                              static_cast<clio::run::u64>(need), hpk);
-  t.Wait();
-  return t->GetReturnCode() == 0 ? 0 : -EIO;
+  // Extend via the real truncate hook for the same pipeline-drain ordering
+  // as the KEEP_SIZE branch above.
+  int trc = cte_fuse_truncate(path, need, fi);
+  return trc;
 }
 #endif  // __linux__
 

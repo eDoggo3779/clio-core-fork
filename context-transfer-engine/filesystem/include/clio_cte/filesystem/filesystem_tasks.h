@@ -426,20 +426,29 @@ struct TruncateTask : public clio::run::Task {
    *  unlinked-while-open RESURRECTED the deleted name through that same
    *  materialization (generic/070's undeletable ghosts). */
   IN clio::run::u64 tag_packed_;
+  /** The caller-known FULL extent of prior writes (the FUSE adapter's
+   *  hiwater). The chimod-tracked size lags sieve-direct writes (they bypass
+   *  the Write handler), so trimming by it left REAL page-blobs beyond a
+   *  shrink alive — holes then read the old bytes back (fsx). The trim
+   *  covers up to max(tracked, old_extent_). */
+  IN clio::run::u64 old_extent_;
   TruncateTask()
-      : clio::run::Task(), path_(CTP_MALLOC), new_size_(0), tag_packed_(0) {}
+      : clio::run::Task(), path_(CTP_MALLOC), new_size_(0), tag_packed_(0),
+        old_extent_(0) {}
   explicit TruncateTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                         const clio::run::PoolQuery &pool_query,
                         const std::string &path, clio::run::u64 new_size,
-                        clio::run::u64 tag_packed = 0)
+                        clio::run::u64 tag_packed = 0,
+                        clio::run::u64 old_extent = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kTruncate),
         path_(CTP_MALLOC, path), new_size_(new_size),
-        tag_packed_(tag_packed) {}
+        tag_packed_(tag_packed), old_extent_(old_extent) {}
   void Copy(const ctp::ipc::FullPtr<TruncateTask>& o) {
     path_ = o->path_; new_size_ = o->new_size_; tag_packed_ = o->tag_packed_;
+    old_extent_ = o->old_extent_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(path_, new_size_, tag_packed_);
+    Task::SerializeIn(ar); ar(path_, new_size_, tag_packed_, old_extent_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };

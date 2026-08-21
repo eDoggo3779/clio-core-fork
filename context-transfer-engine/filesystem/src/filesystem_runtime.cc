@@ -1055,6 +1055,7 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
       if (it != by_tag_.end()) tfi = it->second;
     }
     clio::run::u64 t_old = tfi != nullptr ? tfi->size_.load() : 0;
+    if (task->old_extent_ > t_old) t_old = task->old_extent_;
     clio::run::u64 t_new = task->new_size_;
     if (tfi != nullptr) {
       tfi->size_.store(t_new);
@@ -1073,6 +1074,31 @@ clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &tas
                                        boundary_off,
                                        clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(tb);
+      // Physically ZERO the boundary page's surviving tail: the shrink frees
+      // whole dropped blocks but the last block keeps its bytes, and a later
+      // write past this EOF re-extends over them — the pre-truncate data
+      // then read back inside what must be a hole (fsx: a stale sliver
+      // starting exactly at the truncate point).
+      {
+        clio::run::u64 page_tail_end =
+            std::min(kFsPageSize,
+                     (t_old - boundary_page * kFsPageSize));
+        if (page_tail_end > boundary_off) {
+          clio::run::u64 zlen = page_tail_end - boundary_off;
+          auto *zipc = CLIO_IPC;
+          ctp::ipc::FullPtr<char> zbuf = zipc->AllocateBuffer(zlen);
+          if (!zbuf.IsNull()) {
+            std::memset(zbuf.ptr_, 0, zlen);
+            auto zp = cte_.AsyncPutBlob(t_tag, std::to_string(boundary_page),
+                                        boundary_off, zlen,
+                                        zbuf.shm_.template Cast<void>(),
+                                        -1.0f, clio::cte::core::Context(), 0u,
+                                        clio::run::PoolQuery::Dynamic());
+            CLIO_CO_AWAIT(zp);
+            zipc->FreeBuffer(zbuf);
+          }
+        }
+      }
       clio::run::u64 last_page = (t_old == 0) ? 0 : (t_old - 1) / kFsPageSize;
       for (clio::run::u64 pg = boundary_page + 1; pg <= last_page; ++pg) {
         auto d = cte_.AsyncDelBlob(t_tag, std::to_string(pg),

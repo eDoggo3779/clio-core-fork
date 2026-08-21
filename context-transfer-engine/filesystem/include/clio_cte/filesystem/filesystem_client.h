@@ -324,11 +324,12 @@ class Client : public clio::cte::core::Client {
 
   clio::run::Future<TruncateTask> AsyncTruncate(const std::string &path,
                                           clio::run::u64 new_size,
-                                          clio::run::u64 tag_packed = 0) {
+                                          clio::run::u64 tag_packed = 0,
+                                          clio::run::u64 old_extent = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<TruncateTask>(clio::run::CreateTaskId(), pool_id_,
                                            clio::run::PoolQuery::Local(), path,
-                                           new_size, tag_packed);
+                                           new_size, tag_packed, old_extent);
     return ipc->Send(task);
   }
 
