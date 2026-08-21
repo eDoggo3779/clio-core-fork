@@ -543,7 +543,11 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   // of a negative lookup — is provably unnecessary here. Opt out before the
   // embedded runtime starts. Respect an explicit user setting.
   if (getenv("CLIO_CFS_NO_IMPLICIT_DIRS") == nullptr) {
+#ifndef _WIN32
     setenv("CLIO_CFS_NO_IMPLICIT_DIRS", "1", 0);
+#else
+    _putenv_s("CLIO_CFS_NO_IMPLICIT_DIRS", "1");
+#endif
   }
 
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
@@ -617,6 +621,80 @@ static inline void NsBitsToTimespec(clio::run::u64 bits, time_t &sec,
   }
   sec = static_cast<time_t>(s);
   nsec = static_cast<NsecT>(rem);
+}
+
+// ---------------------------------------------------------------------------
+// Windows compatibility: the cfs SYNC fast-path helpers (Read/Write/Flush/
+// GetAttr) live in filesystem_client.h's Linux-only region. MSVC builds
+// (only the wheels pipeline compiles this TU with WinFsp) route through the
+// awaited async tasks — slower, but the SHM fast paths never existed there.
+// ---------------------------------------------------------------------------
+static inline int CfsFlushCompat(clio::cte::filesystem::Client *cfs,
+                                 const std::string &p) {
+#ifndef _WIN32
+  return cfs->Flush(p);
+#else
+  (void)cfs;
+  (void)p;
+  return 0;  // write-behind is Linux-only; nothing buffered client-side
+#endif
+}
+
+static inline void CfsGetAttrCompat(clio::cte::filesystem::Client *cfs,
+                                    const std::string &p, bool *exists,
+                                    clio::run::u64 *size) {
+#ifndef _WIN32
+  cfs->GetAttr(p, exists, size);
+#else
+  auto t = cfs->AsyncGetattr(p);
+  t.Wait();
+  *exists = (t->GetReturnCode() == 0 && t->exists_ != 0);
+  *size = *exists ? t->size_ : 0;
+#endif
+}
+
+static inline ssize_t CfsReadCompat(clio::cte::filesystem::Client *cfs,
+                                    clio::run::u64 handle,
+                                    const std::string &p, clio::run::u64 off,
+                                    char *buf, size_t size) {
+#ifndef _WIN32
+  return cfs->Read(handle, p, off, buf, size);
+#else
+  (void)p;
+  auto *ipc = CLIO_CPU_IPC;
+  ctp::ipc::FullPtr<char> shm = ipc->AllocateBuffer(size);
+  if (shm.IsNull()) return -1;
+  auto t = cfs->AsyncRead(handle, off, size, shm.shm_.template Cast<void>());
+  t.Wait();
+  ssize_t got = t->GetReturnCode() == 0
+                    ? static_cast<ssize_t>(t->bytes_read_)
+                    : -1;
+  if (got > 0) std::memcpy(buf, shm.ptr_, static_cast<size_t>(got));
+  ipc->FreeBuffer(shm);
+  return got;
+#endif
+}
+
+static inline ssize_t CfsWriteCompat(clio::cte::filesystem::Client *cfs,
+                                     clio::run::u64 handle,
+                                     const std::string &p, clio::run::u64 off,
+                                     const char *buf, size_t size) {
+#ifndef _WIN32
+  return cfs->Write(handle, p, off, buf, size);
+#else
+  (void)p;
+  auto *ipc = CLIO_CPU_IPC;
+  ctp::ipc::FullPtr<char> shm = ipc->AllocateBuffer(size);
+  if (shm.IsNull()) return -1;
+  std::memcpy(shm.ptr_, buf, size);
+  auto t = cfs->AsyncWrite(handle, off, size, shm.shm_.template Cast<void>());
+  t.Wait();
+  ssize_t wrote = t->GetReturnCode() == 0
+                      ? static_cast<ssize_t>(t->bytes_written_)
+                      : -1;
+  ipc->FreeBuffer(shm);
+  return wrote;
+#endif
 }
 
 int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
@@ -1240,7 +1318,7 @@ int cte_fuse_fsync(const char *path, int /*datasync*/,
     DrainSievePages(handle->tag, HiwaterFor(p));
   }
   auto *cfs = CLIO_CFS_CLIENT;
-  if (cfs->Flush(p) != 0) return -errno;
+  if (CfsFlushCompat(cfs, p) != 0) return -errno;
   return 0;
 }
 
@@ -1334,7 +1412,7 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
       // A pending minted create's whole size story is local; only ask the
       // chimod once the file exists server-side.
       bool exists = false;
-      cfs->GetAttr(handle->path, &exists, &fsize);
+      CfsGetAttrCompat(cfs, handle->path, &exists, &fsize);
     }
     clio::run::u64 hw = HiwaterFor(handle->path);
     if (hw > fsize) fsize = hw;
@@ -1357,8 +1435,8 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
     return static_cast<int>(want);
   }
   // cfs tiered read fallback.
-  ssize_t got = cfs->Read(handle->fh, handle->path,
-                          static_cast<clio::run::u64>(offset), buf, size);
+  ssize_t got = CfsReadCompat(cfs, handle->fh, handle->path,
+                              static_cast<clio::run::u64>(offset), buf, size);
   if (got < 0) return -EIO;
   return static_cast<int>(got);
 }
@@ -1399,8 +1477,9 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   // Deferred write-behind through the cfs client (staging pool, RYW
   // registration, fsync drain) — one submit, no wait.
   auto *cfs = CLIO_CFS_CLIENT;
-  ssize_t wrote = cfs->Write(handle->fh, handle->path,
-                             static_cast<clio::run::u64>(offset), buf, size);
+  ssize_t wrote = CfsWriteCompat(cfs, handle->fh, handle->path,
+                                 static_cast<clio::run::u64>(offset), buf,
+                                 size);
   if (wrote < 0) return -errno;
   return static_cast<int>(wrote);
 }
@@ -1764,6 +1843,13 @@ int cte_fuse_rename(const char *from, const char *to,
   // RENAME_WHITEOUT need chimod-level atomic swap / whiteout support and stay
   // EINVAL so callers fall back cleanly.
   if (flags & RENAME_NOREPLACE) {
+    // A pending minted create is invisible to the chimod until its batch
+    // flushes — probe the client-side registry FIRST or NOREPLACE onto a
+    // just-created file wrongly succeeds (generic/024).
+    {
+      PendingCreate pc;
+      if (PendingCreateLookup(std::string(to), &pc)) return -EEXIST;
+    }
     auto g = cfs->AsyncGetattr(std::string(to));
     g.Wait();
     if (g->GetReturnCode() == 0 && g->exists_ != 0) return -EEXIST;
