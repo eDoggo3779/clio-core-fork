@@ -37,12 +37,16 @@
 #include <climits>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
+#include <unordered_map>
 #include <cstring>
 #include <string>
 #include <vector>
-#include <cerrno>                 // errno
+#include <cerrno>
+#include <chrono>                 // errno
 #include <cstdio>                 // snprintf, fprintf
 #include <fcntl.h>                // O_CREAT, O_RDWR
 #ifdef __linux__
@@ -221,6 +225,109 @@ clio::cte::core::TagId MintTagId() {
   clio::run::u32 node = ipc != nullptr ? ipc->GetNodeId() : 1;
   return clio::cte::core::TagId(
       node, 0x80000000u | counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+// ---------------------------------------------------------------------------
+// Hard-link groups (issue #1007 follow-up): the kernel does NOT invalidate a
+// link TARGET's cached attrs when a sibling name is linked or unlinked, so a
+// 1 s attr TTL served stale nlink/ctime to a stat right after ln/rm
+// (generic/002, generic/236). Links made through this mount are tracked
+// here; link and unlink invalidate every sibling via fuse_invalidate_path.
+// Links made by OTHER mounts stay subject to plain TTL staleness.
+// ---------------------------------------------------------------------------
+std::mutex g_lg_mtx;
+std::unordered_map<std::string, std::shared_ptr<std::set<std::string>>>
+    g_link_groups;
+
+void LinkGroupJoin(const std::string &a, const std::string &b) {
+  std::lock_guard<std::mutex> lk(g_lg_mtx);
+  auto ita = g_link_groups.find(a);
+  auto itb = g_link_groups.find(b);
+  std::shared_ptr<std::set<std::string>> g;
+  if (ita != g_link_groups.end() && itb != g_link_groups.end()) {
+    g = ita->second;
+    for (const auto &m : *itb->second) g->insert(m);
+  } else if (ita != g_link_groups.end()) {
+    g = ita->second;
+  } else if (itb != g_link_groups.end()) {
+    g = itb->second;
+  } else {
+    g = std::make_shared<std::set<std::string>>();
+  }
+  g->insert(a);
+  g->insert(b);
+  for (const auto &m : *g) g_link_groups[m] = g;
+}
+
+// Remove `p` from its group; returns the SIBLINGS whose attrs went stale.
+std::vector<std::string> LinkGroupDrop(const std::string &p) {
+  std::lock_guard<std::mutex> lk(g_lg_mtx);
+  std::vector<std::string> out;
+  auto it = g_link_groups.find(p);
+  if (it == g_link_groups.end()) return out;
+  auto g = it->second;
+  g->erase(p);
+  g_link_groups.erase(it);
+  out.assign(g->begin(), g->end());
+  if (g->size() <= 1) {
+    for (const auto &m : *g) g_link_groups.erase(m);
+  }
+  return out;
+}
+
+void LinkGroupRename(const std::string &from, const std::string &to) {
+  std::lock_guard<std::mutex> lk(g_lg_mtx);
+  auto it = g_link_groups.find(from);
+  if (it == g_link_groups.end()) return;
+  auto g = it->second;
+  g->erase(from);
+  g->insert(to);
+  g_link_groups.erase(it);
+  g_link_groups[to] = g;
+}
+
+// Invalidate a path's kernel entry+attr (and data) cache. Safe from request
+// context in write-through mode (no writeback pages to deadlock on).
+void InvalidatePath(const std::string &p) {
+  struct fuse_context *cx = fuse_get_context();
+  if (cx != nullptr && cx->fuse != nullptr) {
+    fuse_invalidate_path(cx->fuse, p.c_str());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Detached-utimens times overlay: the hook fires the stamp and returns, so a
+// stat racing the in-flight task read the OLD times (generic/221 fstat right
+// after futimens). The hook records the requested values here; getattr
+// overlays them until the server view catches up (entries expire after 2 s —
+// far beyond any task round trip).
+// ---------------------------------------------------------------------------
+struct TimesOverlay {
+  clio::run::u64 atime_ns = 0;  // 0 = not set by the stamp
+  clio::run::u64 mtime_ns = 0;
+  clio::run::u64 ctime_ns = 0;  // always set (utimens advances ctime)
+  std::chrono::steady_clock::time_point at;
+};
+std::mutex g_to_mtx;
+std::unordered_map<std::string, TimesOverlay> g_times_overlay;
+
+void TimesOverlaySet(const std::string &p, clio::run::u64 a,
+                     clio::run::u64 m, clio::run::u64 c) {
+  std::lock_guard<std::mutex> lk(g_to_mtx);
+  g_times_overlay[p] = TimesOverlay{a, m, c, std::chrono::steady_clock::now()};
+}
+
+bool TimesOverlayGet(const std::string &p, TimesOverlay *out) {
+  std::lock_guard<std::mutex> lk(g_to_mtx);
+  auto it = g_times_overlay.find(p);
+  if (it == g_times_overlay.end()) return false;
+  if (std::chrono::steady_clock::now() - it->second.at >
+      std::chrono::seconds(2)) {
+    g_times_overlay.erase(it);
+    return false;
+  }
+  *out = it->second;
+  return true;
 }
 
 bool PendingCreateLookup(const std::string &path, PendingCreate *out) {
@@ -697,7 +804,7 @@ static inline ssize_t CfsWriteCompat(clio::cte::filesystem::Client *cfs,
 #endif
 }
 
-int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
+static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
                                  struct fuse_file_info *fi) {
   (void)fi;
   memset(stbuf, 0, sizeof(*stbuf));
@@ -760,7 +867,8 @@ int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
         return -ENOENT;  // tombstone: authoritative absence, no task
       }
       if (!(mrec.flags_ & (clio::cte::filesystem::kShmFileNoFastPath |
-                           clio::cte::filesystem::kShmFilePendingAppend))) {
+                           clio::cte::filesystem::kShmFilePendingAppend |
+                           clio::cte::filesystem::kShmFileIsDir))) {
         clio::cte::core::ShmTagRecord trec;
         clio::cte::core::TagId mtag(mrec.tag_id_.major_, mrec.tag_id_.minor_);
         if (cte0->TryGetTagRecordShm(mtag, &trec)) {
@@ -920,6 +1028,29 @@ int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
   return 0;
 }
 
+int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
+                          struct fuse_file_info *fi) {
+  int rc = cte_fuse_getattr_stat_inner(path, stbuf, fi);
+  if (rc != 0) return rc;
+  TimesOverlay ov;
+  if (TimesOverlayGet(std::string(path), &ov)) {
+    if (ov.atime_ns != 0)
+      NsBitsToTimespec(ov.atime_ns, stbuf->st_atim.tv_sec,
+                       stbuf->st_atim.tv_nsec);
+    if (ov.mtime_ns != 0)
+      NsBitsToTimespec(ov.mtime_ns, stbuf->st_mtim.tv_sec,
+                       stbuf->st_mtim.tv_nsec);
+    // ctime only ADVANCES.
+    clio::run::u64 cur = static_cast<clio::run::u64>(
+        static_cast<int64_t>(stbuf->st_ctim.tv_sec) * 1000000000LL +
+        stbuf->st_ctim.tv_nsec);
+    if (ov.ctime_ns > cur)
+      NsBitsToTimespec(ov.ctime_ns, stbuf->st_ctim.tv_sec,
+                       stbuf->st_ctim.tv_nsec);
+  }
+  return 0;
+}
+
 #ifdef __APPLE__
 // macFUSE's high-level getattr callback fills a fuse_darwin_attr, not a
 // struct stat. Compute into a struct stat (== cte_stat_t here) and translate.
@@ -1013,7 +1144,7 @@ int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
       // CloserMain) — but this caller need not wait for that.
       PendingClose pc;
       pc.kind = PendingClose::kUtimens;
-      pc.path = std::move(p);
+      pc.path = p;
       pc.atime_ns = atime_ns;
       pc.mtime_ns = mtime_ns;
       pc.flags = flags;
@@ -1021,6 +1152,16 @@ int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
     } else {
       EnsureCreated(p);
       cfs->AsyncUtimensDetached(p, atime_ns, mtime_ns, flags);
+    }
+    {
+      clio::run::u64 now_ns = static_cast<clio::run::u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count());
+      clio::run::u64 a = (flags & 0x4u) ? now_ns
+                         : (flags & 0x1u) ? atime_ns : 0;
+      clio::run::u64 m = (flags & 0x8u) ? now_ns
+                         : (flags & 0x2u) ? mtime_ns : 0;
+      TimesOverlaySet(p, a, m, now_ns);
     }
     return 0;
   }
@@ -1097,10 +1238,22 @@ using ClioFuseFillDirT = fuse_darwin_fill_dir_t;
 using ClioFuseFillDirT = fuse_fill_dir_t;
 #endif
 
+int cte_fuse_readdir_flush_guard() {
+  // Pending minted creates are invisible to the chimod's listing until their
+  // batch flushes; readdir callers (rm -r, ls) must see every child or they
+  // act on a partial view (generic/070: rm -r left "non-empty" dirs whose
+  // remaining children it was never shown).
+  if (CreateQueueNonEmpty()) {
+    FlushCreates();
+  }
+  return 0;
+}
+
 int cte_fuse_readdir(const char *path, void *buf,
                             ClioFuseFillDirT filler, cte_off_t offset,
                             struct fuse_file_info *fi,
                             enum fuse_readdir_flags flags) {
+  cte_fuse_readdir_flush_guard();
   (void)offset;
   (void)fi;
   (void)flags;
@@ -1135,6 +1288,16 @@ int cte_fuse_readdir(const char *path, void *buf,
     cte_stat_t st;
     memset(&st, 0, sizeof(st));
     st.st_ino = i < t->inos_.size() ? static_cast<ino_t>(t->inos_[i]) : 0;
+    // d_ino = 0 means "deleted" to glibc's readdir(3), which silently DROPS
+    // the entry — children whose ino lookup missed became invisible to ls
+    // and rm -r while the server still listed them (generic/070's
+    // undeletable "non-empty" dirs). Any nonzero value keeps the entry
+    // visible; a name hash stays stable across listings.
+    if (st.st_ino == 0) {
+      clio::run::u64 h = 1469598103934665603ull;
+      for (unsigned char c : full) h = (h ^ c) * 1099511628211ull;
+      st.st_ino = static_cast<ino_t>(h | 1);
+    }
 #ifdef __APPLE__
     // macFUSE's fill-dir callback consumes a fuse_darwin_attr, not a
     // struct stat — translate (same mapping getattr uses).
@@ -1158,6 +1321,7 @@ int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
 }
 
 int cte_fuse_rmdir(const char *path) {
+  cte_fuse_readdir_flush_guard();  // children may still be pending creates
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncRmdir(std::string(path));
   t.Wait();
@@ -1501,6 +1665,11 @@ int cte_fuse_unlink(const char *path) {
   auto t = cfs->AsyncUnlink(std::string(path));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());  // 0/EISDIR/EIO
+  if (rc == 0) {
+    for (const auto &sib : LinkGroupDrop(std::string(path))) {
+      InvalidatePath(sib);  // their nlink/ctime changed under the TTL
+    }
+  }
   return rc == 0 ? 0 : -rc;
 }
 
@@ -1513,6 +1682,7 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
   // Sieve-path writes live under the file's page-blob keys; drain them too
   // (tag resolved via the SHM mirror, best-effort) and clamp the hiwater
   // overlay so stat reflects the truncation immediately.
+  clio::cte::core::TagId tr_tag = clio::cte::core::TagId::GetNull();
   {
     const std::string p(path);
     // A queued asynchronous close carries the file's pre-truncate hiwater and
@@ -1526,7 +1696,6 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
     // MultiCreate has not flushed has its tag only in the pending table — the
     // mirror-only lookup skipped the sieve drain for both, and pages flushed
     // AFTER the truncate resurrected the dropped bytes (xfstests fsx).
-    clio::cte::core::TagId tr_tag = clio::cte::core::TagId::GetNull();
     if (fi != nullptr) {
       auto *h = GetHandle(fi);
       if (h != nullptr) tr_tag = h->tag;
@@ -1549,7 +1718,11 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
     }
     HiwaterClamp(p, static_cast<clio::run::u64>(size));
   }
-  auto t = cfs->AsyncTruncate(std::string(path), static_cast<clio::run::u64>(size));
+  auto t = cfs->AsyncTruncate(
+      std::string(path), static_cast<clio::run::u64>(size),
+      tr_tag.IsNull() ? 0ULL
+                      : ((static_cast<clio::run::u64>(tr_tag.major_) << 32) |
+                         static_cast<clio::run::u64>(tr_tag.minor_)));
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
 }
@@ -1558,27 +1731,26 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
 // Write `len` zero bytes at `off` through an open handle, chunked so a large
 // range doesn't need one giant SHM buffer. Used by ZERO_RANGE. Returns 0 or a
 // negative errno.
-static int cte_fuse_write_zeros(CfsHandle *handle, cte_off_t off,
+static int cte_fuse_write_zeros(struct fuse_file_info *fi, cte_off_t off,
                                 cte_off_t len) {
-  auto *ipc = CLIO_IPC;
-  auto *cfs = CLIO_CFS_CLIENT;
-  constexpr cte_off_t kChunk = 1 << 20;  // 1 MiB
-  const cte_off_t buf_sz = (len < kChunk) ? len : kChunk;
-  ctp::ipc::FullPtr<char> zbuf = ipc->AllocateBuffer(buf_sz);
-  if (zbuf.IsNull()) return -ENOMEM;
-  memset(zbuf.ptr_, 0, static_cast<size_t>(buf_sz));
-  int result = 0;
+  // Zeros MUST take the exact same path as write(2) — with the sieve-direct
+  // adapter that is AsyncPutBlobDefer on the file's TAG, not the cfs handle
+  // pipeline. The old cfs->AsyncWrite(handle->fh, ...) route (a) wrote via a
+  // handle that is 0 for minted files and (b) created a SECOND data path
+  // whose bytes the sieve's read-your-writes extents then overrode —
+  // generic/008's zeroed first byte read back as its old value.
+  constexpr size_t kChunk = 64 * 1024;
+  std::unique_ptr<char[]> zbuf(new char[kChunk]());
   for (cte_off_t done = 0; done < len;) {
-    const cte_off_t n = ((len - done) < buf_sz) ? (len - done) : buf_sz;
-    auto t = cfs->AsyncWrite(handle->fh, static_cast<clio::run::u64>(off + done),
-                             static_cast<clio::run::u64>(n),
-                             ctp::ipc::ShmPtr<>(zbuf.shm_));
-    t.Wait();
-    if (t->GetReturnCode() != 0) { result = -EIO; break; }
-    done += n;
+    const size_t n = static_cast<size_t>(
+        ((len - done) < static_cast<cte_off_t>(kChunk)) ? (len - done)
+                                                        : kChunk);
+    int wrote = cte_fuse_write(nullptr, zbuf.get(), n, off + done, fi);
+    if (wrote < 0) return wrote;
+    if (wrote == 0) return -EIO;
+    done += wrote;
   }
-  ipc->FreeBuffer(zbuf);
-  return result;
+  return 0;
 }
 
 // fallocate — page-blobs are created lazily on write and holes read back as
@@ -1608,15 +1780,28 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
     cte_stat_t st;
     int rc = cte_fuse_getattr_stat(path, &st, fi);
     if (rc != 0) return rc;
-    rc = cte_fuse_write_zeros(handle, offset, length);
+    rc = cte_fuse_write_zeros(fi, offset, length);
     if (rc != 0) return rc;
     if ((mode & FALLOC_FL_KEEP_SIZE) && (offset + length) > st.st_size) {
       auto *cfs = CLIO_CFS_CLIENT;
+      clio::run::u64 hpk =
+          (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
+          static_cast<clio::run::u64>(handle->tag.minor_);
       auto t = cfs->AsyncTruncate(std::string(path),
-                                  static_cast<clio::run::u64>(st.st_size));
+                                  static_cast<clio::run::u64>(st.st_size),
+                                  hpk);
       t.Wait();
       if (t->GetReturnCode() != 0) return -EIO;
+      // The zeros went through the WRITE hook, which raised the hiwater
+      // overlay past EOF; clamp it back or getattr keeps reporting the
+      // KEEP_SIZE-extended length.
+      HiwaterClamp(std::string(path), static_cast<clio::run::u64>(st.st_size));
     }
+    // The zeros were written DAEMON-side: the kernel only drops its own
+    // cached pages for PUNCH_HOLE, so a later mmap read of this range
+    // served the stale pre-zero bytes (generic/075 fsx: every mismatching
+    // byte was a should-be-zero). Invalidate the file's page cache.
+    InvalidatePath(std::string(path));
     return 0;
   }
 
@@ -1632,8 +1817,13 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
   if (need <= st.st_size) return 0;  // already large enough; never shrink
 
   auto *cfs = CLIO_CFS_CLIENT;
+  auto *fh = GetHandle(fi);
+  clio::run::u64 hpk =
+      fh != nullptr ? ((static_cast<clio::run::u64>(fh->tag.major_) << 32) |
+                       static_cast<clio::run::u64>(fh->tag.minor_))
+                    : 0ULL;
   auto t = cfs->AsyncTruncate(std::string(path),
-                              static_cast<clio::run::u64>(need));
+                              static_cast<clio::run::u64>(need), hpk);
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
 }
@@ -1648,6 +1838,10 @@ int cte_fuse_link(const char *from, const char *to) {
   auto t = cfs->AsyncLink(std::string(from), std::string(to));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
+  if (rc == 0) {
+    LinkGroupJoin(std::string(from), std::string(to));
+    InvalidatePath(std::string(from));  // nlink/ctime changed under the TTL
+  }
   return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes
 }
 
@@ -1860,6 +2054,7 @@ int cte_fuse_rename(const char *from, const char *to,
   }
   auto t = cfs->AsyncRename(std::string(from), std::string(to));
   t.Wait();
+  if (t->GetReturnCode() == 0) LinkGroupRename(std::string(from), std::string(to));
   int rc = static_cast<int>(t->GetReturnCode());
   return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes (ENOENT/EIO)
 }

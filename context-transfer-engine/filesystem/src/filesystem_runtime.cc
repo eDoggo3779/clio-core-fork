@@ -1040,6 +1040,54 @@ clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task)
 
 clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  // fd-truncate (tag known): operate on the TAG; if it is gone the file was
+  // unlinked-while-open — succeed as a no-op orphan truncate, and NEVER fall
+  // through to the path flow, whose materialize-on-missing would resurrect
+  // the deleted name (generic/070).
+  if (task->tag_packed_ != 0) {
+    clio::cte::core::TagId t_tag(
+        static_cast<clio::run::u32>(task->tag_packed_ >> 32),
+        static_cast<clio::run::u32>(task->tag_packed_ & 0xffffffffULL));
+    std::shared_ptr<FileInfo> tfi;
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      auto it = by_tag_.find(task->tag_packed_);
+      if (it != by_tag_.end()) tfi = it->second;
+    }
+    clio::run::u64 t_old = tfi != nullptr ? tfi->size_.load() : 0;
+    clio::run::u64 t_new = task->new_size_;
+    if (tfi != nullptr) {
+      tfi->size_.store(t_new);
+      {
+        std::lock_guard<std::mutex> g(meta_mu_);
+        auto it = by_path_.find(tfi->path_);
+        if (it != by_path_.end() && it->second == tfi) {
+          MirrorFile(tfi->path_, *tfi);
+        }
+      }
+    }
+    if (t_new < t_old) {
+      clio::run::u64 boundary_page = t_new / kFsPageSize;
+      clio::run::u64 boundary_off = t_new % kFsPageSize;
+      auto tb = cte_.AsyncTruncateBlob(t_tag, std::to_string(boundary_page),
+                                       boundary_off,
+                                       clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(tb);
+      clio::run::u64 last_page = (t_old == 0) ? 0 : (t_old - 1) / kFsPageSize;
+      for (clio::run::u64 pg = boundary_page + 1; pg <= last_page; ++pg) {
+        auto d = cte_.AsyncDelBlob(t_tag, std::to_string(pg),
+                                   clio::run::PoolQuery::Dynamic());
+        CLIO_CO_AWAIT(d);
+      }
+    } else {
+      // Grow (or same size): stamp mtime/ctime via the timestamp-touch blob.
+      auto tb = cte_.AsyncTruncateBlob(t_tag, TsTouchBlob(), 0,
+                                       clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(tb);
+    }
+    task->return_code_ = 0;
+    CLIO_CO_RETURN;
+  }
   std::string path = task->path_.str();
   clio::run::u64 new_size = task->new_size_;
 
@@ -1161,9 +1209,20 @@ clio::run::TaskResume Runtime::Unlink(clio::run::shared_ptr<UnlinkTask> &task) {
     }
   }
 
-  // Drop the mirror BEFORE the tag goes away (issue #817), so no client can
-  // resolve this path to a tag that is being deleted underneath it.
-  MirrorErase(path);
+  // Resolve FIRST and answer ENOENT honestly: with a nonzero entry TTL the
+  // kernel can hand us a STALE path (an ancestor renamed within the TTL) —
+  // DelTag returns success while deleting NOTHING, so the caller believed
+  // the name was freed while the file lived on at its real path, invisible
+  // to its old parent's rm -r (generic/070's undeletable ghosts).
+  {
+    auto qe = cte_.AsyncTagQuery(ExactRe(path), 1,
+                                 clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(qe);
+    if (qe->GetReturnCode() != 0 || qe->results_.empty()) {
+      task->return_code_ = ENOENT;
+      CLIO_CO_RETURN;
+    }
+  }
 
   // DelTag is hierarchy-aware: a hard-link (alias) path unlinks only that name;
   // for the canonical name it promotes a surviving alias so the file lives until
@@ -1172,6 +1231,20 @@ clio::run::TaskResume Runtime::Unlink(clio::run::shared_ptr<UnlinkTask> &task) {
   auto d = cte_.AsyncDelTag(path, clio::run::PoolQuery::Dynamic(),
                             /*posix_unlink=*/true);
   CLIO_CO_AWAIT(d);
+  // Tombstone AFTER the delete, and only if the name truly stopped
+  // resolving: DelTag no-ops (rc 0) when a rename raced the resolve, and a
+  // tombstone published up front then lied ENOENT over a live file forever
+  // — rm -r skipped children it could never remove (generic/070's residual
+  // flake). The µs window where a mid-delete name still resolves is benign;
+  // a permanent false tombstone is not.
+  {
+    auto qv = cte_.AsyncTagQuery(ExactRe(path), 1,
+                                 clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(qv);
+    if (qv->GetReturnCode() != 0 || qv->results_.empty()) {
+      MirrorErase(path);
+    }
+  }
   {
     std::lock_guard<std::mutex> g(meta_mu_);
     by_path_.erase(path);
@@ -1218,15 +1291,12 @@ clio::run::TaskResume Runtime::Mkdir(clio::run::shared_ptr<MkdirTask> &task) {
     // A just-born dir is trivially COMPLETE in the mirror: publishing that
     // lets a mirror miss under it answer ENOENT with no task (the negative
     // lookup ahead of every create was the top remaining checkout cost).
-    {
-      auto dt = cte_.AsyncGetOrCreateTag(path, clio::cte::core::TagId::GetNull(),
-                                         clio::run::PoolQuery::Dynamic());
-      CLIO_CO_AWAIT(dt);
-      MirrorDir(path, dt->GetReturnCode() == 0
-                          ? dt->tag_id_
-                          : clio::cte::core::TagId::GetNull(),
-                /*complete=*/true);
-    }
+    // NULL tag id on purpose: the record only powers authoritative
+    // negatives (dir SELF-stats always go to the task), and the explicit
+    // GetOrCreateTag(path) this used to make for an ino left a self-tag
+    // that Rmdir's hierarchy delete did not retire — the name then wedged
+    // EEXIST-on-mkdir / ENOENT-on-stat (generic/023, generic/024).
+    MirrorDir(path, clio::cte::core::TagId::GetNull(), /*complete=*/true);
     task->return_code_ = 0;
   } else {
     task->return_code_ = EIO;
@@ -1259,6 +1329,23 @@ clio::run::TaskResume Runtime::Rmdir(clio::run::shared_ptr<RmdirTask> &task) {
     }
   }
   if (!is_dir) {
+    // No children AT ALL — not even the marker. Either the name truly does
+    // not exist (ENOENT), or it is a HALF-DELETED directory: the name still
+    // resolves and shows up in its parent's listing, but the marker is gone,
+    // so this branch used to refuse with ENOENT and `rm -r` could never
+    // clear the parent (generic/070's undeletable "non-empty" dirs). If the
+    // name resolves, delete it.
+    auto qe = cte_.AsyncTagQuery(ExactRe(path), 1,
+                                 clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(qe);
+    if (qe->GetReturnCode() == 0 && !qe->results_.empty()) {
+      MirrorErase(path);
+      auto dh = cte_.AsyncDelTag(path, clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(dh);
+      CLIO_FS_TOUCH_DIR(ParentDir(path));
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
     task->return_code_ = ENOENT;  // not a directory (or doesn't exist)
     CLIO_CO_RETURN;
   }
@@ -1281,7 +1368,11 @@ clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
     CLIO_CO_RETURN;
   }
 
-  // Drop both operands from the SHM mirror before anything moves (issue #817).
+  // Tombstoning the operands happens on the SUCCESS path below — publishing
+  // them up front meant every FAILED rename (EISDIR/ENOTEMPTY/ENOENT probes,
+  // which fsstress issues constantly) left tombstones over two LIVE files:
+  // stat then lied ENOENT while the server still listed them, and rm -r
+  // skipped children it could never remove (generic/070).
   //
   // Descendants of a renamed DIRECTORY are deliberately not swept: their
   // records still name the right tag (a rename keeps the TagId, so the pages
@@ -1290,9 +1381,6 @@ clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
   // anyway. That equivalence stops holding the moment a path-keyed lookup is
   // used for name resolution (e.g. accelerating stat(2) by path), which is why
   // this issue's stat path still goes through the runtime.
-  MirrorErase(src);
-  MirrorErase(dst);
-
   // Resolve the source tag (its name is the path). Renaming the tag keeps its
   // TagId, so every page-blob (keyed by TagId) moves with it — no data copy.
   clio::cte::core::TagId src_tag;
@@ -1390,6 +1478,16 @@ clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
     auto d = cte_.AsyncDelTag(dst, clio::run::PoolQuery::Dynamic(),
                               /*posix_unlink=*/true);
     CLIO_CO_AWAIT(d);
+  }
+  // Point of no return: every failure gate has passed. NOW drop the mirror
+  // operands (src moves away; dst is replaced) — see the note at the top.
+  MirrorErase(src);
+  MirrorErase(dst);
+  // A DIRECTORY rename moves a whole subtree whose mirror records keep
+  // their old path keys — invalidate them all via the namespace generation
+  // (rare op; records repopulate lazily).
+  if (src_is_dir) {
+    shm_fs_cache_.BumpNsGen();
   }
   // Rename the tag in place (keeps TagId + blobs).
   auto r = cte_.AsyncRenameTag(src, dst, src_tag, clio::run::PoolQuery::Dynamic());
@@ -1881,11 +1979,21 @@ clio::run::TaskResume Runtime::Chown(clio::run::shared_ptr<ChownTask> &task) {
     if (it != by_path_.end()) tag_id = it->second->tag_id_;
   }
   if (tag_id.IsNull()) {
-    auto t = cte_.AsyncGetOrCreateTag(path, clio::cte::core::TagId::GetNull(),
-                                      clio::run::PoolQuery::Dynamic());
-    CLIO_CO_AWAIT(t);
-    if (t->GetReturnCode() != 0) { task->return_code_ = EIO; CLIO_CO_RETURN; }
-    tag_id = t->tag_id_;
+    // Resolve WITHOUT creating: a chown/chmod of a name that no longer
+    // exists (a SETATTR on an fd whose file was unlinked-while-open) must
+    // not materialize it — GetOrCreateTag here RESURRECTED deleted names
+    // (generic/070 ghosts). ENOENT matches what the kernel expects.
+    auto q = cte_.AsyncTagQuery(ExactRe(path), 1,
+                                clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(q);
+    if (q->GetReturnCode() != 0 || q->results_.empty()) {
+      task->return_code_ = ENOENT;
+      CLIO_CO_RETURN;
+    }
+    clio::run::u64 packed = q->result_ids_.empty() ? 0 : q->result_ids_[0];
+    tag_id = clio::cte::core::TagId(
+        static_cast<clio::run::u32>(packed >> 32),
+        static_cast<clio::run::u32>(packed & 0xffffffffULL));
   }
   // Fetch the current on-tag size BEFORE taking meta_mu_ (no RPC under the
   // lock). If we must CREATE a new FileInfo below, we seed its size_ from this

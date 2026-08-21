@@ -193,8 +193,26 @@ class Client : public clio::cte::core::Client {
     if (shm_fs_root_ == nullptr || out == nullptr) {
       return false;
     }
-    return shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
-                                                   out);
+    if (!shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
+                                                 out)) {
+      return false;
+    }
+    // A FILE record from an older namespace generation may sit under a stale
+    // path key (its directory was renamed): treat as absent. Directory
+    // records stay for IsDir purposes (a moved-away dir name SHOULD read
+    // negative, and dir self-stats never serve from the mirror) — but their
+    // COMPLETE claim dies with the generation: after the bump every file
+    // record reads absent, so a still-complete parent would turn that into
+    // authoritative ENOENT for REAL files across the whole tree (fsstress's
+    // one dir rename made rm -r skip everything it then could not rmdir).
+    if (out->nsgen_ !=
+        shm_fs_root_->nsgen_.load(std::memory_order_relaxed)) {
+      if (!(out->flags_ & kShmFileIsDir)) {
+        return false;
+      }
+      out->flags_ &= ~kShmDirComplete;
+    }
+    return true;
   }
 #endif  // CTP_IS_HOST
 
@@ -305,11 +323,12 @@ class Client : public clio::cte::core::Client {
   }
 
   clio::run::Future<TruncateTask> AsyncTruncate(const std::string &path,
-                                          clio::run::u64 new_size) {
+                                          clio::run::u64 new_size,
+                                          clio::run::u64 tag_packed = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<TruncateTask>(clio::run::CreateTaskId(), pool_id_,
                                            clio::run::PoolQuery::Local(), path,
-                                           new_size);
+                                           new_size, tag_packed);
     return ipc->Send(task);
   }
 

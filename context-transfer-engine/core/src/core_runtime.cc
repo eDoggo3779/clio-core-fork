@@ -355,6 +355,24 @@ bool TargetIsNodeLocal(const clio::run::PoolQuery &q,
 // cache record. Deliberately lossy -- the cache stores only what a client
 // needs to answer a read, in a form that is POD and bounded.
 // ===========================================================================
+// Republish the tag's SHM-cache record from its LIVE fields. The record was
+// previously written exactly ONCE (at creation), so mirror-served stats
+// reported creation-frozen mtime/ctime/atime forever — xfstests generic/080,
+// 215 and 313 all failed on times that never advanced past the first write.
+// Call after EVERY tag time/size mutation, under the same protection as the
+// mutation itself (the SHM slot is seqlocked; readers see old or new).
+void Runtime::MirrorTagShm(const TagId &tag_id, const TagInfo &info) {
+  if (!shm_cache_.IsEnabled()) {
+    return;
+  }
+  ShmTagRecord trec;
+  trec.total_size_ = info.total_size_;
+  trec.last_modified_ = info.last_modified_;
+  trec.last_read_ = info.last_read_;
+  trec.last_changed_ = info.last_changed_;
+  shm_cache_.PutTagInfo(tag_id, trec);
+}
+
 bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
   if (out == nullptr) {
     return false;
@@ -1446,6 +1464,7 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
       if (tag_info_ptr != nullptr) {
         tag_info_ptr->last_read_ = now;
         task->tag_size_ = tag_info_ptr->total_size_;
+        MirrorTagShm(tag_id, *tag_info_ptr);
         LogTelemetry(CteOp::kGetOrCreateTag, 0, 0, tag_id,
                      tag_info_ptr->last_modified_, now);
       }
@@ -1989,6 +2008,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           clio::run::u64 abs_change = static_cast<clio::run::u64>(-size_change);
           tag_info_ptr->total_size_ -= abs_change;
         }
+        MirrorTagShm(tag_id, *tag_info_ptr);
       }
     }
 
@@ -2574,6 +2594,7 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
         tag_info_ptr->last_read_ = now;
+        MirrorTagShm(tag_id, *tag_info_ptr);
       }
     }
 
@@ -3488,6 +3509,7 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
         auto now = GetCurrentTimeNs();
         tag_info_ptr->last_modified_ = now;
         tag_info_ptr->last_changed_ = now;
+        MirrorTagShm(tag_id, *tag_info_ptr);
       }
     }
 
@@ -3892,6 +3914,7 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
         auto now = GetCurrentTimeNs();
         tag_info_ptr->last_modified_ = now;
         tag_info_ptr->last_changed_ = now;
+        MirrorTagShm(tag_id, *tag_info_ptr);
       }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
@@ -3954,6 +3977,7 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
         auto now = GetCurrentTimeNs();
         tag_info_ptr->last_modified_ = now;
         tag_info_ptr->last_changed_ = now;
+        MirrorTagShm(tag_id, *tag_info_ptr);
       }
     }
 

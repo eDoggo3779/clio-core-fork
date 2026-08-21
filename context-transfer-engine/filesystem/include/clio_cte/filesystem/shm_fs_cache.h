@@ -88,7 +88,10 @@ struct ShmFileRecord {
   clio::run::u32 uid_;    /**< owner, or kShmFileNoOverride */
   clio::run::u32 gid_;    /**< group, or kShmFileNoOverride */
   clio::run::u32 flags_;  /**< ShmFileFlags */
-  clio::run::u32 reserved_;
+  /** ShmFsCacheRoot::nsgen_ at publish time. A non-directory record from an
+   *  older generation is treated as ABSENT by readers: a directory rename
+   *  moved some subtree, and path-keyed records under it kept stale keys. */
+  clio::run::u32 nsgen_;
 
   ShmFileRecord()
       : tag_id_(clio::run::UniqueId::GetNull()),
@@ -101,7 +104,7 @@ struct ShmFileRecord {
         uid_(kShmFileNoOverride),
         gid_(kShmFileNoOverride),
         flags_(0),
-        reserved_(0) {}
+        nsgen_(0) {}
 
   bool Exists() const { return (flags_ & kShmFileExists) != 0; }
   bool IsDir() const { return (flags_ & kShmFileIsDir) != 0; }
@@ -128,7 +131,7 @@ using ShmFsFileMap =
  * rather than competing for one slot.
  */
 struct ShmFsCacheRoot {
-  static constexpr clio::run::u32 kLayoutVersion = 2;
+  static constexpr clio::run::u32 kLayoutVersion = 3;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */
@@ -139,9 +142,12 @@ struct ShmFsCacheRoot {
    * Sticky by design: capacity does not come back.
    */
   std::atomic<clio::run::u32> overflow_;
+  /** Namespace generation: bumped on every DIRECTORY rename (see
+   *  ShmFileRecord::nsgen_). */
+  std::atomic<clio::run::u32> nsgen_;
   ShmFsFileMap path_to_file_;
 
-  ShmFsCacheRoot() : version_(0), ready_(0), overflow_(0) {}
+  ShmFsCacheRoot() : version_(0), ready_(0), overflow_(0), nsgen_(0) {}
 };
 
 /**
@@ -225,8 +231,10 @@ class ShmFsCache {
     }
     try {
       ShmFsFileMap::BytesProbe p{path.data(), path.size()};
+      ShmFileRecord stamped = rec;
+      stamped.nsgen_ = root_->nsgen_.load(std::memory_order_relaxed);
       bool ok = root_->path_to_file_.InsertOrAssign(
-          p, ShmCacheString::HashBytes(path.data(), path.size()), rec);
+          p, ShmCacheString::HashBytes(path.data(), path.size()), stamped);
       // A false return means the table is full: the path is simply not
       // cached and clients keep using RPC for it — and authoritative
       // negatives must stand down forever (see overflow_).
@@ -247,6 +255,14 @@ class ShmFsCache {
    * runtime", which is the correct answer for a deleted path, and a tombstone
    * would consume a slot in a table that never grows.
    */
+  /** Invalidate every non-directory record published before now (directory
+   *  rename: subtree records keep stale path keys — see ShmFileRecord). */
+  void BumpNsGen() {
+    if (IsEnabled()) {
+      root_->nsgen_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   void ErasePath(const std::string &path) {
     if (!IsEnabled()) {
       return;
