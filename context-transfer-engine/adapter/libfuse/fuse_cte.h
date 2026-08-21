@@ -486,6 +486,7 @@ using cte_timespec_t = struct timespec;
 using cte_statvfs_t = struct statvfs;
 #endif
 
+#ifndef _WIN32
 // ---------------------------------------------------------------------------
 // Individual operations, exported for the LOW-LEVEL adapter (fuse_cte_ll.cc):
 // it resolves inode->path and delegates to these proven path-keyed
@@ -525,6 +526,7 @@ int cte_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                      cte_off_t offset, struct fuse_file_info *fi,
                      enum fuse_readdir_flags flags);
 int cte_fuse_link(const char *from, const char *to);
+#endif  // !_WIN32
 #endif  // CLIO_CTE_FUSE_ENABLED
 
 #endif  // CLIO_CTE_ADAPTER_LIBFUSE_FUSE_CTE_H_

@@ -1440,14 +1440,31 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
     // truncate: wrote 1000, truncated to 100, stat said 1000). Drain the
     // closer first, exactly like rename and unlink.
     CloserBarrier();
+    // Resolve the tag from EVERY identity source, not just the mirror: an
+    // ftruncate arrives with the open handle (fi), and a minted file whose
+    // MultiCreate has not flushed has its tag only in the pending table — the
+    // mirror-only lookup skipped the sieve drain for both, and pages flushed
+    // AFTER the truncate resurrected the dropped bytes (xfstests fsx).
+    clio::cte::core::TagId tr_tag = clio::cte::core::TagId::GetNull();
+    if (fi != nullptr) {
+      auto *h = GetHandle(fi);
+      if (h != nullptr) tr_tag = h->tag;
+    }
+    if (tr_tag.IsNull()) {
+      PendingCreate pc;
+      if (PendingCreateLookup(p, &pc)) tr_tag = pc.tag;
+    }
+    if (tr_tag.IsNull()) {
+      clio::cte::filesystem::ShmFileRecord rec;
+      if (cfs->TryGetFileRecordShm(p, &rec) && !rec.tag_id_.IsNull()) {
+        tr_tag = clio::cte::core::TagId(rec.tag_id_.major_, rec.tag_id_.minor_);
+      }
+    }
     EnsureCreated(p);
     clio::cte::core::Client::DeferAwaitKey(
         clio::cte::filesystem::Client::FileKey(p));
-    clio::cte::filesystem::ShmFileRecord rec;
-    if (cfs->TryGetFileRecordShm(p, &rec) && !rec.tag_id_.IsNull()) {
-      DrainSievePages(clio::cte::core::TagId(rec.tag_id_.major_,
-                                             rec.tag_id_.minor_),
-                      HiwaterFor(p));
+    if (!tr_tag.IsNull()) {
+      DrainSievePages(tr_tag, HiwaterFor(p));
     }
     HiwaterClamp(p, static_cast<clio::run::u64>(size));
   }
