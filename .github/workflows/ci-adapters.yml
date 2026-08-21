@@ -104,7 +104,7 @@ jobs:
       # /usr/local; installing the cask needs no kext approval — only
       # mounting through the kext backend would.
       - name: Install macFUSE (libfuse3 for the adapter build)
-        run: CI/retry.sh brew install --cask macfuse
+        run: bash CI/retry.sh brew install --cask macfuse
       - name: Configure and build (hdf5_vol + macfuse)
         run: |
           set -x

@@ -73,8 +73,8 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        CI/retry.sh sudo apt-get update
-        CI/retry.sh sudo apt-get install -y --no-install-recommends \
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends \
           cmake ninja-build build-essential pkg-config python3 \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
           libsodium-dev libfuse3-dev
@@ -211,8 +211,8 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        CI/retry.sh sudo apt-get update
-        CI/retry.sh sudo apt-get install -y --no-install-recommends \
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends \
           cmake ninja-build build-essential pkg-config wget file \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
           libsodium-dev libfuse3-dev
@@ -396,8 +396,8 @@ jobs:
         #   1. Mount via FUSE (requires libfuse2 on the runner)
         #   2. APPIMAGE_EXTRACT_AND_RUN=1 — extract to a tmpdir + exec
         # Use (2) so the test runs even on minimal runners without FUSE.
-        CI/retry.sh sudo apt-get update
-        CI/retry.sh sudo apt-get install -y --no-install-recommends file
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends file
         chmod +x pkg/*.AppImage
         echo "=== AppImage info ==="
         file pkg/*.AppImage

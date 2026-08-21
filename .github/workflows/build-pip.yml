@@ -107,7 +107,7 @@ jobs:
         python-version: '3.12'
 
     - name: Install cibuildwheel
-      run: CI/retry.sh pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build wheels
       env:
@@ -193,7 +193,7 @@ jobs:
         }
 
     - name: Install cibuildwheel
-      run: CI/retry.sh pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build Windows wheels
       env:
@@ -275,12 +275,12 @@ jobs:
         # cppzmq is the C++ header wrapper for zeromq; cereal and cppzmq
         # are header-only. msgpack-c is the C library (the recipe uses
         # the C API in serialize/msgpack_wrapper.h).
-        CI/retry.sh brew update
-        CI/retry.sh brew install cmake pkg-config \
+        bash CI/retry.sh brew update
+        bash CI/retry.sh brew install cmake pkg-config \
           yaml-cpp cereal msgpack-c libsodium zeromq cppzmq
 
     - name: Install cibuildwheel
-      run: CI/retry.sh pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build macOS wheels
       env:

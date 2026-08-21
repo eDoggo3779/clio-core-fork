@@ -122,8 +122,8 @@ jobs:
           submodules: recursive
       - name: Install lcov (+ phase deps)
         run: |
-          CI/retry.sh sudo apt-get update
-          CI/retry.sh sudo apt-get install -y lcov ${{ matrix.apt }}
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y lcov ${{ matrix.apt }}
       - name: Install project dependencies (CI/ci-deps.sh)
         run: |
           chmod +x CI/ci-deps.sh
@@ -249,8 +249,8 @@ jobs:
           submodules: recursive
       - name: Install system libraries
         run: |
-          CI/retry.sh sudo apt-get update
-          CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
       - name: Install dependencies (conda env, incl. Boost.Context)
         run: |
           chmod +x CI/ci-deps.sh
@@ -296,13 +296,13 @@ jobs:
       - name: Install sanitizer runtime libraries (ASan/UBSan)
         if: matrix.sanitizer != 'msan'
         run: |
-          CI/retry.sh sudo apt-get update
-          CI/retry.sh sudo apt-get install -y libasan8 libubsan1 libhdf5-dev
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y libasan8 libubsan1 libhdf5-dev
       - name: Install Clang for MSan
         if: matrix.sanitizer == 'msan'
         run: |
-          CI/retry.sh sudo apt-get update
-          CI/retry.sh sudo apt-get install -y clang llvm libhdf5-dev
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y clang llvm libhdf5-dev
       - name: Build and test with ${{ matrix.sanitizer }}
         run: |
           chmod +x CI/ci-deps.sh CI/run_sanitizers.sh
@@ -332,8 +332,8 @@ jobs:
           submodules: recursive
       - name: Install system libraries
         run: |
-          CI/retry.sh sudo apt-get update
-          CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
       - name: Install dependencies (conda env)
         run: |
           chmod +x CI/ci-deps.sh

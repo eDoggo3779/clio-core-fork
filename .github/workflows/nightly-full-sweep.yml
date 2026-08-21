@@ -43,8 +43,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          CI/retry.sh sudo apt-get update
-          CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
+          bash CI/retry.sh sudo apt-get update
+          bash CI/retry.sh sudo apt-get install -y libhdf5-dev liburing-dev
 
       - name: Configure and build
         run: |
