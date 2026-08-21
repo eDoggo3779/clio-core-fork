@@ -179,8 +179,26 @@ jobs:
     # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco
     # package installs to %ProgramFiles(x86)%\WinFsp, which is the CMake
     # default search path.
+    # Retry transient registry failures, then ASSERT the SDK is really there:
+    # choco has been observed to exit 0 on a community-feed 503 ("Unable to
+    # find package 'winfsp'"), after which the wheel silently built WITHOUT
+    # clio_cte_fuse.exe and the miss only surfaced ~40 minutes later in the
+    # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
-      run: choco install winfsp -y --no-progress
+      run: |
+        $ok = $false
+        foreach ($attempt in 1..3) {
+          choco install winfsp -y --no-progress
+          if (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h") {
+            $ok = $true
+            break
+          }
+          Write-Host "WinFsp not installed after attempt $attempt; retrying in 30s..."
+          Start-Sleep -Seconds 30
+        }
+        if (-not $ok) {
+          throw "WinFsp SDK missing after 3 install attempts -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
+        }
 
     - name: Install cibuildwheel
       run: pip install cibuildwheel

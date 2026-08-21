@@ -459,8 +459,23 @@ jobs:
       run: |
         C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c
 
+    # Retry + assert, mirroring build-pip (#1004): choco can exit 0 on a
+    # community-feed 503, silently building the package without the adapter.
     - name: Install WinFsp (FUSE adapter SDK)
-      run: choco install winfsp -y --no-progress
+      run: |
+        $ok = $false
+        foreach ($attempt in 1..3) {
+          choco install winfsp -y --no-progress
+          if (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h") {
+            $ok = $true
+            break
+          }
+          Write-Host "WinFsp not installed after attempt $attempt; retrying in 30s..."
+          Start-Sleep -Seconds 30
+        }
+        if (-not $ok) {
+          throw "WinFsp SDK missing after 3 install attempts (#1004)"
+        }
 
     # cpack -G NSIS below shells out to makensis. Nothing installed it, so the
     # job failed with "Cannot find NSIS compiler makensis ... Cannot initialize
@@ -519,8 +534,22 @@ jobs:
         name: windows-package-x86_64
         path: pkg/
 
+    # Same hardening for the runtime install used by the smoke test (#1004).
     - name: Install WinFsp (FUSE adapter runtime)
-      run: choco install winfsp -y --no-progress
+      run: |
+        $ok = $false
+        foreach ($attempt in 1..3) {
+          choco install winfsp -y --no-progress
+          if (Test-Path "${env:ProgramFiles(x86)}\WinFsp\bin") {
+            $ok = $true
+            break
+          }
+          Write-Host "WinFsp not installed after attempt $attempt; retrying in 30s..."
+          Start-Sleep -Seconds 30
+        }
+        if (-not $ok) {
+          throw "WinFsp runtime missing after 3 install attempts (#1004)"
+        }
 
     - name: Extract ZIP + smoke test
       shell: pwsh
