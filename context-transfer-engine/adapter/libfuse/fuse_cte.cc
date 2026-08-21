@@ -1344,6 +1344,11 @@ int cte_fuse_rmdir(const char *path) {
 // open/creat of an existing file with O_TRUNC would keep its old page-blobs
 // (leaving stale data an app expects to be gone — e.g. reads of a re-created
 // file's holes). Clear it to zero length here, which frees those blobs.
+// Declared here as well as in the header: the header's export block is
+// Linux-only (#ifndef _WIN32), and MSVC compiles this TU for the wheels.
+int cte_fuse_truncate(const char *path, cte_off_t size,
+                      struct fuse_file_info *fi);
+
 static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
                                        const std::string &p, int flags) {
   if (flags & O_TRUNC) {
