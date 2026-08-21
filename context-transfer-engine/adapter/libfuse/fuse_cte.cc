@@ -1103,6 +1103,9 @@ int cte_fuse_rmdir(const char *path) {
 static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
                                        const std::string &p, int flags) {
   if (flags & O_TRUNC) {
+    // Same closer ordering as cte_fuse_truncate: a queued close's
+    // AdvanceSize landing after this truncate would resurrect the old size.
+    CloserBarrier();
     auto tr = cfs->AsyncTruncate(p, 0);
     tr.Wait();
   }
@@ -1431,6 +1434,12 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
   // overlay so stat reflects the truncation immediately.
   {
     const std::string p(path);
+    // A queued asynchronous close carries the file's pre-truncate hiwater and
+    // pushes it via AdvanceSize, which only ever RAISES the size — landing
+    // after this truncate it resurrects the truncated length (CI fuse_ops
+    // truncate: wrote 1000, truncated to 100, stat said 1000). Drain the
+    // closer first, exactly like rename and unlink.
+    CloserBarrier();
     EnsureCreated(p);
     clio::cte::core::Client::DeferAwaitKey(
         clio::cte::filesystem::Client::FileKey(p));
