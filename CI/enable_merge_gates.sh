@@ -18,8 +18,9 @@
 #     git show origin/dev:.github/workflows/ci-adapters.yml | grep merge_group
 #
 # USAGE
-#   CI/enable_merge_gates.sh dev            # dry run: prints the ruleset
-#   CI/enable_merge_gates.sh dev --apply    # create/update it
+#   CI/enable_merge_gates.sh dev                       # dry run: print ruleset
+#   CI/enable_merge_gates.sh dev --apply --no-queue    # checks only, safe today
+#   CI/enable_merge_gates.sh dev --apply               # checks + merge queue
 #   CI/enable_merge_gates.sh main --apply
 #
 # The required set is deliberately SMALL and fast. A required check that is
@@ -29,9 +30,24 @@
 
 set -euo pipefail
 
-BRANCH="${1:?usage: enable_merge_gates.sh <branch> [--apply]}"
-APPLY="${2:-}"
+BRANCH="${1:?usage: enable_merge_gates.sh <branch> [--apply] [--no-queue]}"
 REPO="${REPO:-iowarp/clio-core}"
+
+APPLY=""
+NO_QUEUE=""
+shift
+for arg in "$@"; do
+  case "$arg" in
+    --apply)    APPLY=1 ;;
+    --no-queue) NO_QUEUE=1 ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# --no-queue exists for the ordering problem: required checks are safe to turn
+# on the moment they report on pull_request events, but the merge_queue rule is
+# only safe once the workflows carrying `merge_group:` triggers are ON the
+# target branch. Protect first, queue second, same script both times.
 
 # Check names must match the JOB NAME exactly, and each must run on BOTH
 # pull_request and merge_group events -- otherwise the queue stalls on a check
@@ -51,10 +67,11 @@ CHECKS=(
 checks_json=$(printf '%s\n' "${CHECKS[@]}" \
   | python3 -c 'import json,sys; print(json.dumps([{"context": l.rstrip("\n")} for l in sys.stdin if l.strip()]))')
 
-ruleset=$(python3 - "$BRANCH" "$checks_json" <<'PY'
+ruleset=$(python3 - "$BRANCH" "$checks_json" "${NO_QUEUE:-}" <<'PY'
 import json, sys
 branch, checks = sys.argv[1], json.loads(sys.argv[2])
-print(json.dumps({
+no_queue = bool(sys.argv[3]) if len(sys.argv) > 3 else False
+ruleset = {
   "name": f"{branch}: gated merges",
   "target": "branch",
   "enforcement": "active",
@@ -77,22 +94,26 @@ print(json.dumps({
         "strict_required_status_checks_policy": False,
         "do_not_enforce_on_create": False,
         "required_status_checks": checks}},
-    {"type": "merge_queue", "parameters": {
-        "merge_method": "SQUASH",
-        "grouping_strategy": "ALLGREEN",
-        "max_entries_to_build": 5,
-        "min_entries_to_merge": 1,
-        "max_entries_to_merge": 5,
-        "min_entries_to_merge_wait_minutes": 5,
-        # The full matrix runs about an hour at the tail (macOS sweep, boost).
-        # A timeout shorter than the slowest gate silently drops entries.
-        "check_response_timeout_minutes": 90}},
   ],
-}, indent=2))
+}
+if not no_queue:
+    ruleset["rules"].append(
+      {"type": "merge_queue", "parameters": {
+          "merge_method": "SQUASH",
+          "grouping_strategy": "ALLGREEN",
+          "max_entries_to_build": 5,
+          "min_entries_to_merge": 1,
+          "max_entries_to_merge": 5,
+          "min_entries_to_merge_wait_minutes": 5,
+          # The full matrix runs about an hour at the tail (macOS sweep,
+          # boost). A timeout shorter than the slowest gate silently drops
+          # entries from the queue.
+          "check_response_timeout_minutes": 90}})
+print(json.dumps(ruleset, indent=2))
 PY
 )
 
-if [ "$APPLY" != "--apply" ]; then
+if [ -z "$APPLY" ]; then
   echo "DRY RUN for $REPO branch '$BRANCH' -- re-run with --apply to create it."
   echo "$ruleset"
   exit 0
@@ -111,4 +132,9 @@ fi
 
 echo "Done. Required checks on '$BRANCH':"
 printf '  - %s\n' "${CHECKS[@]}"
-echo "Merge queue: enabled (squash, all-green grouping)."
+if [ -n "$NO_QUEUE" ]; then
+  echo "Merge queue: NOT enabled (--no-queue). Re-run without it once the"
+  echo "  merge_group: triggers are on '$BRANCH'."
+else
+  echo "Merge queue: enabled (squash, all-green grouping)."
+fi
