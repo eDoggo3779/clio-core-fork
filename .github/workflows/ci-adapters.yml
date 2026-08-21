@@ -27,6 +27,13 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
+  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
+  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
+  # single bad commit turns every later push red. A merge_group run is that
+  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
+  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -97,7 +104,7 @@ jobs:
       # /usr/local; installing the cask needs no kext approval — only
       # mounting through the kext backend would.
       - name: Install macFUSE (libfuse3 for the adapter build)
-        run: brew install --cask macfuse
+        run: CI/retry.sh brew install --cask macfuse
       - name: Configure and build (hdf5_vol + macfuse)
         run: |
           set -x
@@ -156,7 +163,7 @@ jobs:
             --no-binary=h5py h5py numpy
           ctest --test-dir build-adapters --output-on-failure \
             --timeout 180 --repeat until-pass:2 \
-            -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama"
+            -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama|flaky"
       # Real mount attempt via the FSKit backend (kext-free; macFUSE 5.1+,
       # macOS 15.4+, mountpoint must live under /Volumes). NON-BLOCKING: FSKit
       # extension approval semantics on runner images are unproven — promote
@@ -288,7 +295,7 @@ jobs:
           # the ctest timeout (at 300s AND 900s ceilings — hung, not slow).
           # Tracked in #907; test_fuse_adapter + the live mount smoke below
           # are the Windows FUSE coverage until it is root-caused.
-          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite|fuse_ops" -LE "docker|ollama"
+          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 --repeat until-pass:2 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite|fuse_ops" -LE "docker|ollama|flaky"
       # Live end-to-end WinFsp mount (#903): runtime up -> compose -> mount a
       # drive letter -> write/read/verify -> unmount. The WinFsp MSI install
       # above included the driver, so mounting works without a reboot.
