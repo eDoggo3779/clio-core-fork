@@ -1012,6 +1012,9 @@ struct BlobInfo {
   // under-refusing hands back codec bytes as if they were data. Cleared only
   // when the blob itself is destroyed.
   clio::run::u32 transform_flags_;
+  // Non-zero when this blob is an expendable cache copy the tier may evict.
+  // Write-once: set at creation, never changed. See kCtePutDroppable.
+  clio::run::u32 droppable_;
   int compress_lib_;     // Compression library ID *requested* for this blob
                          // (0 = none). Provenance/telemetry only -- NOT a
                          // reliable answer to "is this blob compressed?";
@@ -1179,6 +1182,7 @@ struct BlobInfo {
         last_read_(0),
         access_count_(0),
         transform_flags_(kBlobTransformNone),
+        droppable_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -1200,6 +1204,7 @@ struct BlobInfo {
         last_read_(0),
         access_count_(0),
         transform_flags_(kBlobTransformNone),
+        droppable_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -1222,6 +1227,7 @@ struct BlobInfo {
         last_read_(GetCurrentTimeNs()),
         access_count_(0),
         transform_flags_(kBlobTransformNone),
+        droppable_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -1244,6 +1250,7 @@ struct BlobInfo {
         last_read_(other.last_read_),
         access_count_(other.access_count_),
         transform_flags_(other.transform_flags_),
+        droppable_(other.droppable_),
         compress_lib_(other.compress_lib_),
         compress_preset_(other.compress_preset_),
         trace_key_(other.trace_key_),
@@ -1678,6 +1685,31 @@ enum class CteOp : clio::run::u32 {
  * explicit TruncateBlob op share Runtime::ResizeBlob.
  */
 GLOBAL_CROSS_CONST clio::run::u32 kCtePutReplace = 0x1u;
+
+/**
+ * kCtePutDroppable: this blob's bytes are EXPENDABLE -- a cache copy of data
+ * that is authoritative elsewhere, which the tier may discard at any time.
+ *
+ * Only the writer can know this, so only the writer may say it. Two effects,
+ * and both are needed for the guarantee to hold: the put may trigger eviction
+ * when placement fails, and the blob becomes eligible to BE evicted by such a
+ * put. Without the flag a put neither evicts nor is evicted.
+ *
+ * Droppability is decided at creation and never changes. Eviction selects
+ * candidates from a scan and deletes them afterwards, so a blob that changed
+ * sides in between would be deleted on an answer that is no longer true. A put
+ * WITHOUT the flag to a blob that has it is therefore refused with
+ * kCteDroppabilityConflictRc: a cache copy and authoritative data claiming one
+ * name is a collision worth surfacing. The reverse is allowed and leaves the
+ * blob authoritative.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kCtePutDroppable = 0x2u;
+
+/**
+ * PutBlob refused: the blob is an expendable cache copy (kCtePutDroppable) and
+ * this put would take ownership of bytes the tier may discard.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kCteDroppabilityConflictRc = 14;
 
 /**
  * CTE Telemetry data structure for performance monitoring
@@ -2384,6 +2416,10 @@ struct ReorganizeBlobTask : public clio::run::Task {
 struct EvictTask : public clio::run::Task {
   IN float min_tier_score_;   // Only evict blobs on targets with score >= this
   IN clio::run::u64 bytes_;   // Reclaim at least this many bytes from the tier
+  // Non-zero: reclaim only from blobs marked kCtePutDroppable, so eviction
+  // cannot destroy data somebody still owns. Set by PutBlob's make-room retry;
+  // 0 for callers that ask for eviction directly.
+  IN clio::run::u32 droppable_only_;
   OUT clio::run::u64 bytes_evicted_;  // Physical bytes actually reclaimed
   OUT clio::run::u64 blobs_evicted_;  // Number of blobs evicted
 
@@ -2392,6 +2428,7 @@ struct EvictTask : public clio::run::Task {
       : clio::run::Task(),
         min_tier_score_(0.0f),
         bytes_(0),
+        droppable_only_(0),
         bytes_evicted_(0),
         blobs_evicted_(0) {}
 
@@ -2399,10 +2436,12 @@ struct EvictTask : public clio::run::Task {
   CTP_CROSS_FUN explicit EvictTask(const clio::run::TaskId &task_id,
                                    const clio::run::PoolId &pool_id,
                                    const clio::run::PoolQuery &pool_query,
-                                   float min_tier_score, clio::run::u64 bytes)
+                                   float min_tier_score, clio::run::u64 bytes,
+                                   clio::run::u32 droppable_only = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kEvict),
         min_tier_score_(min_tier_score),
         bytes_(bytes),
+        droppable_only_(droppable_only),
         bytes_evicted_(0),
         blobs_evicted_(0) {
     task_id_ = task_id;
@@ -2415,7 +2454,7 @@ struct EvictTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(min_tier_score_, bytes_);
+    ar(min_tier_score_, bytes_, droppable_only_);
   }
 
   template <typename Archive>
@@ -2428,6 +2467,9 @@ struct EvictTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     min_tier_score_ = other->min_tier_score_;
     bytes_ = other->bytes_;
+    // Every IN field must be copied here: this is the per-replica duplication
+    // path, so an omission silently reverts to the default on remote shards.
+    droppable_only_ = other->droppable_only_;
     bytes_evicted_ = other->bytes_evicted_;
     blobs_evicted_ = other->blobs_evicted_;
   }
