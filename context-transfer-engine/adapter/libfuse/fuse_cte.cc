@@ -338,7 +338,7 @@ void CloserMain() {
     // regressing the published size and truncating subsequent reads
     // (git's .git/config came back garbage).
     clio::cte::core::Client::DeferAwaitKey(
-        clio::cte::filesystem::Client::FileKey(pc.path));
+        clio::cte::core::Client::DeferKeyHashName(pc.path));
     if (pc.kind == PendingClose::kClose) {
       DrainSievePages(pc.tag, pc.hiwater);
       if (pc.fh == 0) {
@@ -418,7 +418,7 @@ void CloserBarrier() {
   }
   for (auto &pc : q) {
     clio::cte::core::Client::DeferAwaitKey(
-        clio::cte::filesystem::Client::FileKey(pc.path));
+        clio::cte::core::Client::DeferKeyHashName(pc.path));
     if (pc.kind == PendingClose::kClose) {
       DrainSievePages(pc.tag, pc.hiwater);
       if (pc.fh == 0) {
@@ -565,6 +565,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   return nullptr;
 }
 
+#ifndef _WIN32
 // Client bootstrap for alternate front ends (the low-level adapter): same
 // sequence as cte_fuse_init's tail. Safe to call once from any init hook.
 int cte_fuse_bootstrap_clients() {
@@ -584,6 +585,7 @@ int cte_fuse_bootstrap_clients() {
   }
   return 0;
 }
+#endif  // !_WIN32
 
 static void cte_fuse_destroy(void *private_data) {
   (void)private_data;
@@ -701,7 +703,7 @@ int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
             stbuf->st_nlink = 1;  // hardlinked records are refused above
             clio::run::u64 sz = mrec.size_;
             clio::run::u64 pend = clio::cte::core::Client::DeferMaxPendingEnd(
-                clio::cte::filesystem::Client::FileKey(p));
+                clio::cte::core::Client::DeferKeyHashName(p));
             if (pend > sz) sz = pend;
             clio::run::u64 hw = HiwaterFor(p);
             if (hw > sz) sz = hw;
@@ -803,7 +805,7 @@ int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
     // stat must see it. High-water pending end, no drain (same rule as the
     // cfs client's GetAttr).
     clio::run::u64 pend = clio::cte::core::Client::DeferMaxPendingEnd(
-        clio::cte::filesystem::Client::FileKey(p));
+        clio::cte::core::Client::DeferKeyHashName(p));
     if (pend > static_cast<clio::run::u64>(stbuf->st_size)) {
       stbuf->st_size = static_cast<cte_off_t>(pend);
     }
@@ -928,7 +930,7 @@ int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
   if (async_utimens) {
     std::string p(path);
     if (clio::cte::core::Client::DeferKeyPending(
-            clio::cte::filesystem::Client::FileKey(p))) {
+            clio::cte::core::Client::DeferKeyHashName(p))) {
       // Writes in flight: the stamp must EXECUTE after they land (see
       // CloserMain) — but this caller need not wait for that.
       PendingClose pc;
@@ -1221,7 +1223,7 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   const std::string p = handle ? handle->path : std::string(path ? path : "");
   if (p.empty()) return 0;
   int err = clio::cte::core::Client::DeferTakeKeyError(
-      clio::cte::filesystem::Client::FileKey(p));
+      clio::cte::core::Client::DeferKeyHashName(p));
   return err != 0 ? -err : 0;
 }
 
@@ -1267,7 +1269,7 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
     // lazy closer does, off the caller's path.
     if (minted || hiwater != 0 ||
         clio::cte::core::Client::DeferKeyPending(
-            clio::cte::filesystem::Client::FileKey(handle->path))) {
+            clio::cte::core::Client::DeferKeyHashName(handle->path))) {
       PendingClose pc;
       pc.kind = PendingClose::kClose;
       pc.fh = handle->fh;
@@ -1280,7 +1282,7 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
     }
   } else {
     clio::cte::core::Client::DeferAwaitKey(
-        clio::cte::filesystem::Client::FileKey(handle->path));
+        clio::cte::core::Client::DeferKeyHashName(handle->path));
     DrainSievePages(handle->tag, hiwater);
     if (minted) {
       EnsureCreated(handle->path);
@@ -1414,7 +1416,7 @@ int cte_fuse_unlink(const char *path) {
   // flight, which an unlink-after-write pattern rarely does).
   CloserBarrier();
   clio::cte::core::Client::DeferAwaitKey(
-      clio::cte::filesystem::Client::FileKey(std::string(path)));
+      clio::cte::core::Client::DeferKeyHashName(std::string(path)));
   EnsureCreated(std::string(path));
   HiwaterErase(std::string(path));
   auto t = cfs->AsyncUnlink(std::string(path));
@@ -1462,7 +1464,7 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
     }
     EnsureCreated(p);
     clio::cte::core::Client::DeferAwaitKey(
-        clio::cte::filesystem::Client::FileKey(p));
+        clio::cte::core::Client::DeferKeyHashName(p));
     if (!tr_tag.IsNull()) {
       DrainSievePages(tr_tag, HiwaterFor(p));
     }
@@ -1740,7 +1742,7 @@ int cte_fuse_rename(const char *from, const char *to,
   // they need no drain — but the hiwater overlay is path-keyed and moves.
   CloserBarrier();
   clio::cte::core::Client::DeferAwaitKey(
-      clio::cte::filesystem::Client::FileKey(std::string(from)));
+      clio::cte::core::Client::DeferKeyHashName(std::string(from)));
   EnsureCreated(std::string(from));
   {
     // The source's sieve pages (keyed by its tag) must land before the tag
