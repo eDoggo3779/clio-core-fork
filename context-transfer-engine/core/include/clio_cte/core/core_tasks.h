@@ -106,6 +106,23 @@ inline Timestamp GetCurrentTimeNs() {
 }
 #endif
 
+/** UTC WALL-clock nanoseconds. For the POSIX-visible tag timestamps
+ *  (mtime/ctime served to stat) — GetCurrentTimeNs above is STEADY-clock
+ *  (process-uptime-like) and reads as 1970-era when interpreted as an
+ *  epoch: fine for relative bookkeeping (scores, LRU), wrong for stat.
+ *  Host-only paths use this; a device pass has no wall clock and the tag
+ *  metadata never lives there. */
+inline Timestamp GetWallTimeNs() {
+#if CTP_IS_GPU_COMPILER && defined(__CUDA_ARCH__)
+  return 0;
+#elif CTP_IS_SYCL_COMPILER && CTP_IS_DEVICE_PASS
+  return 0;
+#else
+  return static_cast<clio::run::u64>(
+      std::chrono::system_clock::now().time_since_epoch().count());
+#endif
+}
+
 /**
  * CreateParams for CTE Core chimod
  * Contains configuration parameters for CTE container creation
@@ -1012,6 +1029,9 @@ struct BlobInfo {
   // under-refusing hands back codec bytes as if they were data. Cleared only
   // when the blob itself is destroyed.
   clio::run::u32 transform_flags_;
+  // Non-zero when this blob is an expendable cache copy the tier may evict.
+  // Write-once: set at creation, never changed. See kCtePutDroppable.
+  clio::run::u32 droppable_;
   int compress_lib_;     // Compression library ID *requested* for this blob
                          // (0 = none). Provenance/telemetry only -- NOT a
                          // reliable answer to "is this blob compressed?";
@@ -1179,6 +1199,7 @@ struct BlobInfo {
         last_read_(0),
         access_count_(0),
         transform_flags_(kBlobTransformNone),
+        droppable_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -1200,6 +1221,7 @@ struct BlobInfo {
         last_read_(0),
         access_count_(0),
         transform_flags_(kBlobTransformNone),
+        droppable_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -1222,6 +1244,7 @@ struct BlobInfo {
         last_read_(GetCurrentTimeNs()),
         access_count_(0),
         transform_flags_(kBlobTransformNone),
+        droppable_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -1244,6 +1267,7 @@ struct BlobInfo {
         last_read_(other.last_read_),
         access_count_(other.access_count_),
         transform_flags_(other.transform_flags_),
+        droppable_(other.droppable_),
         compress_lib_(other.compress_lib_),
         compress_preset_(other.compress_preset_),
         trace_key_(other.trace_key_),
@@ -1680,6 +1704,31 @@ enum class CteOp : clio::run::u32 {
 GLOBAL_CROSS_CONST clio::run::u32 kCtePutReplace = 0x1u;
 
 /**
+ * kCtePutDroppable: this blob's bytes are EXPENDABLE -- a cache copy of data
+ * that is authoritative elsewhere, which the tier may discard at any time.
+ *
+ * Only the writer can know this, so only the writer may say it. Two effects,
+ * and both are needed for the guarantee to hold: the put may trigger eviction
+ * when placement fails, and the blob becomes eligible to BE evicted by such a
+ * put. Without the flag a put neither evicts nor is evicted.
+ *
+ * Droppability is decided at creation and never changes. Eviction selects
+ * candidates from a scan and deletes them afterwards, so a blob that changed
+ * sides in between would be deleted on an answer that is no longer true. A put
+ * WITHOUT the flag to a blob that has it is therefore refused with
+ * kCteDroppabilityConflictRc: a cache copy and authoritative data claiming one
+ * name is a collision worth surfacing. The reverse is allowed and leaves the
+ * blob authoritative.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kCtePutDroppable = 0x2u;
+
+/**
+ * PutBlob refused: the blob is an expendable cache copy (kCtePutDroppable) and
+ * this put would take ownership of bytes the tier may discard.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kCteDroppabilityConflictRc = 14;
+
+/**
  * CTE Telemetry data structure for performance monitoring
  */
 struct CteTelemetry {
@@ -1728,10 +1777,15 @@ template <typename CreateParamsT = CreateParams>
 struct GetOrCreateTagTask : public clio::run::Task {
   IN clio::run::priv::string tag_name_;  // Tag name (required)
   INOUT TagId tag_id_;  // Tag unique ID (default null, output on creation)
+  // Fused metadata (one round trip instead of three for callers like the
+  // clio-fs Open, which needed existence + id + size):
+  OUT clio::run::u32 created_;    // 1 = this call created the tag
+  OUT clio::run::u64 tag_size_;   // total bytes (0 for a fresh tag)
 
   // SHM constructor
   CTP_CROSS_FUN GetOrCreateTagTask()
-      : clio::run::Task(), tag_name_(CLIO_PRIV_ALLOC), tag_id_(TagId::GetNull()) {}
+      : clio::run::Task(), tag_name_(CLIO_PRIV_ALLOC), tag_id_(TagId::GetNull()),
+        created_(0), tag_size_(0) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit GetOrCreateTagTask(
@@ -1740,7 +1794,7 @@ struct GetOrCreateTagTask : public clio::run::Task {
       const TagId &tag_id = TagId::GetNull())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetOrCreateTag),
         tag_name_(CLIO_PRIV_ALLOC, tag_name),
-        tag_id_(tag_id) {
+        tag_id_(tag_id), created_(0), tag_size_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetOrCreateTag;
@@ -1763,7 +1817,7 @@ struct GetOrCreateTagTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(tag_id_);
+    ar(tag_id_, created_, tag_size_);
   }
 
   /**
@@ -1774,6 +1828,8 @@ struct GetOrCreateTagTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     tag_name_ = other->tag_name_;
     tag_id_ = other->tag_id_;
+    created_ = other->created_;
+    tag_size_ = other->tag_size_;
   }
 
   /**
@@ -2384,6 +2440,10 @@ struct ReorganizeBlobTask : public clio::run::Task {
 struct EvictTask : public clio::run::Task {
   IN float min_tier_score_;   // Only evict blobs on targets with score >= this
   IN clio::run::u64 bytes_;   // Reclaim at least this many bytes from the tier
+  // Non-zero: reclaim only from blobs marked kCtePutDroppable, so eviction
+  // cannot destroy data somebody still owns. Set by PutBlob's make-room retry;
+  // 0 for callers that ask for eviction directly.
+  IN clio::run::u32 droppable_only_;
   OUT clio::run::u64 bytes_evicted_;  // Physical bytes actually reclaimed
   OUT clio::run::u64 blobs_evicted_;  // Number of blobs evicted
 
@@ -2392,6 +2452,7 @@ struct EvictTask : public clio::run::Task {
       : clio::run::Task(),
         min_tier_score_(0.0f),
         bytes_(0),
+        droppable_only_(0),
         bytes_evicted_(0),
         blobs_evicted_(0) {}
 
@@ -2399,10 +2460,12 @@ struct EvictTask : public clio::run::Task {
   CTP_CROSS_FUN explicit EvictTask(const clio::run::TaskId &task_id,
                                    const clio::run::PoolId &pool_id,
                                    const clio::run::PoolQuery &pool_query,
-                                   float min_tier_score, clio::run::u64 bytes)
+                                   float min_tier_score, clio::run::u64 bytes,
+                                   clio::run::u32 droppable_only = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kEvict),
         min_tier_score_(min_tier_score),
         bytes_(bytes),
+        droppable_only_(droppable_only),
         bytes_evicted_(0),
         blobs_evicted_(0) {
     task_id_ = task_id;
@@ -2415,7 +2478,7 @@ struct EvictTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(min_tier_score_, bytes_);
+    ar(min_tier_score_, bytes_, droppable_only_);
   }
 
   template <typename Archive>
@@ -2428,6 +2491,9 @@ struct EvictTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     min_tier_score_ = other->min_tier_score_;
     bytes_ = other->bytes_;
+    // Every IN field must be copied here: this is the per-replica duplication
+    // path, so an omission silently reverts to the default on remote shards.
+    droppable_only_ = other->droppable_only_;
     bytes_evicted_ = other->bytes_evicted_;
     blobs_evicted_ = other->blobs_evicted_;
   }

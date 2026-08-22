@@ -95,6 +95,14 @@ static std::string DefaultServerBindAddr() {
   return std::string("0.0.0.0");
 }
 
+// True for bind addresses that can only ever serve this machine. A loopback
+// listener is single-node by construction: no process on another host can
+// reach it, so there is no such thing as a loopback-bound cluster peer.
+static bool IsLoopbackBindAddr(const std::string &addr) {
+  return addr == "localhost" || addr == "::1" ||
+         addr.compare(0, 4, "127.") == 0;
+}
+
 // ChiServerBootstrap{Hip,Sycl}Gpu are defined in the GPU companion lib
 // (clio_run_cxx_gpu) and called from ServerInit below. Declare them at
 // namespace scope (not block scope) so MSVC mangles the references as
@@ -1606,6 +1614,30 @@ bool IpcManager::LoadHostfile() {
   // Clear existing hostfile map
   hostfile_map_.clear();
   hosts_cache_valid_ = false;
+
+  // A loopback bind target means "single node, this machine only", so a
+  // configured hostfile cannot apply: we could not serve any peer listed in it,
+  // nor could a peer reach us. Drop the hostfile and take the single-node path
+  // below. DefaultServerBindAddr() only yields loopback when CLIO_BIND_ADDR
+  // says so explicitly or CLIO_TEST_MODE is set -- a real deployment gets
+  // 0.0.0.0 -- so this cannot change multi-node behavior.
+  //
+  // This matters because the hostfile comes from the *developer's* config
+  // (~/.clio/clio.yaml). Without this, running the unit tests on a machine that
+  // is also a node of a real cluster silently promotes each test into a peer of
+  // that cluster: it binds the cluster IP as node N, and any cluster-wide
+  // operation then blocks waiting for peers that aren't running (the config's
+  // `wait_for_restart`), so the test hangs until its ctest timeout instead of
+  // running single-node on loopback as CLIO_TEST_MODE asked.
+  if (!hostfile_path.empty()) {
+    const std::string bind_addr = DefaultServerBindAddr();
+    if (IsLoopbackBindAddr(bind_addr)) {
+      HLOG(kInfo,
+           "Bind address {} is loopback (single-node); ignoring hostfile {}",
+           bind_addr, hostfile_path);
+      hostfile_path.clear();
+    }
+  }
 
   if (hostfile_path.empty()) {
     // No hostfile configured: bind on all local interfaces (0.0.0.0) by
