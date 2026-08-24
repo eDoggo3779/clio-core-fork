@@ -57,6 +57,9 @@ class Iowarp(CMakePackage):
     variant('gcs', default=False,
             description='Enable Google Cloud Storage (gs://) import in CAE '
                         '(google-cloud-cpp storage)')
+    variant('s3_bdev', default=False,
+            description='Enable the S3 (kS3) bdev storage tier (Poco + SigV4). '
+                        'Distinct from +s3, which is the CAE s3:// importer.')
     variant('boost_coro', default=False,
             description='Use Boost.Context stackful coroutine backend (issue #620)')
 
@@ -92,6 +95,17 @@ class Iowarp(CMakePackage):
     # google-cloud-cpp for the GCS assimilator (find_package(google_cloud_cpp_storage)).
     depends_on('aws-sdk-cpp', when='+s3')
     depends_on('google-cloud-cpp', when='+gcs')
+
+    # The S3 bdev tier is a Poco::Net HTTPS client that signs with SigV4; it
+    # deliberately does NOT link aws-sdk-cpp, because loading aws-cpp-sdk-core
+    # into a process that calls CLIO_INIT corrupts runtime startup, and a
+    # per-block bdev cannot fork a helper the way the CAE assimilator does. So
+    # +s3_bdev and +s3 are genuinely different dependency sets, not aliases.
+    #
+    # No Spack builtin repo ships `poco`, so this tree vendors one under
+    # installers/spack/packages/poco. On a system that already provides Poco
+    # (e.g. libpoco-dev), declare it a Spack external instead of building it.
+    depends_on('poco', when='+s3_bdev')
 
     conflicts('+s3', when='~cae', msg='S3 import lives under CAE; enable +cae')
     conflicts('+gcs', when='~cae', msg='GCS import lives under CAE; enable +cae')
@@ -261,6 +275,11 @@ class Iowarp(CMakePackage):
                 args.append(self.define('CAE_ENABLE_S3', 'ON'))
             if '+gcs' in self.spec:
                 args.append(self.define('CAE_ENABLE_GCS', 'ON'))
+
+        # The S3 bdev tier lives in the runtime's bdev module, not under CAE,
+        # so it is gated outside the '+cae' block above.
+        if '+s3_bdev' in self.spec:
+            args.append(self.define('CLIO_ENABLE_AMAZON_DRIVE', 'ON'))
 
         return args
 
