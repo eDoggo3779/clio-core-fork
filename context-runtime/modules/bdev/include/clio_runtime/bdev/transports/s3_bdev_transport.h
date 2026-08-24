@@ -9,13 +9,25 @@
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
 
+#include <memory>
+
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
-#include <aws/core/Aws.h>
-#include <aws/s3/S3Client.h>
+#include <clio_runtime/bdev/transports/s3_rest.h>
 #endif
 
 namespace clio::run::bdev {
 
+/**
+ * Amazon S3 block-device transport. Each block is stored as an S3 object (key
+ * `[prefix/]block_<offset>`); a sparse (never-written) block reads back as
+ * zeros via the 404 -> zero-fill convention. Mirrors GcsBdevTransport, with
+ * SigV4 request signing in place of GCS's bearer token.
+ *
+ * Deliberately holds no AWS SDK object: linking aws-cpp-sdk-core into a process
+ * that calls CLIO_INIT corrupts runtime init, and unlike the CAE assimilator
+ * this code cannot fork+exec its way out at per-block granularity. See
+ * s3_rest.h.
+ */
 class S3BdevTransport : public BdevTransport {
  public:
   S3BdevTransport() = default;
@@ -39,10 +51,7 @@ class S3BdevTransport : public BdevTransport {
   clio::run::u64 s3_capacity_{0};
 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
-  Aws::SDKOptions options_;
-  std::unique_ptr<Aws::S3::S3Client> s3_client_;
-  Aws::String bucket_name_;
-  static std::atomic<int> init_count_;
+  std::unique_ptr<s3::S3RestClient> client_;
 #endif
 };
 

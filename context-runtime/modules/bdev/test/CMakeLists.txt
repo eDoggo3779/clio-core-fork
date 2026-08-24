@@ -40,6 +40,44 @@ if(Poco_FOUND)
   install(TARGETS clio_run_sigv4_test RUNTIME DESTINATION bin)
 endif()
 
+# S3 REST client round-trip tests. Driven by s3_stub_server.py, which stands up
+# an in-memory S3 stand-in on an ephemeral port and verifies SigV4 itself, so
+# the test needs no AWS account, no network and no credentials. Gated on the
+# feature flag because it includes s3_rest.h, which is #ifdef'd on it.
+if(CLIO_ENABLE_AMAZON_DRIVE)
+  add_executable(clio_run_s3_rest_test test_s3_rest.cc)
+  target_include_directories(clio_run_s3_rest_test PRIVATE
+    ${CLIO_RUN_ROOT}/test              # simple_test.h
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(clio_run_s3_rest_test
+    Poco::Net Poco::NetSSL Poco::Crypto Poco::Foundation
+    ctp::cxx                            # simple_test.h pulls in clio_ctp
+  )
+  set_target_properties(clio_run_s3_rest_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  target_compile_definitions(clio_run_s3_rest_test PRIVATE CLIO_ENABLE_AMAZON_DRIVE)
+  if(CLIO_CORE_ENABLE_TESTS)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+      add_test(
+        NAME cr_bdev_s3_rest
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/s3_stub_server.py
+                -- $<TARGET_FILE:clio_run_s3_rest_test>
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+      )
+      set_tests_properties(cr_bdev_s3_rest PROPERTIES TIMEOUT 120)
+    else()
+      message(STATUS "Python3 not found; skipping the cr_bdev_s3_rest test")
+    endif()
+  endif()
+  install(TARGETS clio_run_s3_rest_test RUNTIME DESTINATION bin)
+endif()
+
 # Create bdev test executable
 add_executable(${BDEV_TEST_TARGET} ${BDEV_TEST_SOURCES})
 
