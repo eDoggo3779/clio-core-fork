@@ -247,6 +247,45 @@ set_tests_properties(summarizer_config_units PROPERTIES
   LABELS "coverage;cae;summarizer;config;msan_skip"
 )
 
+#------------------------------------------------------------------------------
+# Test 4d: Summarizer rule/chunking Unit Tests (pure, no runtime)
+#------------------------------------------------------------------------------
+# FindLabelMatch and SplitPayload from summarizer_rules.h: rule precedence, the
+# regex_search semantics and invalid-regex skip, and the chunk-boundary
+# arithmetic (chunking disabled, empty payload, template deduction, sanity
+# floor). Deliberately NOT labeled "integration": those two functions are the
+# decision logic of the whole module, and the tests that drive them through a
+# live PutBlob are integration-labeled -- which excludes them from the default
+# (and PR) coverage phase. Testing them directly keeps them measured.
+#------------------------------------------------------------------------------
+add_executable(test_summarizer_rules
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_rules.cc
+)
+
+target_include_directories(test_summarizer_rules
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_summarizer_rules
+  PRIVATE
+    clio_cae_summarizer_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${YAML_CPP_LIBS}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_summarizer_rules DESTINATION bin)
+
+add_test(NAME summarizer_rules COMMAND test_summarizer_rules)
+set_tests_properties(summarizer_rules PROPERTIES
+  TIMEOUT 60
+  LABELS "coverage;cae;summarizer;rules;msan_skip"
+)
+
 # Register individual test cases with CTest
 add_test(NAME cae_clientinit COMMAND test_cae_comprehensive "[cae][core][init]")
 add_test(NAME cae_assimilationctx_default COMMAND test_cae_comprehensive "[cae][ctx]")
@@ -579,6 +618,7 @@ set_tests_properties(
 #------------------------------------------------------------------------------
 add_executable(test_summarizer_store
   ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_store.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/summarizer_http_stub.cc
 )
 
 target_include_directories(test_summarizer_store
@@ -889,6 +929,7 @@ message(STATUS "")
 if(CAE_SUMMARIZATION_ENABLED)
   add_executable(test_summarizer_label_client
     ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_label_client.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/summarizer_http_stub.cc
   )
 
   target_include_directories(test_summarizer_label_client

@@ -33,10 +33,9 @@
 
 #include <clio_cae/summarizer/summarizer_runtime.h>
 #include <clio_cae/summarizer/label_client.h>
+#include <clio_cae/summarizer/summarizer_rules.h>
 
-#include <algorithm>
 #include <cstring>
-#include <regex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -47,74 +46,6 @@ CLIO_TASK_CC(clio::cae::summarizer::Runtime)
 namespace clio::cae::summarizer {
 
 namespace {
-
-/**
- * Walk the configured rules and return the first (if any) whose tag_re_
- * matches `tag_name` and blob_re_ matches `blob_name`. std::regex_search
- * (not _match) so ".*\\.txt" matches any name ending in .txt without needing
- * an explicit anchor. An invalid regex in either side disables that rule
- * (logged at kWarning) and matching continues with the next one.
- * @param rules The configured summarization rules, in priority order.
- * @param tag_name Resolved name of the blob's tag ("" if unresolvable).
- * @param blob_name Name of the blob being written.
- * @return The winning rule, or nullptr when nothing matches.
- */
-const LabelMatch *FindLabelMatch(const std::vector<LabelMatch> &rules,
-                                 const std::string &tag_name,
-                                 const std::string &blob_name) {
-  for (const auto &rule : rules) {
-    try {
-      std::regex tag_rx(rule.tag_re_);
-      std::regex blob_rx(rule.blob_re_);
-      if (std::regex_search(tag_name, tag_rx) &&
-          std::regex_search(blob_name, blob_rx)) {
-        return &rule;
-      }
-    } catch (const std::regex_error &e) {
-      HLOG(kWarning,
-           "FindLabelMatch: invalid regex in rule (tag='{}' blob='{}'): {}",
-           rule.tag_re_, rule.blob_re_, e.what());
-    }
-  }
-  return nullptr;
-}
-
-/**
- * Split a blob payload into per-request slices that fit the model's context.
- *
- * The Ollama API counts both prompt and generated tokens against num_ctx.
- * Reserve ~25% of context for the prompt template + the response budget; the
- * remaining 75% is available for blob payload. Convert tokens to bytes via a
- * conservative ~3 bytes/token English ratio (binary blobs run closer to
- * 1 byte/token, so this errs on splitting *more*).
- *
- * @param payload The blob bytes to summarize.
- * @param prompt_template The template prepended to each chunk.
- * @param ctx_tokens The rule's context_length. <= 0 disables chunking
- *        entirely — the caller takes Ollama's default 2048 and accepts
- *        whatever truncation it does.
- * @return One view per request; always at least one element.
- */
-std::vector<std::string_view> SplitPayload(const std::string &payload,
-                                           const std::string &prompt_template,
-                                           int ctx_tokens) {
-  std::vector<std::string_view> chunks;
-  if (ctx_tokens <= 0 || payload.empty()) {
-    chunks.emplace_back(payload);
-    return chunks;
-  }
-  size_t budget_tokens = static_cast<size_t>(ctx_tokens) * 3 / 4;
-  size_t budget_bytes = budget_tokens * 3;
-  if (budget_bytes > prompt_template.size() + 256) {
-    budget_bytes -= prompt_template.size();
-  }
-  if (budget_bytes == 0) budget_bytes = 256;  // sanity floor
-  for (size_t off = 0; off < payload.size(); off += budget_bytes) {
-    size_t take = std::min(budget_bytes, payload.size() - off);
-    chunks.emplace_back(payload.data() + off, take);
-  }
-  return chunks;
-}
 
 /**
  * Run the rule's prompt over every chunk of the payload and concatenate the
