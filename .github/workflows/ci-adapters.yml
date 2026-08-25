@@ -21,6 +21,20 @@ name: CI Adapters
 #             suites; FSKit-backend mount smoke as a non-blocking probe)
 #   Windows : hdf5_vol + libfuse (WinFsp build + unit + in-process ops
 #             suites + live WinFsp mount smoke)
+#
+# NOT A REQUIRED CHECK (2026-08-25, issue #1022). "adapters (linux, all 5)" was
+# a required status check on the dev and main rulesets and was removed from
+# both. Reason: over 157 runs (2026-08-05..08-25) it blocked 5 of 134 otherwise
+# clean runs on xfstests that flake under the runner's scheduling, on branches
+# that touched nothing those tests exercise -- a macFUSE-only build fix, a
+# dashboard-teardown fix, a bdev preallocation clamp. Blocking a merge on a
+# result the author cannot act on trains people to re-run instead of read.
+#
+# It still runs on every PR and every push: this is informational coverage, not
+# a gate. Take it seriously -- the five known-flaky xfstests are quarantined
+# (scripts/xfstests/ci_flaky_quarantine.txt) precisely so that what is left CAN
+# be trusted. Re-add it to the rulesets once it has been green for a stretch on
+# its own merits.
 
 on:
   push:
