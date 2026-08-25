@@ -61,6 +61,11 @@ THROUGHPUT_PATTERNS = {
 # Equivalence caveats: what each stack actually did to produce its number.
 FAIRNESS_NUMERIC = {
     'objects_read': r'Objects read:\s+(\d+)',
+    # Write-side counterparts of objects_read / get_count. Both tables are
+    # applied to every results block, so a read row simply leaves these unset
+    # and a write row leaves the read keys unset -- no label dispatch needed.
+    'objects_written': r'Objects written:\s+(\d+)',
+    'put_count': r'PUT count:\s+(\d+)',
     'bytes_moved': r'Bytes moved:\s+(\d+)',
     'logical_bytes': r'Logical bytes:\s+(\d+)',
     'get_count': r'GET count:\s+(\d+)',
