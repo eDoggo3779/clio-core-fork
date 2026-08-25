@@ -72,6 +72,13 @@ class ClioRuntime(Service):
                 'default': 9413
             },
             {
+                'name': 'forward_env',
+                'msg': 'Env var names to copy from the submitting shell into '
+                       'the runtime daemon environment',
+                'type': list,
+                'default': [],
+            },
+            {
                 'name': 'ipc_mode',
                 'msg': 'IPC transport mode for client-server communication',
                 'type': str,
@@ -232,11 +239,56 @@ class ClioRuntime(Service):
         self.setenv('CLIO_SERVER_CONF', self.config_file)
         self.setenv('CTP_LOG_LEVEL', self.config['log_level'])
         self.setenv('CLIO_IPC_MODE', self.config['ipc_mode'].upper())
+        self._forward_env()
 
         self._generate_config()
 
         self.log(f"IOWarp runtime configured")
         self.log(f"  Config file: {self.config_file}")
+
+    def _forward_env(self):
+        """
+        Copy selected variables from the submitting shell into the runtime's
+        environment.
+
+        WHY THIS EXISTS. Jarvis does not hand the job script's environment to
+        the daemon: start() launches it as
+        `PsshExecInfo(env=self.env, ...)`, and self.env is the curated dict
+        jarvis builds (`Auto-built environment with N variables` in the job
+        log). Exporting a variable in the pipeline's pre_cmds therefore reaches
+        jarvis itself and every benchmark process, but NOT clio_run.
+
+        That distinction is invisible until something inside the daemon needs
+        an env var. The S3 bdev does: its SigV4 signer reads
+        AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from the environment only
+        (it has no profile support), and the signing happens in a runtime
+        worker. Without forwarding, bdev Init fails, CTE registers no target,
+        and every subsequent PutBlob returns rc=11 from a different process
+        than the one that logged the cause.
+
+        Names only are logged -- never values, which are credentials here.
+        A name that is unset in the submitting shell is skipped silently, so a
+        pipeline may list optional variables (AWS_SESSION_TOKEN) unconditionally.
+        """
+        names = self.config.get('forward_env') or []
+        if isinstance(names, str):
+            names = [names]
+        forwarded, missing = [], []
+        for name in names:
+            name = str(name).strip()
+            if not name:
+                continue
+            value = os.environ.get(name)
+            if value is None or value == '':
+                missing.append(name)
+                continue
+            self.setenv(name, value)
+            forwarded.append(name)
+        if forwarded:
+            self.log(f"  Forwarded env to runtime: {', '.join(forwarded)}")
+        if missing:
+            self.log(f"  Not set in the submitting shell, skipped: "
+                     f"{', '.join(missing)}")
 
     def _generate_config(self):
         if self.config['main_segment_size'] == 'auto':

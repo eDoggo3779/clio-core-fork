@@ -159,6 +159,46 @@ scheduler:
     - 'mkdir -p "$HOME/s3_write_bench_results" "$HOME/.jarvis-s3-bench"'
     - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
     - 'rm -f "$HOME/s3_write_bench_results/results.csv"'
+    # Pre-flight the EXACT call the S3 bdev makes at Init: a HEAD on the
+    # bucket, signed with the RAW EXPORTED KEYS (not the profile -- the bdev
+    # cannot read profiles). Cheap, and it separates four failures that
+    # otherwise all surface identically as a dead bdev twenty minutes in:
+    #   empty keys -> the export above silently failed
+    #   403        -> the key pair lacks s3:ListBucket ON THE BUCKET. Object
+    #                 -level Get/Put grants are NOT enough; EnsureBucket HEADs
+    #                 the bucket itself before any block is written.
+    #   301        -> AWS_DEFAULT_REGION is not the bucket's region
+    #   404        -> bucket name typo (the bdev will NOT create it; that
+    #                 needs S3_ALLOW_BUCKET_CREATE=1, deliberately unset)
+    - |
+      "${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" - <<'EOF' || exit 1
+      import os, sys
+      # botocore, not s3fs: s3fs's request helpers are internal and have
+      # changed shape across releases. botocore is a hard dependency of s3fs,
+      # so it is present in the same venv, and create_client/head_bucket are
+      # public API.
+      import botocore.session, botocore.exceptions
+      key    = os.environ.get("AWS_ACCESS_KEY_ID", "")
+      secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+      token  = os.environ.get("AWS_SESSION_TOKEN") or None
+      region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+      bucket = os.environ.get("S3_BENCH_BUCKET", "")
+      if not key or not secret:
+          sys.exit("ERROR: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are empty "
+                   "after the credential export. The S3 bdev needs raw keys.")
+      client = botocore.session.get_session().create_client(
+          "s3", region_name=region, aws_access_key_id=key,
+          aws_secret_access_key=secret, aws_session_token=token)
+      try:
+          client.head_bucket(Bucket=bucket)
+      except botocore.exceptions.ClientError as e:
+          code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+          sys.exit(f"ERROR: HeadBucket on '{bucket}' failed with HTTP {code}: {e}\n"
+                   f"  403 -> the key pair needs s3:ListBucket on the bucket itself\n"
+                   f"  301 -> AWS_DEFAULT_REGION={region} is not the bucket's region\n"
+                   f"  404 -> bucket name is wrong")
+      print(f"S3 preflight OK: HeadBucket {bucket} in {region} with exported keys")
+      EOF
   post_cmds:
     - 'RES="$HOME/s3_write_bench_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 2"'
     # A green row with a blank throughput column is a FAILURE, not a success.
@@ -224,6 +264,19 @@ config:
       # SWIM off: transient errors must not promote a peer to dead mid-bench.
       swim_enabled: false
       sleep: 4
+      # THE DAEMON DOES NOT INHERIT THE JOB SCRIPT'S ENVIRONMENT. jarvis starts
+      # clio_run as PsshExecInfo(env=self.env, ...) with the curated dict it
+      # builds itself ("Auto-built environment with N variables" in the job
+      # log), so the AWS_* exports below reach jarvis and every benchmark
+      # process but NOT the runtime. The S3 bdev's SigV4 signer runs inside a
+      # runtime worker and reads raw keys from the environment only -- it has
+      # no AWS_PROFILE support. These names must therefore be forwarded
+      # explicitly. Names only; values never appear in the pipeline or the log.
+      forward_env:
+        - AWS_ACCESS_KEY_ID
+        - AWS_SECRET_ACCESS_KEY
+        - AWS_SESSION_TOKEN      # optional; skipped when unset
+        - AWS_DEFAULT_REGION
 
     - pkg_type: jarvis_clio_core.clio_cte
       pkg_name: cte_core
@@ -253,7 +306,12 @@ config:
       tag_prefix: "s3wb"
       aws_region: "${S3_BENCH_REGION}"
       aws_profile: "${S3_BENCH_PROFILE}"
-      verify: false
+      # ON for the smoke. It runs AFTER the timed loop, so it costs GET egress
+      # (~256 MiB, cents) but not measurement fidelity -- and it is the only
+      # thing in the pipeline that proves bytes actually round-tripped through
+      # S3 rather than being counted as written by a tier that swallowed them.
+      # Turn it off for the full grid, where the egress stops being trivial.
+      verify: true
 
     - pkg_type: jarvis_clio_core.zarr_s3_write_bench
       pkg_name: zarr_s3
