@@ -615,7 +615,14 @@ set_tests_properties(
 # response back as `{name}_label`. Tests 8 & 9 cover it only with a live Ollama,
 # so on a machine without a model it had no coverage at all. Here an in-process
 # HTTP stub answers like Ollama, so the whole path runs hermetically.
+#
+# Gated on CAE_SUMMARIZATION_ENABLED for the same reason as the label-client
+# test below: without libcurl, OllamaGenerate compiles to a stub that always
+# fails, so no summary is ever produced and the whole point of this test is
+# unreachable. (Windows CI has no libcurl; summarizer_dispatch still covers
+# the interposition there, since it EXPECTS inference to fail.)
 #------------------------------------------------------------------------------
+if(CAE_SUMMARIZATION_ENABLED)
 add_executable(test_summarizer_store
   ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_store.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/summarizer_http_stub.cc
@@ -670,6 +677,7 @@ set_tests_properties(
         LABELS "coverage;cae;summarizer;store;integration;msan_skip"
         RESOURCE_LOCK "clio_runtime"
 )
+endif()  # CAE_SUMMARIZATION_ENABLED
 
 # Tests 8 & 9 (LLM labeling + semantic search) require a running Ollama
 # service, so they are gated behind CLIO_CAE_ENABLE_SUMMARY (OFF by default) —
