@@ -351,6 +351,10 @@ typedef struct H5FD_clio_t {
   clio::vfdtrace::FileTrace *trace; /* byte-altitude telemetry; null when off */
 } H5FD_clio_t;
 
+/* Was this file opened with write intent? H5F_ACC_RDWR is what open() keyed
+ * its O_RDWR/O_RDONLY choice off, so it is the same question, asked later. */
+#define H5FD_CLIO_WRITABLE(f) (((f)->flags & H5F_ACC_RDWR) != 0)
+
 /* Prototypes */
 static herr_t H5FD__clio_term(void);
 static void *H5FD__clio_fapl_get(H5FD_t *_file);
@@ -732,7 +736,15 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
   // a durability barrier (no pending dirty state), and the on-disk file is a
   // complete valid native HDF5 image afterward.
   if (file->posix_fd >= 0) {
-    if (clio_vfd_fsync(file->posix_fd) < 0) {
+    /* Only a file we could have WRITTEN has anything to persist, and asking to
+     * persist a read-only one is not portable: fsync(2) tolerates a read-only
+     * descriptor, but the Windows equivalent (_commit -> FlushFileBuffers)
+     * requires write access. The debug CRT asserts outright there ("Invalid
+     * file descriptor", ucrt commit.cpp), and the release CRT quietly returns
+     * EBADF -- which this fail-closed branch would then turn into a failed
+     * H5Fclose on a file that was never dirty. Reproduced by the no-runtime
+     * test's read-only reopen, which is the second open of the same path. */
+    if (H5FD_CLIO_WRITABLE(file) && clio_vfd_fsync(file->posix_fd) < 0) {
       H5FD_CLIO_ERROR("fsync() on close failed");
       ret_value = FAIL; /* fail-closed: a close that did not persist fails */
     }
@@ -1385,7 +1397,8 @@ static herr_t H5FD__clio_flush(H5FD_t *_file, hid_t dxpl_id, bool closing) {
   // Persist the authoritative native file; fail-closed so a flush that did not
   // reach disk never reports success. Writes are write-through, so the native
   // file is the only store holding data to flush.
-  if (file->posix_fd >= 0 && clio_vfd_fsync(file->posix_fd) < 0) {
+  if (file->posix_fd >= 0 && H5FD_CLIO_WRITABLE(file) &&
+      clio_vfd_fsync(file->posix_fd) < 0) {
     H5FD_CLIO_ERROR("fsync() in flush failed");
     return FAIL;
   }
