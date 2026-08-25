@@ -63,6 +63,39 @@ scheduler:
     - 'command -v cae_s3_tool         >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3? (needed for the rawput floor)" >&2; exit 1; }'
     - 'command -v jarvis              >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
     - '"${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" -c "import zarr,s3fs,numpy" || { echo "ERROR: zarr venv broken at ${ZARR_VENV:-$HOME/zarr-venv}" >&2; exit 1; }'
+    # Every IOWarp binary must come from ONE install root. A stale symlink
+    # view earlier on PATH silently pairs an OLD clio_run with a NEW bench:
+    # the runtime then rejects `bdev_type: s3`, CTE starts with zero storage
+    # devices, and every PutBlob fails with rc=11 -- twenty minutes later and
+    # a hundred log lines away from the cause. Compare realpaths, so a view
+    # that does symlink into the right prefix still passes.
+    #
+    # Also assert the runtime is new enough to accept the s3/gcs bdev_type.
+    # The allowlist's error string is a compiled-in literal, so grep the
+    # library for it directly -- do NOT trust the spack hash: branch versions
+    # do not rehash when the branch moves, so a stale build keeps its name.
+    - |
+      RUN_ROOT="$(dirname "$(dirname "$(readlink -f "$(command -v clio_run)")")")"
+      BENCH_ROOT="$(dirname "$(dirname "$(readlink -f "$(command -v clio_s3_write_bench)")")")"
+      if [ "$RUN_ROOT" != "$BENCH_ROOT" ]; then
+        echo "ERROR: mixed IOWarp installs on PATH -- these must be one prefix" >&2
+        echo "  clio_run            -> $RUN_ROOT" >&2
+        echo "  clio_s3_write_bench -> $BENCH_ROOT" >&2
+        echo "  Fix: export IOWARP_VIEW=\$(spack find --format '{prefix}' iowarp@968-s3-bench | tail -1)" >&2
+        exit 1
+      fi
+      CTE_LIB="$RUN_ROOT/lib/libclio_cte_core_runtime.so"
+      [ -f "$CTE_LIB" ] || CTE_LIB="$RUN_ROOT/lib64/libclio_cte_core_runtime.so"
+      [ -f "$CTE_LIB" ] || { echo "ERROR: libclio_cte_core_runtime.so not found under $RUN_ROOT" >&2; exit 1; }
+      grep -aqF "'noop', 's3', or 'gcs'" "$CTE_LIB" || {
+        echo "ERROR: $CTE_LIB predates the s3/gcs bdev_type allowlist." >&2
+        echo "  It will log \"Invalid bdev_type 's3'\", warn \"No storage devices" >&2
+        echo "  configured\", and fail every PutBlob with rc=11. Rebuild:" >&2
+        echo "    spack uninstall -y iowarp@968-s3-bench && spack clean -s \\" >&2
+        echo "      && spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev" >&2
+        exit 1; }
+      echo "install root OK: $RUN_ROOT"
+      echo "CTE s3 allowlist OK: $CTE_LIB"
     # The S3 bdev must actually be in the runtime library, or CTE will fall
     # back to a local tier and this measures RAM. Assert it rather than trust
     # the build. Poco present + AWS SDK absent is the signature of the

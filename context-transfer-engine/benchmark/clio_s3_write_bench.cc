@@ -218,6 +218,7 @@ struct RunResult {
   size_t blobs_done = 0;           /**< Total blobs written. */
   double wall_us = 0.0;            /**< True end-to-end wall time. */
   int rc = 0;                      /**< Non-zero if any put failed. */
+  size_t blobs_failed = 0;         /**< Blobs whose PutBlob returned non-zero. */
 };
 
 /**
@@ -291,9 +292,30 @@ RunResult RunWriteLoop(const BenchConfig& c,
       r.slot_us[s] += std::chrono::duration_cast<std::chrono::microseconds>(
                           t1 - slots[s].t0).count();
       r.slot_ops[s] += 1;
-      if (slots[s].fut->return_code_.load() != 0) {
-        HLOG(kError, "PutBlob failed for blob {} (rc={})", slots[s].blob_idx,
-             slots[s].fut->return_code_.load());
+      const int put_rc = slots[s].fut->return_code_.load();
+      if (put_rc != 0) {
+        // Log the FIRST failure only. When placement is broken every blob
+        // fails identically, and N identical lines bury the one fact that
+        // matters. rc 11..19 is CTE's `10 + alloc_result` from PlaceBlobBytes
+        // (core_runtime.cc), i.e. no target could take the bytes -- almost
+        // always because the S3 tier was rejected at config parse time and
+        // CTE came up with zero storage devices. Say so, rather than making
+        // the reader correlate this against the runtime log.
+        if (r.blobs_failed == 0) {
+          HLOG(kError, "PutBlob failed for blob {} (rc={})", slots[s].blob_idx,
+               put_rc);
+          if (put_rc >= 10 && put_rc < 20) {
+            HLOG(kError,
+                 "  rc {} is a CTE placement failure (alloc_result={}). Check "
+                 "the runtime log for \"Invalid bdev_type 's3'\" followed by "
+                 "\"No storage devices configured\": that means the runtime "
+                 "predates the s3/gcs bdev_type allowlist, so the S3 tier was "
+                 "dropped and there is nowhere to put the blob.",
+                 put_rc, put_rc - 10);
+          }
+          HLOG(kError, "  suppressing further per-blob errors");
+        }
+        ++r.blobs_failed;
         r.rc = 1;
       }
       ++r.blobs_done;
@@ -434,6 +456,11 @@ int main(int argc, char** argv) {
 
     RunResult r = RunWriteLoop(c, tag_id);
     exit_code = r.rc;
+    if (r.blobs_failed != 0) {
+      HLOG(kError, "{}/{} blobs failed to write; the numbers below are not a "
+                   "measurement of anything",
+           r.blobs_failed, r.blobs_done);
+    }
 
     clio_bench::BenchArgs a;
     a.test_case = c.label;

@@ -255,3 +255,37 @@ does not skip cloud paths in its `Mkdir` loop. Pull the branch.
 
 **The bdev link assert fails in `pre_cmds`.** Either the view is stale (see the
 `spack view symlink` trap above) or the build lacked `+s3_bdev`.
+
+**Every `PutBlob` fails with `rc=11`.** CTE has no target to place on. `rc` in the
+range 11–19 is `10 + alloc_result` from `PlaceBlobBytes`; 11 means allocation
+found no viable device. Scroll **up** in the runtime log — the cause is printed
+minutes earlier and looks like this:
+
+```
+core_config.cc:534 ERROR ParseStorageConfig Config error: Invalid bdev_type 's3'
+                     (must be 'file', 'ram', 'hbm', 'pinned', or 'noop')
+core_runtime.cc:743 WARNING Create Warning: No storage devices configured
+```
+
+That error message is the *old* one — the current build names `'s3', or 'gcs'` in
+the same list. So the runtime library predates the s3/gcs allowlist, the S3 tier
+was dropped at config-parse time, and CTE came up with zero devices. Note that
+this is only a `WARNING`: the pool is created successfully and the failure does
+not surface until the first write.
+
+The `pre_cmds` gate greps the compiled-in literal out of
+`libclio_cte_core_runtime.so` to catch this before the allocation is spent.
+
+**"mixed IOWarp installs on PATH".** Two different `iowarp` prefixes were
+reachable at once — typically a stale `IOWARP_VIEW` supplying `clio_run` while a
+freshly built spack prefix supplies `clio_s3_write_bench`. Because
+`spack view symlink` never overwrites existing links, refreshing a view that
+already has an `iowarp` in it silently keeps serving the old one. The reliable
+fix is to skip the view entirely and point `IOWARP_VIEW` straight at the prefix:
+
+```bash
+export IOWARP_VIEW=$(spack find --format '{prefix}' iowarp@968-s3-bench | tail -1)
+```
+
+RPATH makes the symlink farm unnecessary, and a prefix has the `bin/` and `lib/`
+layout the pipeline expects.
