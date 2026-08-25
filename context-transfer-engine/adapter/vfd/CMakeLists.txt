@@ -40,6 +40,23 @@ target_link_libraries(clio_vfd
   ctp::interceptor
   ${HDF5_LIBRARIES})
 
+# Flips CLIO_VFD_API (H5FDclio.h) to dllexport for this target; every consumer
+# leaves it undefined and gets dllimport.
+target_compile_definitions(clio_vfd PRIVATE CLIO_VFD_BUILD)
+
+if(WIN32 AND NOT HDF5_USE_STATIC_LIBRARIES)
+  # HDF5's public GLOBALS -- H5P_CLS_FILE_ACCESS_ID_g, which H5Pset_fapl_clio
+  # reaches through the H5P_FILE_ACCESS macro -- are declared H5_DLLVAR, and
+  # H5api_adpt.h only expands that to __declspec(dllimport) when the CONSUMER
+  # defines H5_BUILT_AS_DYNAMIC_LIB. Without it MSVC emits a plain extern and
+  # the link fails with LNK2019 on that symbol; functions are unaffected, so
+  # the build gets all the way to linking before anything complains.
+  #
+  # Guarded on HDF5_USE_STATIC_LIBRARIES because the macro would be wrong for a
+  # static HDF5, where the globals are ordinary externs.
+  target_compile_definitions(clio_vfd PRIVATE H5_BUILT_AS_DYNAMIC_LIB)
+endif()
+
 # -----------------------------------------------------------------------------
 # Install
 # -----------------------------------------------------------------------------

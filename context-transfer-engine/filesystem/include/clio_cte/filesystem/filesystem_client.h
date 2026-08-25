@@ -1008,9 +1008,18 @@ class Client : public clio::cte::core::Client {
     // Cast to whatever the caller's own struct declares rather than to fixed
     // POSIX types: this is a template instantiated with their stat struct.
     buf->st_size = static_cast<decltype(buf->st_size)>(size);
-    buf->st_blksize = static_cast<decltype(buf->st_blksize)>(kCfsBlkSize);
-    // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
-    buf->st_blocks = static_cast<decltype(buf->st_blocks)>((size + 511) / 512);
+    // st_blksize/st_blocks are POSIX extensions that MSVC's struct stat simply
+    // does not have. Detected on the caller's struct rather than on _WIN32,
+    // because this is a template: a caller passing a struct that DOES declare
+    // them still gets them filled, whatever the platform.
+    if constexpr (requires { buf->st_blksize; }) {
+      buf->st_blksize = static_cast<decltype(buf->st_blksize)>(kCfsBlkSize);
+    }
+    if constexpr (requires { buf->st_blocks; }) {
+      // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
+      buf->st_blocks =
+          static_cast<decltype(buf->st_blocks)>((size + 511) / 512);
+    }
   }
 
   /** fstat(2): fill *buf from the fd's chimod metadata. */

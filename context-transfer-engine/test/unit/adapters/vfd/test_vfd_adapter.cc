@@ -27,9 +27,19 @@
 #include <hdf5.h>
 
 #include <fcntl.h>
-#include <sys/file.h>
 #include <sys/stat.h>
+
+// The descriptor calls below go through the driver's own platform shims
+// (H5FDclio_compat.h) rather than POSIX directly, so this test builds on
+// Windows for the same reason the driver does. sys/file.h and unistd.h do not
+// exist on MSVC; on POSIX the shims are thin inline wrappers over flock/pread.
+#ifndef _WIN32
+#include <sys/file.h>
 #include <unistd.h>
+#endif
+
+#include <filesystem>
+#include <system_error>
 
 #include <algorithm>
 #include <cerrno>
@@ -44,8 +54,29 @@
 #include "clio_cte/core/core_client.h"
 #include <clio_cte/filesystem/filesystem_client.h>
 #include "adapter/vfd/H5FDclio.h"
+#include "adapter/vfd/H5FDclio_compat.h"
 
 namespace {
+
+/** setenv(3) is POSIX; MSVC spells it _putenv_s and has no "don't overwrite"
+ *  mode, so honor overwrite=0 by checking first. */
+inline void TestSetenv(const char *name, const char *value, int overwrite) {
+#ifdef _WIN32
+  if (!overwrite && std::getenv(name) != nullptr) return;
+  (void)_putenv_s(name, value);
+#else
+  (void)setenv(name, value, overwrite);
+#endif
+}
+
+/** access(path, F_OK) stand-in. The error_code overload is deliberate: one
+ *  call site probes a "clio::"-marked name, and a bare colon in a path makes
+ *  the throwing overload unhappy on Windows. */
+inline bool TestPathExists(const char *path) {
+  std::error_code ec;
+  return std::filesystem::exists(path, ec);
+}
+
 const char *kBackend = "/tmp/clio_cte_vfd_test.dat";
 const char *kClioFile = "/tmp/clio_cte_vfd_suite.h5";
 const char *kNativeFile = "/tmp/clio_cte_vfd_suite.h5";
@@ -288,7 +319,7 @@ int main() {
   // every section exercises splitting and resuming, while the constant stream
   // of sub-4 KiB metadata I/O still covers the single-pass case. Must be set
   // before the driver's first use -- it is read once.
-  setenv("CLIO_VFD_MAX_IO_BYTES", "4096", /*overwrite*/ 0);
+  TestSetenv("CLIO_VFD_MAX_IO_BYTES", "4096", /*overwrite*/ 0);
 
   if (!InitRuntime()) {
     std::fprintf(stderr, "[vfd-suite] FAIL: runtime/CTE init\n");
@@ -466,11 +497,11 @@ int main() {
     CHECK(WriteDset(f, "d", H5T_NATIVE_INT32, MakeI32(kSmall)), "7: write");
     CHECK(H5Fflush(f, H5F_SCOPE_GLOBAL) >= 0, "7: H5Fflush (flush callback)");
     // The HDF5 superblock signature must be on the fd now, read via plain POSIX.
-    int rfd = ::open(kNativeFl, O_RDONLY);
+    int rfd = clio_vfd_open(kNativeFl, O_RDONLY, 0);
     CHECK(rfd >= 0, "7: POSIX-open native file mid-session");
     unsigned char sig[8] = {0};
-    ssize_t n = ::pread(rfd, sig, sizeof(sig), 0);
-    ::close(rfd);
+    clio_vfd_ssize_t n = clio_vfd_pread(rfd, sig, sizeof(sig), 0);
+    clio_vfd_close(rfd);
     const unsigned char kHdf5Sig[8] = {0x89, 'H', 'D', 'F',  '\r',
                                        '\n', 0x1a, '\n'};
     CHECK(n == 8 && std::memcmp(sig, kHdf5Sig, 8) == 0,
@@ -513,17 +544,17 @@ int main() {
           "8: force file locking on");
     hid_t f = H5Fcreate(kClioLk, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_lk);
     CHECK(f >= 0, "8: create (VFD takes exclusive lock)");
-    int p = ::open(kNativeLk, O_RDWR);
+    int p = clio_vfd_open(kNativeLk, O_RDWR, 0);
     CHECK(p >= 0, "8: POSIX-open native file");
     errno = 0;
-    int held = ::flock(p, LOCK_EX | LOCK_NB);
+    int held = clio_vfd_lock(p, /*exclusive*/1);
     CHECK(held < 0 && (errno == EWOULDBLOCK || errno == EAGAIN),
           "8: independent flock denied while the VFD holds the lock");
     CHECK(H5Fclose(f) >= 0, "8: close (VFD unlocks)");
-    int freed = ::flock(p, LOCK_EX | LOCK_NB);
+    int freed = clio_vfd_lock(p, /*exclusive*/1);
     CHECK(freed == 0, "8: independent flock granted after the VFD unlocks");
-    ::flock(p, LOCK_UN);
-    ::close(p);
+    clio_vfd_unlock(p);
+    clio_vfd_close(p);
     H5Pclose(fapl_lk);
     std::printf("[vfd-suite] ok 8: lock excludes a concurrent opener; unlock releases\n");
   }
@@ -714,8 +745,6 @@ int main() {
   // Confirm the vector callbacks actually ran (exported counters advanced) AND
   // the data round-trips byte-clean.
   {
-    extern unsigned long H5FDclio_read_vector_calls_g;
-    extern unsigned long H5FDclio_write_vector_calls_g;
     const char *kClioVec = "/tmp/clio_cte_vfd_vec.h5";
     std::remove("/tmp/clio_cte_vfd_vec.h5");
     hid_t dxpl = H5Pcreate(H5P_DATASET_XFER);
@@ -1071,8 +1100,8 @@ int main() {
     CHECK(marker_only < 0, "20: a bare marker with no path is refused");
     CHECK(marked < 0, "20: a clio::-marked path is refused (marker is internal)");
     // ...and nothing was created behind our back at either spelling.
-    CHECK(::access("/tmp/clio_cte_vfd_marked.h5", F_OK) != 0 &&
-              ::access("clio::/tmp/clio_cte_vfd_marked.h5", F_OK) != 0,
+    CHECK(!TestPathExists("/tmp/clio_cte_vfd_marked.h5") &&
+              !TestPathExists("clio::/tmp/clio_cte_vfd_marked.h5"),
           "20: a refused marked name creates no file");
     if (empty >= 0) H5Fclose(empty);
     if (marker_only >= 0) H5Fclose(marker_only);
@@ -1099,8 +1128,8 @@ int main() {
           "21: seed the file");
 
     // An unrelated process-level lock holder.
-    int holder = ::open(kNativeBusy, O_RDWR);
-    CHECK(holder >= 0 && ::flock(holder, LOCK_EX | LOCK_NB) == 0,
+    int holder = clio_vfd_open(kNativeBusy, O_RDWR, 0);
+    CHECK(holder >= 0 && clio_vfd_lock(holder, /*exclusive*/1) == 0,
           "21: take an exclusive lock outside HDF5");
 
     H5E_auto2_t of = nullptr;
@@ -1116,8 +1145,8 @@ int main() {
     CHECK(blocked < 0, "21: opening a file locked by another holder fails");
     CHECK(found_clio_err,
           "21: the driver explains WHY the locked open failed");
-    ::flock(holder, LOCK_UN);
-    ::close(holder);
+    clio_vfd_unlock(holder);
+    clio_vfd_close(holder);
     H5Pclose(fapl_lk);
     std::printf("[vfd-suite] ok 21: a file locked elsewhere fails with a "
                 "diagnosable error\n");
@@ -1289,7 +1318,6 @@ int main() {
   // coalesced I/O, so the assertion is on the bound itself rather than on data
   // that round-trips either way.
   {
-    extern unsigned long H5FDclio_vec_max_span_g;
     const char *kVecCap = "/tmp/clio_cte_vfd_veccap.h5";
     std::remove(kVecCap);
     const size_t kWindow = 4096;

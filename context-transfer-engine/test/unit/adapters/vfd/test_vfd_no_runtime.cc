@@ -26,6 +26,7 @@
 #include <hdf5.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -33,6 +34,20 @@
 #include "adapter/vfd/H5FDclio.h"
 
 namespace {
+
+/** setenv(3) is POSIX; MSVC spells it _putenv_s and has no "don't overwrite"
+ *  mode, so honor overwrite=0 by checking first. Kept local rather than shared
+ *  with test_vfd_adapter.cc on purpose: this test deliberately links nothing
+ *  beyond the driver, which is the whole point of "no runtime". */
+inline void TestSetenv(const char *name, const char *value, int overwrite) {
+#ifdef _WIN32
+  if (!overwrite && std::getenv(name) != nullptr) return;
+  (void)_putenv_s(name, value);
+#else
+  (void)setenv(name, value, overwrite);
+#endif
+}
+
 constexpr hsize_t kN = 4096;
 
 #define CHECK(cond, msg)                                              \
@@ -109,7 +124,7 @@ int main() {
   // Give up on a missing runtime immediately instead of retrying for the
   // default 60s. Without this the second case below spends a minute confirming
   // what it already knows, and the fallback it is checking looks like a hang.
-  setenv("CLIO_CLIENT_RETRY_TIMEOUT", "0", /*overwrite*/ 0);
+  TestSetenv("CLIO_CLIENT_RETRY_TIMEOUT", "0", /*overwrite*/ 0);
 
   hid_t driver = H5FD_clio_init();
   CHECK(driver >= 0, "the driver registers without a runtime");
