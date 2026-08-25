@@ -30,7 +30,21 @@ that shows what a REAL regression looks like in this data (many tests, both
 ctest attempts, MOUNTFAIL) versus a flake (one or two tests, once).
 
 These five now live in `ci_flaky_quarantine.txt`: still run every job, reported
-as a `::warning::`, never gating. **Root cause not yet found.** They are almost
+as a `::warning::`, never gating.
+
+**First signatures captured** (run 32883603078, the PR that added the
+quarantine -- a CI-scripts-only diff that flaked two of the five, which is
+exactly the measured rate and would have been red under the old gate):
+
+* `generic/070` — `rm: cannot remove '.../fsstress/p0/d4b/.../dd60': Directory
+  not empty`. fsstress teardown: `rmdir` sees a directory as non-empty after
+  its children were unlinked — an unlink/readdir visibility ordering hole.
+* `generic/729` — `mmap-rw-fault: pread (D_DIRECT) from hole is broken`. An
+  `O_DIRECT` read from a hole did not come back zeroed.
+
+Both are **real filesystem-semantics bugs that are merely rare**, not test
+noise. Quarantining them is right for the gate; tolerating them is not.
+**Root cause not yet found.** They are almost
 certainly the same class as the 2026-07-05 pool above — a scheduling race that
 only manifests under the runner's constrained CPU — but unlike that pool these
 FAIL rather than HANG, so the two are not proven identical. Next step is to

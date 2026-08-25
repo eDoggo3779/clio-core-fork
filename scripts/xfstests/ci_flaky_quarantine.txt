@@ -48,6 +48,26 @@
 #   * the compat suites, the live mount smoke, apt/pip/docker setup: zero
 #     failures in 157 runs.
 #
+# 2026-08-25 FIRST CAPTURED SIGNATURES. The run that validated this quarantine
+# (32883603078, on the PR that introduced it -- a CI-scripts-only diff) flaked
+# generic/070 AND generic/729, and the new diagnostics printed why:
+#
+#   generic/070  rm: cannot remove '.../fsstress/p0/d4b/.../dd60':
+#                Directory not empty
+#                -> fsstress teardown: rmdir sees a directory as non-empty
+#                   after its children were unlinked. An unlink/readdir
+#                   visibility ordering hole, not test noise.
+#
+#   generic/729  mmap-rw-fault: pread (D_DIRECT) from hole is broken
+#                -> an O_DIRECT read from a hole did not come back zeroed.
+#
+# So these are REAL filesystem-semantics bugs that happen to be rare -- not
+# infrastructure noise. Quarantine is the right call for the gate (a 0.7-2.2%
+# per-test failure rate cannot be allowed to block unrelated merges) but they
+# should be fixed, not tolerated. Note also that this pair failing together on
+# one run is exactly the measured rate, and would have turned the CI-scripts PR
+# red under the old gate.
+#
 # Re-admit a test to ci_baseline_pass.txt once the underlying race is fixed and
 # it has been green across several CI runs. Do not re-admit on a local pass —
 # these flake only under the runner's constrained scheduling.
