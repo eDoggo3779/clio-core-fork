@@ -203,6 +203,12 @@ bool IpcManager::ClientInit() {
   if (is_initialized_) {
     return true;
   }
+  // A genuine (re)initialisation builds fresh transports, so clear the
+  // finalized flag (issue #970). Deliberately AFTER the early return above:
+  // when ClientInit is a no-op because the manager is already initialised, the
+  // transports torn down by a previous ClientFinalize are NOT rebuilt, and a
+  // wait on them must keep failing fast rather than parking forever.
+  client_finalized_.store(false, std::memory_order_release);
   // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
   ctp::SystemInfo::RequestTimerResolutionFromEnv();
 
@@ -610,6 +616,12 @@ bool IpcManager::ServerInit() {
 }
 
 void IpcManager::ClientFinalize() {
+  // FIRST, before anything is torn down (issue #970): publish that this client
+  // is going away, so any wait — one already parked on another thread, or one
+  // submitted later from a still-to-run atexit handler — fails fast instead of
+  // blocking on a response that provably cannot arrive.
+  client_finalized_.store(true, std::memory_order_release);
+
   // Mark shutdown so ZeroMqTransport leaks shared-context sockets instead of
   // zmq_close-ing them on Windows (avoids libzmq's signaler WSASTARTUP abort).
   ctp::lbm::sock::SetSocketLibShutdown();
