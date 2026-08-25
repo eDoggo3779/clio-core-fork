@@ -49,10 +49,12 @@
 
 #include "../simple_test.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <string>
 
@@ -953,6 +955,72 @@ TEST_CASE("Viz pools can be shut down from the dashboard", "[viz]") {
     REQUIRE(Contains(std::string(buf, static_cast<size_t>(n)), "404"));
     REQUIRE(sec < 5.0);
   }
+}
+
+// ===========================================================================
+// Dashboard teardown (issue #1020)
+//
+// Stop() used to deadlock: the HTTPServer(factory, socket, params) overload
+// borrows Poco's process-wide ThreadPool::defaultPool(), so tearing the
+// dashboard down joined threads it never owned and stopAll() never returned.
+// ServerFinalize() stalled behind it and the RequestStop watchdog force-exited
+// the daemon with code 2.
+//
+// These cases drive Stop() directly, on a private VizServer rather than the
+// runtime's singleton, so the teardown is exercised as its own unit instead of
+// only incidentally at process exit.
+// ===========================================================================
+
+TEST_CASE("Viz dashboard starts and stops without wedging", "[viz][shutdown]") {
+  clio::run::viz::VizServer server;
+  // Port 0: an ephemeral port, so this never collides with the singleton
+  // dashboard the other cases in this file are talking to.
+  REQUIRE(server.StartOn("127.0.0.1", 0, /*max_threads=*/4));
+  REQUIRE(server.IsRunning());
+  REQUIRE(server.GetPort() != 0);
+  REQUIRE(server.GetBindAddr() == "127.0.0.1");
+
+  // The regression: this call is what used to never return. Time it, and hold
+  // it to a budget far below the watchdog's, so a reintroduced deadlock fails
+  // the test instead of quietly slowing every shutdown down.
+  auto t0 = std::chrono::steady_clock::now();
+  server.Stop();
+  double ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+  std::cout << "  Stop() took " << ms << " ms" << std::endl;
+  REQUIRE(!server.IsRunning());
+  REQUIRE(server.GetPort() == 0);
+  REQUIRE(ms < 3000.0);  // the teardown budget; a deadlock would spend it all
+
+  // Idempotent: stopping an already-stopped dashboard is a no-op, not a crash.
+  server.Stop();
+  REQUIRE(!server.IsRunning());
+}
+
+TEST_CASE("Viz teardown abandons a slow dashboard instead of blocking",
+          "[viz][shutdown]") {
+  // CLIO_VIZ_STOP_BUDGET_MS=0 forces the abandon path: Stop() must give up on
+  // the Poco teardown immediately and return, leaving the server logically
+  // stopped. This is the backstop that keeps a blocked request handler from
+  // holding the whole daemon's shutdown hostage -- without a knob it would be
+  // a branch no test could reach.
+  SIMPLE_TEST_SETENV("CLIO_VIZ_STOP_BUDGET_MS", "0");
+
+  clio::run::viz::VizServer server;
+  REQUIRE(server.StartOn("127.0.0.1", 0, /*max_threads=*/4));
+  REQUIRE(server.IsRunning());
+
+  auto t0 = std::chrono::steady_clock::now();
+  server.Stop();
+  double ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+  std::cout << "  Stop() with a 0 ms budget took " << ms << " ms" << std::endl;
+  REQUIRE(!server.IsRunning());
+  REQUIRE(ms < 1000.0);  // must not wait out anything
+
+  SIMPLE_TEST_SETENV("CLIO_VIZ_STOP_BUDGET_MS", "");
 }
 
 SIMPLE_TEST_MAIN()

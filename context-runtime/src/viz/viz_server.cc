@@ -870,7 +870,19 @@ void VizServer::Stop() {
   // alive for the worker, and the process is seconds from exit anyway) and let
   // the rest of ServerFinalize proceed. Losing the dashboard's memory at exit
   // is strictly better than losing the graceful shutdown.
-  constexpr int kVizStopBudgetMs = 3000;
+  // Overridable with CLIO_VIZ_STOP_BUDGET_MS, the same env convention as
+  // CLIO_VIZ_ENABLE / _PORT / _BIND. An operator can shorten it on a node
+  // where a wedged handler must never delay shutdown, and the tests set 0 to
+  // exercise the abandon path deterministically instead of leaving it as a
+  // branch nothing ever takes.
+  int stop_budget_ms = 3000;
+  if (const char *env = clio::run::env::GetCompat("VIZ_STOP_BUDGET_MS")) {
+    char *end = nullptr;
+    long n = std::strtol(env, &end, 10);
+    if (end != env && n >= 0) {
+      stop_budget_ms = static_cast<int>(n);
+    }
+  }
   std::shared_ptr<Impl> impl(std::move(impl_));  // impl_ is null from here on
   auto finished = std::make_shared<std::promise<void>>();
   std::future<void> done = finished->get_future();
@@ -887,12 +899,12 @@ void VizServer::Stop() {
     finished->set_value();
   }).detach();
 
-  if (done.wait_for(std::chrono::milliseconds(kVizStopBudgetMs)) !=
+  if (done.wait_for(std::chrono::milliseconds(stop_budget_ms)) !=
       std::future_status::ready) {
     HLOG(kWarning,
          "Viz: dashboard teardown did not finish within {} ms; abandoning it "
          "so the shutdown can proceed",
-         kVizStopBudgetMs);
+         stop_budget_ms);
   }
 }
 
