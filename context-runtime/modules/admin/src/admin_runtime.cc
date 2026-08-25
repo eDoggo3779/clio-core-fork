@@ -61,12 +61,6 @@
 #include <unordered_set>
 #include <vector>
 
-#ifdef CLIO_COVERAGE
-// abort() in InitiateShutdown skips the gcov at-exit flush; declared here so
-// the shutdown path can dump counters explicitly (see InitiateShutdown).
-extern "C" void __gcov_dump(void);
-#endif
-
 namespace clio::run::admin {
 
 // Method implementations for Runtime class
@@ -78,6 +72,12 @@ namespace clio::run::admin {
 // Method implementations
 //===========================================================================
 
+// NOTE: no dashboard teardown here. Every viz handler is stateless (no
+// container capture -- see Container::RegisterViz), so an admin container can
+// be destroyed and re-created under a running server; requests in the gap get
+// error responses from a dead pool, not use-after-free. This destructor must
+// also stay trivial because ModuleManager destroys a throwaway prototype
+// instance right after load-time route registration.
 Runtime::~Runtime() {}
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
@@ -153,6 +153,17 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       CTP_MALLOC, kSystemStatsRingSize);
   prev_cpu_times_ = ctp::SystemInfo::GetCpuTimes();
   client_.AsyncSystemMonitor(clio::run::PoolQuery::Local(), 1000000);  // 1s
+
+  // Spawn the web dashboard (issue #990). One server per node -- the routes it
+  // serves are all node-local reads or explicitly-addressed Monitor queries, so
+  // there is no collective here and every node can serve the same UI. Our
+  // routes were already registered by PoolManager::RegisterContainer (which
+  // runs before this Create), and any ChiMod composed later adds its own as it
+  // comes up. Start() is a no-op unless the dashboard is enabled, and never
+  // fatal: a taken port disables the dashboard, it does not fail the runtime.
+  if (auto *viz = CLIO_VIZ) {
+    viz->Start();
+  }
 
   HLOG(kDebug,
        "Admin: Container created and initialized for pool: {} (ID: {}, count: "
@@ -298,38 +309,23 @@ clio::run::TaskResume Runtime::StopRuntime(clio::run::shared_ptr<StopRuntimeTask
   task->return_code_ = 0;
   task->error_message_ = "";
 
-  // Die immediately. SWIM will detect the death and trigger recovery.
   is_shutdown_requested_ = true;
-  HLOG(kInfo, "Admin: Runtime shutdown initiated successfully");
-  InitiateShutdown(task->grace_period_ms_);
+  const bool force =
+      (task->shutdown_flags_ & StopRuntimeTask::kForceShutdown) != 0;
+  HLOG(kInfo, "Admin: Runtime shutdown initiated ({})",
+       force ? "forced" : "graceful");
+
+  // This handler runs on a worker thread, so it must not tear down the
+  // runtime inline (ServerFinalize joins this very worker). RequestStop only
+  // sets flags / spawns detached threads; shutdown proceeds asynchronously
+  // after this task's ack is delivered to the client.
+  auto *runtime_manager = CLIO_RUNTIME_MANAGER;
+  runtime_manager->RequestStop(force
+                                   ? clio::run::RuntimeManager::StopMode::kForce
+                                   : clio::run::RuntimeManager::StopMode::kGraceful,
+                               task->grace_period_ms_);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
-}
-
-void Runtime::InitiateShutdown(clio::run::u32 grace_period_ms) {
-  HLOG(kDebug, "Admin: Initiating runtime shutdown with {}ms grace period",
-       grace_period_ms);
-
-  // In a real implementation, this would:
-  // 1. Signal all worker threads to stop
-  // 2. Wait for current tasks to complete (up to grace period)
-  // 3. Clean up all resources
-  // 4. Exit the runtime process
-
-  // For now, we'll just set a flag that other components can check
-  is_shutdown_requested_ = true;
-
-  // Get CLIO Runtime manager to initiate shutdown
-  auto *runtime_manager = CLIO_RUNTIME_MANAGER;
-  if (runtime_manager) {
-    // runtime_manager->InitiateShutdown(grace_period_ms);
-  }
-#ifdef CLIO_COVERAGE
-  // abort() skips the gcov at-exit flush; dump counters explicitly so
-  // daemon-side coverage from runtime tests is not silently discarded.
-  __gcov_dump();
-#endif
-  std::abort();
 }
 
 clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
@@ -775,64 +771,74 @@ void Runtime::MonitorContainerStats(clio::run::shared_ptr<MonitorTask> &task) {
   msgpack::sbuffer sbuf;
   msgpack::packer<msgpack::sbuffer> pk(sbuf);
 
-  auto pool_ids = pool_manager->GetAllPoolIds();
-  pk.pack_array(pool_ids.size());
-
-  for (const auto &pid : pool_ids) {
+  // One entry per REAL container hosted on this node (issue #994): the model
+  // is per container, so each entry reports exactly the weights that container
+  // schedules with. The static container owns no learned state and a pool with
+  // no container on this node contributes nothing.
+  struct Entry {
+    PoolId pool_id_;
+    std::string pool_name_;
+    std::string chimod_name_;
+    ContainerHold container_;
+  };
+  std::vector<Entry> entries;
+  for (const auto &pid : pool_manager->GetAllPoolIds()) {
     const auto *info = pool_manager->GetPoolInfo(pid);
     if (!info) continue;
+    std::string pool_name = info->pool_name_;
+    std::string chimod_name = info->chimod_name_;
+    for (const auto &dc : pool_manager->GetLocalContainers(pid)) {
+      ContainerHold container = dc.get();
+      if (!container) continue;
+      entries.push_back(Entry{pid, pool_name, chimod_name, container});
+    }
+  }
 
-    // Get the static container for model data
-    auto container = pool_manager->GetStaticContainer(pid).get();
+  pk.pack_array(entries.size());
+  for (const auto &entry : entries) {
+    ContainerHold container = entry.container_;
 
     pk.pack_map(6);
 
     pk.pack("pool_id");
-    pk.pack(pid.ToString());
+    pk.pack(entry.pool_id_.ToString());
 
     pk.pack("pool_name");
-    pk.pack(info->pool_name_);
+    pk.pack(entry.pool_name_);
 
     pk.pack("chimod_name");
-    pk.pack(info->chimod_name_);
+    pk.pack(entry.chimod_name_);
 
     pk.pack("container_id");
-    pk.pack(container ? container->container_id_ : 0u);
+    pk.pack(container->container_id_);
 
     // Model data: array of per-method entries
-    if (container) {
-      const auto &model = container->GetMethodModel();
-      const auto &mape = container->GetMethodMapeVec();
-      const auto &model_wall = container->GetMethodModelWall();
-      const auto &mape_wall = container->GetMethodMapeWallVec();
-      const auto &names = container->GetMethodNames();
+    const auto &model = container->GetMethodModel();
+    const auto &mape = container->GetMethodMapeVec();
+    const auto &model_wall = container->GetMethodModelWall();
+    const auto &mape_wall = container->GetMethodMapeWallVec();
+    const auto &names = container->GetMethodNames();
 
-      pk.pack("methods");
-      pk.pack_array(model.size());
-      for (size_t i = 0; i < model.size(); ++i) {
-        pk.pack_map(6);
-        pk.pack("id");
-        pk.pack(static_cast<uint32_t>(i));
-        pk.pack("name");
-        pk.pack(i < names.size() ? names[i] : std::string());
-        pk.pack("coefficient");
-        pk.pack(model[i]);
-        pk.pack("mape");
-        pk.pack(i < mape.size() ? mape[i] : 0.0f);
-        pk.pack("wall_coefficient");
-        pk.pack(i < model_wall.size() ? model_wall[i] : 0.0f);
-        pk.pack("wall_mape");
-        pk.pack(i < mape_wall.size() ? mape_wall[i] : 0.0f);
-      }
-
-      pk.pack("learning_rate");
-      pk.pack(container->GetLearningRate());
-    } else {
-      pk.pack("methods");
-      pk.pack_array(0);
-      pk.pack("learning_rate");
-      pk.pack(0.0f);
+    pk.pack("methods");
+    pk.pack_array(model.size());
+    for (size_t i = 0; i < model.size(); ++i) {
+      pk.pack_map(6);
+      pk.pack("id");
+      pk.pack(static_cast<uint32_t>(i));
+      pk.pack("name");
+      pk.pack(i < names.size() ? names[i] : std::string());
+      pk.pack("coefficient");
+      pk.pack(model[i]);
+      pk.pack("mape");
+      pk.pack(i < mape.size() ? mape[i] : 0.0f);
+      pk.pack("wall_coefficient");
+      pk.pack(i < model_wall.size() ? model_wall[i] : 0.0f);
+      pk.pack("wall_mape");
+      pk.pack(i < mape_wall.size() ? mape_wall[i] : 0.0f);
     }
+
+    pk.pack("learning_rate");
+    pk.pack(container->GetLearningRate());
   }
 
   task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
@@ -2229,8 +2235,7 @@ clio::run::TaskResume Runtime::RecoverContainers(
       continue;
     }
     container.get()->Recover(ra.pool_id_, ra.pool_name_, ra.container_id_);
-    pool_manager->RegisterContainer(ra.pool_id_, ra.container_id_, container,
-                                    false);
+    pool_manager->RegisterContainer(ra.pool_id_, ra.container_id_, container);
     task->num_recovered_++;
   }
 
@@ -2282,6 +2287,16 @@ clio::run::TaskResume Runtime::SystemMonitor(clio::run::shared_ptr<SystemMonitor
   // Push into ring buffer
   if (system_stats_ring_) {
     system_stats_ring_->Push(stats);
+  }
+
+  // Persist each pool's learned task-stat model (issue #956). This 1 Hz task is
+  // the runtime's existing "sample everything" heartbeat, so it is the natural
+  // driver; FlushModels throttles itself to one write per pool per flush
+  // interval and skips pools whose weights have not changed, so the common tick
+  // does no I/O at all. Without a periodic save the weights would only survive
+  // a graceful shutdown.
+  if (auto *pool_manager = CLIO_POOL_MANAGER) {
+    pool_manager->FlushModels();
   }
 
   cur_task->SetDidWork(true);
