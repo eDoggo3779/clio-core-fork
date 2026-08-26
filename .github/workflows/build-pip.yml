@@ -378,13 +378,25 @@ jobs:
     - name: Checkout repository (for test script)
       uses: actions/checkout@v4
       with:
-        sparse-checkout: installers/pip
+        # CI/ as well as installers/pip: the image pull below goes through
+        # CI/retry.sh, which has to exist in the workspace.
+        sparse-checkout: |
+          installers/pip
+          CI
 
     - name: Download wheels
       uses: actions/download-artifact@v4
       with:
         name: wheels-${{ matrix.arch }}
         path: wheels/
+
+    # Pull with retry BEFORE the run. A registry hiccup makes `docker run`
+    # exit 125 -- "Error response from daemon: Get
+    # https://registry-1.docker.io/v2/..." -- which reads as a wheel failure
+    # but is Docker Hub being briefly unreachable. Pulling separately keeps the
+    # retry on the network step and off the test itself.
+    - name: Pull ${{ matrix.distro }}
+      run: bash CI/retry.sh docker pull ${{ matrix.distro }}
 
     - name: Test wheel in ${{ matrix.distro }}
       run: |
