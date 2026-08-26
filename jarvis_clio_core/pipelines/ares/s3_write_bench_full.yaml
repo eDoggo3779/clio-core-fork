@@ -80,7 +80,11 @@ scheduler:
   # Must stay large: Ares Slurm uses proctrack/cgroup with ConstrainCores, and
   # each S3 PUT occupies a whole runtime worker thread for its duration. A
   # narrow cgroup silently caps concurrency.
-  cpus_per_task: 48
+  # 40, NOT MORE. Ares compute nodes have 40 allocatable CPUs, and sbatch
+  # rejects the job outright with "CPU count per node can not be satisfied"
+  # if this exceeds that -- at submit time, before anything runs. Every
+  # working pipeline in this directory on the compute partition uses 40.
+  cpus_per_task: 40
   partition: compute
   # ~70 min per repeat x 3 repeats = ~3.6 h measured, with headroom for a
   # bad-network night. Sized for overnight; raise `time` before adding rows.
@@ -520,11 +524,17 @@ vars:
   # narrower than K caps effective concurrency below the requested value and
   # the row silently measures the pool instead of the link.
   #
-  # 64 workers against cpus_per_task: 48 is intentional oversubscription:
-  # these threads are parked in a socket read, not spinning on CPU. The
-  # smoke already ran 48 workers on 40 cpus without trouble. Do not read
-  # that as licence to go much further -- if a future row needs K >> 64,
-  # confirm the workers are not spin-polling first.
+  # 64 workers against cpus_per_task: 40 is intentional oversubscription
+  # (1.6x): these threads are parked in a socket read, not spinning on CPU.
+  # The smoke already ran 48 workers on 40 cpus without trouble. 40 is a
+  # hard Slurm limit on this partition, so widening the pool is the only
+  # lever available -- cpus_per_task cannot follow it.
+  #
+  # IF THE K=64 ROW DIPS BELOW K=32 *FOR CLIO ONLY* while rawput holds
+  # flat, oversubscription is the suspect -- rawput forks processes and
+  # uses no runtime worker, so it is unaffected by the pool. Re-run that
+  # one point with runtime.num_threads: 48 before reading anything into it.
+  # If both dip, it is the link and the pool is innocent.
   #
   # clio_s3.worker_threads is REPORTED ONLY (it lands in the fairness block
   # as `Runtime worker threads`); it must track runtime.num_threads or the
