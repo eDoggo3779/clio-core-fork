@@ -231,6 +231,18 @@ void BatchManager::OnAggregateComplete(Worker *worker,
     member->SetCompleter(completer);
     // Complete the original: local future signal or remote SendOut.
     member->ExecContainer() = container;  // DynamicContainer copy (handle)
+    // A member forwarded from another node completes by SendOut, which EndTask
+    // performs ASYNCHRONOUSLY: it copies the member's RunFuture onto the net
+    // queue and relies on that copy being OWNING to keep the task alive until
+    // the net worker actually transmits. RouteManyToOne deliberately left the
+    // RunFuture's task pointer NON-owning (to break the task->RunContext->
+    // future->task cycle), and the last owning reference is the `members`
+    // element being iterated here, which drops as soon as this loop finishes.
+    // Restore ownership for the duration of the handoff; EndTask re-breaks the
+    // cycle itself right after EnqueueNetTask has taken its copy.
+    if (member->IsRemote()) {
+      member->RunFuture().GetTaskPtr() = member;
+    }
     worker->EndTask(member, false);
   }
 }

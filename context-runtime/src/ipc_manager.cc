@@ -4044,19 +4044,35 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     return RouteResult::Dne;
   }
 
-  // Check if task has already been routed - if so, return ExecHere
-  if (task_ptr->IsRouted()) {
-    return RouteResult::ExecHere;
-  }
-
   // Collective (ManyToOne / AllToOne) routing is handled before the normal
   // resolve path: forward to the neighborhood leader, or park into the batch
   // manager if we are the leader. Both modes share this routing; they differ
   // only in the BatchManager flush condition (time window vs. all-containers
   // barrier). (The aggregate task the leader later runs is a plain Local task
   // and does not re-enter this branch.)
+  //
+  // This MUST come before the IsRouted() early-return below. A member submitted
+  // on a non-leader node is forwarded here over the network, and RecvIn marks
+  // EVERY net-received task routed before handing it to a worker. With the
+  // early-return first, such a member never reached the BatchManager: it ran
+  // standalone on the leader and returned its own un-combined result, while the
+  // leader-local member sat in a group whose count could never reach the pool's
+  // container count. So a collective whose members did not all originate on the
+  // leader node silently did not happen -- an AllReduce returned each caller's
+  // own value with rc=0, and any leader-local member hung forever. Collectives
+  // only worked when every member was submitted on the leader, which is exactly
+  // the case the single-client alltoone test covers.
+  //
+  // Re-entry is bounded: on the leader this parks the task (it is never routed
+  // again), and the aggregate it later builds carries PoolQuery::Local(), so it
+  // does not match IsCollectiveMode().
   if (task_ptr->pool_query_.IsCollectiveMode()) {
     return RouteManyToOne(future);
+  }
+
+  // Check if task has already been routed - if so, return ExecHere
+  if (task_ptr->IsRouted()) {
+    return RouteResult::ExecHere;
   }
 
   // Only call ScheduleTask for Dynamic pool queries.

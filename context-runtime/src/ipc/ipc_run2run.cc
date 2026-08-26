@@ -254,7 +254,23 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
 
     task_copy->task_id_.net_key_ = send_map_key;
     task_copy->task_id_.replica_id_ = i;
-    task_copy->pool_query_ = query;
+    // A collective (ManyToOne / AllToOne) member keeps its OWN query across the
+    // wire. `query` here is the physical envelope RouteManyToOne wrapped it in
+    // (Physical(leader)), and the target node was already resolved from it
+    // above, so nothing on this side still needs it. The receiving leader,
+    // however, needs the collective query itself: it carries the routing mode
+    // that makes RouteTask park the task in the BatchManager, plus the
+    // container_hash and batch_key that decide WHICH group it joins.
+    // Overwriting it with the envelope erased all three, so a forwarded member
+    // arrived at the leader looking like an ordinary Physical task: it ran
+    // standalone and returned an un-combined result (an AllReduce gave each
+    // caller back its own value with rc=0), and the collective it should have
+    // joined waited for a member that never arrived.
+    if (origin_task->pool_query_.IsCollectiveMode()) {
+      task_copy->pool_query_ = origin_task->pool_query_;
+    } else {
+      task_copy->pool_query_ = query;
+    }
     task_copy->pool_query_.SetReturnNode(ipc_manager->GetNodeId());
 
     if (!ipc_manager->IsAlive(target_node_id)) {
