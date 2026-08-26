@@ -187,7 +187,7 @@ jobs:
     # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
       run: |
-        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 -- choco install winfsp -y --no-progress
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
         if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
           throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
         }
@@ -653,7 +653,7 @@ jobs:
     # install this from winfsp.dev. The DLL lives under
     # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
     - name: Install WinFsp (FUSE adapter runtime)
-      run: pwsh CI/Retry.ps1 -- choco install winfsp -y --no-progress
+      run: pwsh CI/Retry.ps1 choco install winfsp -y --no-progress
 
     - name: Test wheel in clean venv
       shell: pwsh
