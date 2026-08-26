@@ -2,6 +2,7 @@ from jarvis_cd.core.pkg import Application
 from jarvis_cd.shell import Exec, LocalExecInfo
 import os
 import re
+import subprocess
 import sys
 
 # The repo root is on sys.path when jarvis imports this module, so the shared
@@ -25,10 +26,19 @@ class ClioS3WriteBench(Application):
     IMPORTANT -- environment ownership: the PUT is performed by the RUNTIME
     process, which the clio_runtime package launches with its own environment.
     The AWS_* variables set here cover only this benchmark process, which does
-    no S3 I/O at all. The pipeline's pre_cmds MUST export them so the job
-    script -- and hence the runtime daemon -- inherits them. This differs from
-    the read bench only in which process signs: there it was the forked
-    cae_s3_tool, here it is clio_run itself.
+    no S3 I/O at all.
+
+    Exporting them in the pipeline's pre_cmds is NOT sufficient either, which
+    is the trap this benchmark actually fell into. Jarvis launches the daemon
+    as `PsshExecInfo(env=self.env, ...)` with a dict it builds from
+    `EnvironmentManager.COMMON_ENV_VARS` -- a fixed list of toolchain
+    variables that contains no AWS_* entry -- so the job script's exports
+    reach jarvis and every benchmark process but never clio_run. The runtime
+    package's `forward_env` option exists to bridge that gap; the pipeline
+    must list the AWS names there. See clio_runtime.pkg._forward_env.
+
+    This differs from the read bench only in which process signs: there it was
+    the forked cae_s3_tool, here it is clio_run itself.
     """
 
     def _init(self):
@@ -36,6 +46,7 @@ class ClioS3WriteBench(Application):
         self.benchmark_executable = 'clio_s3_write_bench'
         self.output_path = None
         self.rss_path = None
+        self.objects_path = None
 
     def _configure_menu(self):
         """
@@ -50,8 +61,9 @@ class ClioS3WriteBench(Application):
                 'msg': 'Bytes per blob',
                 'type': str,
                 'default': '4m',
-                'help': 'Suffixes k/m/g. Blobs larger than the bdev block '
-                        'size become several PUTs.'
+                'help': 'Suffixes k/m/g. One blob becomes one S3 object: '
+                        'the bdev issues one PutObject per allocator block '
+                        'and an unfragmented request gets a single block.'
             },
             {
                 'name': 'num_blobs',
@@ -70,13 +82,29 @@ class ClioS3WriteBench(Application):
                         'duration. Sweep clio_runtime.num_threads with this.'
             },
             {
-                'name': 'block_size',
-                'msg': 'Bdev block size, for the derived PUT count',
+                'name': 'bucket',
+                'msg': 'Bucket to count objects in after the run',
                 'type': str,
-                'default': '1m',
-                'help': 'Must match the bdev tier actually configured, or the '
-                        '"PUT count" fairness column will be wrong. It is a '
-                        'reporting input only; it does not configure the bdev.'
+                'default': '',
+                'help': 'Enables the objects_measured column. Empty disables '
+                        'the count; the run still succeeds.'
+            },
+            {
+                'name': 'key_prefix',
+                'msg': 'Key prefix of the bdev tier, for the object count',
+                'type': str,
+                'default': '',
+                'help': 'The clio_cte device path WITHOUT the s3://bucket/ '
+                        'part and without the _node<N> suffix CTE appends -- '
+                        'listing that stem covers every node.'
+            },
+            {
+                'name': 'venv',
+                'msg': 'Python venv providing botocore, for the object count',
+                'type': str,
+                'default': '',
+                'help': 'Ares has no AWS CLI and no system botocore; reuse '
+                        'the zarr venv. Empty falls back to sys.executable.'
             },
             {
                 'name': 'worker_threads',
@@ -140,6 +168,8 @@ class ClioS3WriteBench(Application):
                                         'clio_s3_write_output.txt')
         self.rss_path = os.path.join(self.shared_dir,
                                      'clio_s3_write_time.txt')
+        self.objects_path = os.path.join(self.shared_dir,
+                                         'clio_s3_write_objects.txt')
 
         self.setenv('AWS_DEFAULT_REGION', self.config['aws_region'])
         if self.config['aws_profile']:
@@ -184,7 +214,6 @@ class ClioS3WriteBench(Application):
             self.benchmark_executable,
             '--num-blobs', str(self.config['num_blobs']),
             '--blob-size', str(self.config['blob_size']),
-            '--block-size', str(self.config['block_size']),
             '--concurrency', str(self.config['concurrency']),
             '--tag-prefix', str(self.config['tag_prefix']),
             '--worker-threads', str(self.config['worker_threads']),
@@ -210,10 +239,12 @@ class ClioS3WriteBench(Application):
                                         'clio_s3_write_output.txt')
         self.rss_path = os.path.join(self.shared_dir,
                                      'clio_s3_write_time.txt')
+        self.objects_path = os.path.join(self.shared_dir,
+                                         'clio_s3_write_objects.txt')
 
         # Stale output from a previous combination is the blank-column failure
         # mode -- a crash here would otherwise be scored with old numbers.
-        for path in (self.output_path, self.rss_path):
+        for path in (self.output_path, self.rss_path, self.objects_path):
             if path and os.path.exists(path):
                 os.remove(path)
 
@@ -234,7 +265,93 @@ class ClioS3WriteBench(Application):
             raise RuntimeError(
                 f'clio_s3_write_bench exited with non-zero code(s): {nonzero}')
         self._check_output_freshness()
+        # Count what actually landed in the bucket while the runtime is still
+        # up. It must happen here, not in _get_stat: the runtime's teardown
+        # frees blocks, and FreeBlocks issues a DeleteObject per block
+        # (s3_bdev_transport.cc), so by stat-collection time the prefix may be
+        # empty and the count would read zero.
+        self._measure_objects()
         self.log(f'Benchmark completed. Output: {self.output_path}')
+
+    def _measure_objects(self):
+        """
+        List the bdev's key prefix and record how many objects exist.
+
+        WHY THIS IS NOT DERIVED. The benchmark reports `PUT count` as the blob
+        count, which is right only while the allocator satisfies each request
+        with one block. It previously derived ceil(blob_size / block_size)
+        from a knob that configured nothing, and overstated the count 4x. A
+        derived number that cannot be wrong-detected is worse than no number,
+        so this lists the bucket and reports ground truth alongside it. When
+        objects_measured != put_count the allocator fragmented -- or, if it is
+        zero, nothing reached S3 at all and the throughput column is fiction.
+
+        Never raises: a listing problem must not fail a row whose measurement
+        already succeeded.
+        """
+        bucket = str(self.config.get('bucket') or '').strip()
+        prefix = str(self.config.get('key_prefix') or '').strip().strip('/')
+        if not bucket or not prefix:
+            self.log('objects_measured: skipped (bucket/key_prefix not set)')
+            return
+        python = str(self.config.get('venv') or '').strip()
+        python = os.path.join(python, 'bin', 'python3') if python \
+            else sys.executable
+        if not os.path.exists(python):
+            self.log(f'objects_measured: skipped ({python} not found)')
+            return
+
+        # Credentials: AWS_PROFILE + HOME resolve through botocore's shared
+        # credentials file. mod_env carries both (jarvis copies HOME out of
+        # COMMON_ENV_VARS), and the job script's raw keys are inherited by
+        # this process, so pass those through too for the profile-less case.
+        env = dict(self.mod_env) if isinstance(self.mod_env, dict) \
+            else dict(os.environ)
+        for name in ('HOME', 'AWS_PROFILE', 'AWS_ACCESS_KEY_ID',
+                     'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'):
+            if not env.get(name) and os.environ.get(name):
+                env[name] = os.environ[name]
+        env['AWS_DEFAULT_REGION'] = str(self.config.get('aws_region')
+                                        or env.get('AWS_DEFAULT_REGION')
+                                        or 'us-east-1')
+
+        script = (
+            'import os, sys, botocore.session\n'
+            'b, p = sys.argv[1], sys.argv[2]\n'
+            'c = botocore.session.get_session().create_client(\n'
+            '    "s3", region_name=os.environ.get("AWS_DEFAULT_REGION"))\n'
+            'n = tot = 0\n'
+            'for page in c.get_paginator("list_objects_v2").paginate(\n'
+            '        Bucket=b, Prefix=p):\n'
+            '    for o in page.get("Contents", []):\n'
+            '        n += 1; tot += o["Size"]\n'
+            'print(n, tot)\n')
+        try:
+            proc = subprocess.run([python, '-c', script, bucket, prefix],
+                                  env=env, capture_output=True, timeout=180,
+                                  text=True)
+        except Exception as e:
+            self.log(f'objects_measured: listing failed ({e})')
+            return
+        if proc.returncode != 0:
+            self.log(f'objects_measured: listing failed rc={proc.returncode}: '
+                     f'{(proc.stderr or "").strip()[-400:]}')
+            return
+        try:
+            count, total = proc.stdout.split()[:2]
+            int(count), int(total)
+        except Exception:
+            self.log(f'objects_measured: unparseable listing output: '
+                     f'{proc.stdout!r}')
+            return
+        with open(self.objects_path, 'w') as f:
+            f.write(f'objects_measured {count}\nbytes_measured {total}\n')
+        self.log(f'objects_measured: {count} objects, {total} bytes under '
+                 f's3://{bucket}/{prefix}')
+        if int(count) == 0:
+            self.log('WARNING: the bdev prefix is EMPTY after a run the '
+                     'benchmark called successful. Nothing reached S3; treat '
+                     'the throughput columns as invalid.')
 
     def _log_output_tail(self, n_lines=100):
         """
@@ -294,7 +411,7 @@ class ClioS3WriteBench(Application):
         the pipeline's to manage (post_cmds), and clean() runs per-package
         without knowing whether another row still needs the data.
         """
-        for path in (self.output_path, self.rss_path):
+        for path in (self.output_path, self.rss_path, self.objects_path):
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
@@ -326,6 +443,21 @@ class ClioS3WriteBench(Application):
             return
         found = parse_bench_output(output, self.pkg_id, stat_dict)
         parse_time_v(rss_path, self.pkg_id, 'write', stat_dict)
+        # Ground truth from the bucket, written by start(). Compare against
+        # <pkg>.write.put_count: equal means one object per blob as expected,
+        # zero means nothing reached S3 and the row is fiction.
+        objects_path = os.path.join(self.shared_dir,
+                                    'clio_s3_write_objects.txt')
+        if os.path.exists(objects_path):
+            try:
+                with open(objects_path, 'r') as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) == 2:
+                            stat_dict[f'{self.pkg_id}.write.{parts[0]}'] = \
+                                int(parts[1])
+            except Exception as e:
+                self.log(f'Could not read {objects_path}: {e}')
         if found == 0:
             self.log(f'Warning: no metrics extracted from {output_path} '
                      f'({len(output)} bytes). A green row with a blank '

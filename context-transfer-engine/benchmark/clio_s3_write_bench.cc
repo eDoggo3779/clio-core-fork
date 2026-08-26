@@ -53,11 +53,18 @@
  *      concurrency" before concluding anything about scaling.
  *   2. CTE must have the S3 tier as its ONLY target, or the DPE is free to
  *      place blobs on a faster local tier and the benchmark silently measures
- *      RAM. The pipeline config enforces this; --verify-tier asserts it at
- *      runtime rather than trusting the config.
- *   3. The bdev writes fixed-size blocks named block_<offset>, so a blob
- *      larger than the block size becomes several PUTs. "PUT count" reports
- *      the derived object count, not the blob count.
+ *      RAM. The pipeline config enforces this by configuring exactly one
+ *      device; this process has no way to assert it, so read the fairness
+ *      block's measured object count to confirm bytes reached the bucket.
+ *   3. ONE PutBlob BECOMES ONE S3 OBJECT in the common case. The bdev does
+ *      not chop a blob into fixed-size blocks: AllocateFromTarget passes the
+ *      whole request to the allocator and WriteBlocks issues one PutObject
+ *      per returned block (s3_bdev_transport.cc), and the allocator satisfies
+ *      an unfragmented request with a single block. So "PUT count" here is
+ *      blobs_done, not ceil(blob_size / some_block_size). Under heap
+ *      fragmentation the allocator can return several blocks and the real
+ *      count rises; that is why the jarvis package also LISTS the bucket
+ *      prefix and reports objects_measured. Trust that column over this one.
  *
  * Neither the AWS SDK nor Poco is linked into this process: all S3 work
  * happens in the runtime daemon. See the sigv4.h/s3_rest.h transport.
@@ -97,19 +104,29 @@ struct BenchConfig {
   size_t num_blobs = 0;             /**< Blobs to write. */
   u64 blob_size = 0;                /**< Bytes per blob. */
   size_t concurrency = 1;           /**< In-flight AsyncPutBlob calls (K). */
-  u64 block_size = 1048576;         /**< Bdev block size, for the PUT count. */
   int worker_threads = 0;           /**< Reported runtime worker count. */
   bool verify = false;              /**< Read blobs back and compare bytes. */
   bool ok = false;                  /**< False => usage printed, exit. */
 };
+
+/**
+ * Build stamp, greppable in the installed binary.
+ *
+ * Spack branch versions do not rehash when the branch moves, so `spack find`
+ * happily reports a months-old build under the right name and `spack install`
+ * skips the compile. The pipeline therefore greps this literal out of the
+ * binary rather than trusting the spec. BUMP IT whenever a change here alters
+ * what the pipeline expects to read back, and bump the matching literal in
+ * pipelines/ares/s3_write_bench.yaml in the same commit.
+ */
+constexpr const char* kBuildMarker = "s3wb-build-marker-2026-08-26";
 
 void PrintUsage(const char* argv0) {
   HLOG(kError, "Usage: {} --num-blobs N --blob-size 4m --concurrency K",
        argv0);
   HLOG(kError,
        "       [--tag-prefix s3wb] [--label Write] [--worker-threads N]");
-  HLOG(kError,
-       "       [--block-size 1m] [--verify]");
+  HLOG(kError, "       [--verify]");
 }
 
 /**
@@ -153,10 +170,6 @@ BenchConfig ParseArgs(int argc, char** argv) {
       v = need(++i);
       if (!v) return c;
       c.blob_size = clio_bench::ParseSize(v);
-    } else if (f == "--block-size") {
-      v = need(++i);
-      if (!v) return c;
-      c.block_size = clio_bench::ParseSize(v);
     } else if (f == "--concurrency") {
       v = need(++i);
       if (!v) return c;
@@ -178,10 +191,6 @@ BenchConfig ParseArgs(int argc, char** argv) {
   }
   if (c.concurrency == 0) {
     HLOG(kError, "--concurrency must be > 0");
-    return c;
-  }
-  if (c.block_size == 0) {
-    HLOG(kError, "--block-size must be > 0");
     return c;
   }
   c.ok = true;
@@ -392,11 +401,15 @@ int VerifyBlobs(const BenchConfig& c, const clio::cte::core::TagId& tag_id) {
  */
 void PrintFairness(const BenchConfig& c, const RunResult& r) {
   const u64 bytes_moved = static_cast<u64>(r.blobs_done) * c.blob_size;
-  // The bdev splits each blob into block_size objects named block_<offset>,
-  // so PUTs are derived from the block geometry, not from the blob count.
-  const u64 blocks_per_blob =
-      (c.blob_size + c.block_size - 1) / c.block_size;
-  const u64 put_count = static_cast<u64>(r.blobs_done) * blocks_per_blob;
+  // One PutBlob -> one allocator block -> one PutObject, for any request the
+  // heap can satisfy contiguously. This USED to be derived as
+  // ceil(blob_size / block_size) from a --block-size knob that configured
+  // nothing, which overstated the count 4x at 4 MiB blobs and a 1 MiB guess.
+  // The knob is gone. This is still a derivation of the common case, so the
+  // jarvis package lists the bucket prefix afterwards and reports
+  // objects_measured as ground truth -- if the two disagree, the allocator
+  // fragmented and returned more than one block per blob.
+  const u64 put_count = static_cast<u64>(r.blobs_done);
   HLOG(kInfo, "");
   HLOG(kInfo, "=== {} Fairness ===", c.label);
   HLOG(kInfo, "Objects written: {}", put_count);
@@ -416,7 +429,10 @@ void PrintFairness(const BenchConfig& c, const RunResult& r) {
   // one spawn and a full object staged per transfer.
   HLOG(kInfo, "Subprocess spawns: 0");
   HLOG(kInfo, "Temp file bytes: 0");
-  HLOG(kInfo, "Transport chunk bytes: {}", c.block_size);
+  // Bytes per PutObject, not a configured block size: WriteBlocks writes
+  // min(remaining, block.size_) and the single returned block spans the whole
+  // request. Equals blob_size unless the allocator fragmented.
+  HLOG(kInfo, "Transport chunk bytes: {}", c.blob_size);
   HLOG(kInfo, "===================");
 }
 
@@ -428,8 +444,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  HLOG(kInfo, "clio_s3_write_bench: {} blobs of {}, K={}", c.num_blobs,
-       clio_bench::FormatSize(c.blob_size), c.concurrency);
+  HLOG(kInfo, "clio_s3_write_bench [{}]: {} blobs of {}, K={}", kBuildMarker,
+       c.num_blobs, clio_bench::FormatSize(c.blob_size), c.concurrency);
 
   // Attach to the already-running clio_run daemon as a pure client. The
   // second arg (default_with_runtime) MUST be false: the jarvis pipeline

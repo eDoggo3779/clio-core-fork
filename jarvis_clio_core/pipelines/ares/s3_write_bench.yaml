@@ -30,7 +30,8 @@
 #
 # Usage:
 #   export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench
-#   export S3_BENCH_REGION=us-east-2
+#   export S3_BENCH_REGION=us-east-2      # MANDATORY, and must be the bucket's
+#                                         # real region -- verified in pre_cmds
 #   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
 #   jarvis ppl submit <abs path>/s3_write_bench.yaml
 #
@@ -94,8 +95,24 @@ scheduler:
         echo "    spack uninstall -y iowarp@968-s3-bench && spack clean -s \\" >&2
         echo "      && spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev" >&2
         exit 1; }
+      # Same trick for the benchmark binary itself. `spack develop` builds
+      # rebuild in place, so a `git pull` without a `spack install` leaves an
+      # binary that predates the source with no outward sign -- the spec name,
+      # the hash and the view all still look right. Grep the build stamp
+      # instead. Keep this literal in sync with kBuildMarker in
+      # context-transfer-engine/benchmark/clio_s3_write_bench.cc.
+      WANT_MARKER="s3wb-build-marker-2026-08-26"
+      grep -aqF "$WANT_MARKER" "$(command -v clio_s3_write_bench)" || {
+        echo "ERROR: clio_s3_write_bench is STALE -- it predates $WANT_MARKER." >&2
+        echo "  Pulling the repo does not rebuild it. For the dev spec:" >&2
+        echo "    spack install iowarp@968-s3-bench" >&2
+        echo "  For a non-develop spec, branch versions do not rehash, so:" >&2
+        echo "    spack uninstall -y iowarp@968-s3-bench && spack clean -s \\" >&2
+        echo "      && spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev" >&2
+        exit 1; }
       echo "install root OK: $RUN_ROOT"
       echo "CTE s3 allowlist OK: $CTE_LIB"
+      echo "bench build stamp OK: $WANT_MARKER"
     # The S3 bdev must actually be in the runtime library, or CTE will fall
     # back to a local tier and this measures RAM. Assert it rather than trust
     # the build. Poco present + AWS SDK absent is the signature of the
@@ -116,7 +133,12 @@ scheduler:
     #    then inherits. Ares has no AWS CLI, so `aws configure
     #    export-credentials` is unavailable; parse the file directly.
     - 'export AWS_PROFILE="${S3_BENCH_PROFILE:-clio-bench}"'
-    - 'export AWS_DEFAULT_REGION="${S3_BENCH_REGION:-us-east-1}"'
+    # No default. SigV4 is region-scoped and the bdev's signer does not follow
+    # redirects, so guessing us-east-1 for a bucket that lives elsewhere is a
+    # silent 400/301 inside a runtime worker. The preflight below resolves the
+    # bucket's true region and refuses to run if this disagrees.
+    - '[ -n "${S3_BENCH_REGION:-}" ] || { echo "ERROR: S3_BENCH_REGION not set -- it must be the real region of the bucket" >&2; exit 1; }'
+    - 'export AWS_DEFAULT_REGION="$S3_BENCH_REGION"'
     # Real AWS: an endpoint override flips the signer to path-style addressing
     # against a nonexistent host, so both must stay unset.
     - 'unset S3_ENDPOINT AWS_ENDPOINT_URL'
@@ -157,7 +179,40 @@ scheduler:
     # 5) Experiment dirs + repo registration + clean slate (the sweep runner
     #    RESUMES over an existing results.csv and would skip failed rows).
     - 'mkdir -p "$HOME/s3_write_bench_results" "$HOME/.jarvis-s3-bench"'
-    - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
+    # The runtime persists a perf model here and logs an ERROR per attempt if
+    # it cannot. /tmp is node-local, so this must happen on the compute node --
+    # creating it on the login node does nothing for the job.
+    - 'mkdir -p /tmp/clio/models 2>/dev/null || echo "note: /tmp/clio/models not creatable; TaskStatModel will log errors (harmless)"'
+    # Registering the repo was `|| true`, which also swallowed a WRONG path --
+    # jarvis then silently kept whatever copy it had registered before,
+    # including a stale one under ~/.ppi-jarvis. Resolve the checkout, prove
+    # the packages this pipeline needs are in it, and prove nothing shadows
+    # them. All three failures otherwise appear as a missing config option
+    # (`forward_env`) twenty minutes into the allocation.
+    - |
+      if [ -z "${CLIO_REPO:-}" ]; then
+        for cand in "$HOME/clio-core-fork" "$HOME/clio-core"; do
+          if [ -d "$cand/jarvis_clio_core/jarvis_clio_core" ]; then CLIO_REPO="$cand"; break; fi
+        done
+      fi
+      [ -n "${CLIO_REPO:-}" ] || { echo "ERROR: no CLIO checkout found; set CLIO_REPO" >&2; exit 1; }
+      export CLIO_REPO
+      RT_PKG="$CLIO_REPO/jarvis_clio_core/jarvis_clio_core/clio_runtime/pkg.py"
+      [ -f "$RT_PKG" ] || { echo "ERROR: $RT_PKG missing -- CLIO_REPO=$CLIO_REPO is wrong" >&2; exit 1; }
+      grep -q "forward_env" "$RT_PKG" || {
+        echo "ERROR: $RT_PKG has no forward_env option, so AWS credentials" >&2
+        echo "  cannot reach the clio_run daemon and every PutBlob will fail" >&2
+        echo "  with rc=11. Pull the branch in $CLIO_REPO." >&2
+        exit 1; }
+      for shadow in "$HOME/.ppi-jarvis/builtin/clio_runtime" \
+                    "$HOME/.ppi-jarvis/builtin/clio_s3_write_bench"; do
+        if [ -e "$shadow" ]; then
+          echo "ERROR: $shadow shadows the checkout; jarvis will load the stale copy. Remove it." >&2
+          exit 1
+        fi
+      done
+      jarvis repo add "$CLIO_REPO/jarvis_clio_core" 2>/dev/null || true
+      echo "jarvis packages OK: $CLIO_REPO/jarvis_clio_core"
     - 'rm -f "$HOME/s3_write_bench_results/results.csv"'
     # Pre-flight the EXACT call the S3 bdev makes at Init: a HEAD on the
     # bucket, signed with the RAW EXPORTED KEYS (not the profile -- the bdev
@@ -170,18 +225,26 @@ scheduler:
     #   301        -> AWS_DEFAULT_REGION is not the bucket's region
     #   404        -> bucket name typo (the bdev will NOT create it; that
     #                 needs S3_ALLOW_BUCKET_CREATE=1, deliberately unset)
+    #
+    # HeadBucket ALONE IS NOT ENOUGH, and this is the subtle part. Modern
+    # botocore transparently follows S3 region redirects: it will retry
+    # against the correct region and report success even when the region we
+    # handed it is wrong. The bdev's hand-rolled SigV4 signer has no redirect
+    # logic at all, so a preflight that only HEADs can go green while the
+    # daemon gets a 400/301 on every PUT. Ask S3 for the authoritative region
+    # with GetBucketLocation and refuse to run on a mismatch.
     - |
       "${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" - <<'EOF' || exit 1
       import os, sys
       # botocore, not s3fs: s3fs's request helpers are internal and have
       # changed shape across releases. botocore is a hard dependency of s3fs,
       # so it is present in the same venv, and create_client/head_bucket are
-      # public API.
+      # public API. (There is no boto3 in the zarr venv.)
       import botocore.session, botocore.exceptions
       key    = os.environ.get("AWS_ACCESS_KEY_ID", "")
       secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
       token  = os.environ.get("AWS_SESSION_TOKEN") or None
-      region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+      region = os.environ.get("AWS_DEFAULT_REGION", "")
       bucket = os.environ.get("S3_BENCH_BUCKET", "")
       if not key or not secret:
           sys.exit("ERROR: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are empty "
@@ -195,9 +258,26 @@ scheduler:
           code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
           sys.exit(f"ERROR: HeadBucket on '{bucket}' failed with HTTP {code}: {e}\n"
                    f"  403 -> the key pair needs s3:ListBucket on the bucket itself\n"
-                   f"  301 -> AWS_DEFAULT_REGION={region} is not the bucket's region\n"
+                   f"  301 -> AWS_DEFAULT_REGION={region} is not the region of the bucket\n"
                    f"  404 -> bucket name is wrong")
-      print(f"S3 preflight OK: HeadBucket {bucket} in {region} with exported keys")
+      try:
+          loc = client.get_bucket_location(Bucket=bucket).get("LocationConstraint")
+      except botocore.exceptions.ClientError as e:
+          sys.exit(f"ERROR: GetBucketLocation on '{bucket}' failed: {e}\n"
+                   "  The key pair needs s3:GetBucketLocation. Without it the\n"
+                   "  region cannot be verified, and an unverified region is a\n"
+                   "  signing failure inside a runtime worker.")
+      # None/"" means us-east-1; "EU" is the legacy alias for eu-west-1.
+      true_region = {None: "us-east-1", "": "us-east-1",
+                     "EU": "eu-west-1"}.get(loc, loc)
+      if true_region != region:
+          sys.exit(f"ERROR: S3_BENCH_REGION={region} but bucket '{bucket}' "
+                   f"lives in {true_region}.\n"
+                   f"  botocore hid this by following the redirect; the bdev "
+                   f"signer will not.\n"
+                   f"  Fix: export S3_BENCH_REGION={true_region}")
+      print(f"S3 preflight OK: HeadBucket {bucket}, region confirmed "
+            f"{true_region}, with the exported keys")
       EOF
   post_cmds:
     - 'RES="$HOME/s3_write_bench_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 2"'
@@ -212,10 +292,26 @@ scheduler:
       need = ["clio_s3.write.agg_bw_mbps", "zarr_s3.write.agg_bw_mbps",
               "zarr_s3.writezstd.agg_bw_mbps", "raw_put.rawput.agg_bw_mbps"]
       rows = list(csv.DictReader(open(path)))
-      bad = [r.get("run_idx") for r in rows
-             if r.get("status") == "success" and any(not r.get(c) for c in need)]
+      green = [r for r in rows if r.get("status") == "success"]
+      bad = [r.get("run_idx") for r in green if any(not r.get(c) for c in need)]
       print("rows:", len(rows))
       print("GREEN ROWS WITH BLANK THROUGHPUT (== FAILURES):", bad or "none")
+      # objects_measured is a LIST of the bucket, not a number the benchmark
+      # computed, so it is the one column that cannot be fabricated by a run
+      # that wrote nothing. Zero here means the throughput columns are fiction
+      # even though the row is green.
+      empty = [r.get("run_idx") for r in green
+               if str(r.get("clio_s3.write.objects_measured", "")).strip() in ("", "0")]
+      print("GREEN ROWS THAT WROTE NO S3 OBJECTS (== FAILURES):", empty or "none")
+      # A blob should become exactly one object. A mismatch is not a failure,
+      # but it means the allocator fragmented and PUT count understates the
+      # request count -- worth knowing before reading the numbers.
+      for r in green:
+          got, want = (r.get("clio_s3.write.objects_measured"),
+                       r.get("clio_s3.write.put_count"))
+          if got and want and got != want:
+              print(f"  note: row {r.get('run_idx')} measured {got} objects "
+                    f"for {want} blobs (allocator returned >1 block per blob)")
       EOF
     # Purge the write prefix. Object keys are DETERMINISTIC (block_<offset>,
     # raw_%06d.bin, zarr chunk paths), so re-runs overwrite rather than
@@ -267,8 +363,11 @@ config:
       # THE DAEMON DOES NOT INHERIT THE JOB SCRIPT'S ENVIRONMENT. jarvis starts
       # clio_run as PsshExecInfo(env=self.env, ...) with the curated dict it
       # builds itself ("Auto-built environment with N variables" in the job
-      # log), so the AWS_* exports below reach jarvis and every benchmark
-      # process but NOT the runtime. The S3 bdev's SigV4 signer runs inside a
+      # log). That dict is a copy of whichever names in
+      # EnvironmentManager.COMMON_ENV_VARS happen to be set -- a fixed
+      # toolchain list (PATH, LD_LIBRARY_PATH, HOME, CC, ...) with no AWS_*
+      # entry -- so the AWS_* exports in pre_cmds reach jarvis and every
+      # benchmark process but NOT the runtime. The S3 bdev's SigV4 signer runs inside a
       # runtime worker and reads raw keys from the environment only -- it has
       # no AWS_PROFILE support. These names must therefore be forwarded
       # explicitly. Names only; values never appear in the pipeline or the log.
@@ -300,9 +399,14 @@ config:
       num_blobs: 64                                   # SWEPT
       concurrency: 8                                  # SWEPT
       worker_threads: 16                              # SWEPT (reported only)
-      # Reporting only -- must match the bdev's real block size or the
-      # "PUT count" column is wrong.
-      block_size: "1m"
+      # Count what actually landed in the bucket, instead of deriving it. The
+      # prefix is the clio_cte device path below MINUS the s3://bucket/ part
+      # and MINUS the _node<N> suffix CTE appends, so listing this stem covers
+      # every node. It is read right after the timed loop, before teardown:
+      # FreeBlocks issues a DeleteObject per block, so a later count reads 0.
+      bucket: "${S3_BENCH_BUCKET}"
+      key_prefix: "clio-s3-write-bench/bdev"
+      venv: "${ZARR_VENV}"
       tag_prefix: "s3wb"
       aws_region: "${S3_BENCH_REGION}"
       aws_profile: "${S3_BENCH_PROFILE}"

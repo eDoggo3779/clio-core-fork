@@ -163,10 +163,16 @@ uses its `s3fs` for the post-run purge, so it must be importable.
 Here the process that signs is the `clio_run` daemon, and the Poco SigV4 signer
 reads **raw environment variables only** — it has no profile support at all.
 
-The pipeline's `pre_cmds` therefore resolve the profile to keys at job time and
-export them, so the daemon inherits them. Ares has **no AWS CLI**, so
-`aws configure export-credentials` is unavailable; the credentials are parsed
-out of `~/.aws/credentials` (mode 600) with stdlib `configparser`.
+The pipeline's `pre_cmds` therefore resolve the profile to keys at job time.
+Ares has **no AWS CLI**, so `aws configure export-credentials` is unavailable;
+the credentials are parsed out of `~/.aws/credentials` (mode 600) with stdlib
+`configparser`.
+
+Exporting them is **not** enough on its own — the daemon does not inherit the
+job script's environment. The `clio_runtime` package's `forward_env` option
+carries the names listed in the pipeline into the runtime's environment. See the
+troubleshooting entry for the full mechanism; get this wrong and every `PutBlob`
+fails with `rc=11`.
 
 **No secrets are stored in the YAML** — only profile and region names. Set:
 
@@ -176,9 +182,12 @@ export S3_BENCH_PROFILE=clio-bench
 export S3_BENCH_REGION=us-east-2
 ```
 
-`S3_BENCH_REGION` must match the bucket's real region. **SigV4 is
-region-scoped**, and a mismatch is an HTTP **301**, not a 403 — an unhelpful
-error to debug from the runtime log.
+`S3_BENCH_REGION` is **mandatory and must be the bucket's real region** — there
+is deliberately no `us-east-1` default. **SigV4 is region-scoped**, and a
+mismatch is an HTTP **301/400**, not a 403 — an unhelpful error to debug from
+the runtime log. `pre_cmds` verifies it against `GetBucketLocation` rather than
+trusting it, because botocore silently follows the redirect and the bdev's
+signer does not.
 
 ### 3. No dataset staging
 
@@ -222,10 +231,16 @@ without bound even if a purge is skipped.
    required columns are `clio_s3.write.agg_bw_mbps`, `zarr_s3.write.agg_bw_mbps`,
    `zarr_s3.writezstd.agg_bw_mbps`, and `raw_put.rawput.agg_bw_mbps`.
 3. **`objects_written` and `put_count` > 0** on every stack.
-4. **`rawput` is the fastest row.** If CLIO or Zarr beats the floor, something
+4. **`clio_s3.write.objects_measured` equals `num_blobs`.** This one is a `list`
+   of the bucket prefix rather than a number the benchmark computed, so it is
+   the only column a run that wrote nothing cannot fabricate. Zero means the
+   row is fiction regardless of what the throughput columns say; more than
+   `num_blobs` means the allocator fragmented (not a failure — see
+   troubleshooting).
+5. **`rawput` is the fastest row.** If CLIO or Zarr beats the floor, something
    is not actually reaching S3 — check that the CTE tier really is the S3 device
    and not a local fallback.
-5. **Run once with `clio_s3.verify: true`** to prove bytes round-tripped: it
+6. **Run once with `clio_s3.verify: true`** to prove bytes round-tripped: it
    re-reads every blob through CTE and compares content byte-for-byte. Leave it
    off for timed rows.
 
@@ -289,3 +304,81 @@ export IOWARP_VIEW=$(spack find --format '{prefix}' iowarp@968-s3-bench | tail -
 
 RPATH makes the symlink farm unnecessary, and a prefix has the `bin/` and `lib/`
 layout the pipeline expects.
+
+**`S3 bdev: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set`, even though
+the job script exported them.** This is the same `rc=11` cascade as above, one
+layer down: the bdev fails to initialize, `core_runtime.cc` logs
+`Failed to register target ... (error code: 1)` as a **warning**, CTE comes up
+with zero devices, and every `PutBlob` returns 11.
+
+Exporting credentials in `pre_cmds` is not enough. Jarvis launches the daemon as
+`PsshExecInfo(env=self.env, ...)`, and `self.env` is a dict it builds itself from
+`EnvironmentManager.COMMON_ENV_VARS` — a fixed toolchain list (`PATH`,
+`LD_LIBRARY_PATH`, `HOME`, `CC`, …) with **no `AWS_*` entry**. The job script's
+exports therefore reach jarvis and every benchmark process but never `clio_run`.
+The job log names the mechanism:
+
+```
+Auto-built environment with N variables (no 'env' field in pipeline)
+```
+
+The `clio_runtime` package's `forward_env` option copies named variables from
+the submitting shell into the runtime's environment, and this pipeline lists the
+AWS names there. Values are never logged — only names, and only whether each was
+set. A top-level `env:` dict in the pipeline would also work, but it would put
+the secret in a file on disk; `forward_env` reads it from the live shell.
+
+`forward_env` refuses to forward a value containing `$`, a backtick, or a
+backslash. The ssh transport emits each variable as an inline `KEY="value"`
+prefix and escapes only the double quote, so those characters would reach the
+daemon altered — and a corrupted secret is indistinguishable from a permissions
+problem at the far end. AWS keys are base64 (`A–Za–z0–9+/=`), so this should
+never trigger; if it does, regenerate the credential.
+
+**`clio_s3_write_bench is STALE -- it predates <marker>`.** `spack develop`
+builds compile from the working tree, so pulling the branch does **not** rebuild
+them, and nothing about the spec, the hash or the view changes to show it. Run:
+
+```bash
+spack install iowarp@968-s3-bench      # dev spec: rebuilds in place
+```
+
+For a non-`develop` spec, branch versions never rehash when the branch moves, so
+`spack install` reports "already installed" and skips the compile entirely:
+
+```bash
+spack uninstall -y iowarp@968-s3-bench && spack clean -s \
+  && spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev
+```
+
+The gate greps a build stamp (`kBuildMarker` in `clio_s3_write_bench.cc`) out of
+the installed binary rather than trusting the spec.
+
+**`S3_BENCH_REGION=... but bucket ... lives in ...`.** SigV4 is region-scoped and
+the bdev's signer does not follow redirects, so a wrong region is an HTTP 400/301
+on every PUT, from inside a runtime worker. This is easy to miss because
+**botocore hides it**: it transparently retries against the correct region, so an
+`aws`-style check or a `HeadBucket` preflight goes green while the daemon fails.
+The preflight therefore asks S3 for the authoritative answer with
+`GetBucketLocation` and refuses to run on a mismatch, naming the export to fix.
+
+**A row is green but `clio_s3.write.objects_measured` is 0.** Nothing reached the
+bucket and the throughput columns are fiction. `objects_measured` is a `list`
+of the bdev's key prefix taken right after the timed loop — the one column a run
+that wrote nothing cannot fabricate. It runs before teardown on purpose:
+`FreeBlocks` issues a `DeleteObject` per block, so a count taken later reads
+zero even on a healthy run.
+
+**`objects_measured` disagrees with `put_count`.** Not a failure. One `PutBlob`
+normally becomes exactly one S3 object: `AllocateFromTarget` hands the whole
+request to the allocator, `WriteBlocks` issues one `PutObject` per returned
+block, and an unfragmented request gets a single block. More objects than blobs
+means the allocator fragmented and split the request. (An earlier version of this
+benchmark derived `PUT count` as `ceil(blob_size / block_size)` from a
+`--block-size` flag that configured nothing, which overstated it 4× at the smoke
+test's 4 MiB blobs. The flag is gone.)
+
+**`TaskStatModel: failed to open /tmp/clio/models/...`.** Harmless. The runtime
+persists a perf model there and logs an error per attempt if it cannot. `/tmp` is
+node-local, so creating the directory on the login node does nothing — `pre_cmds`
+creates it on the compute node. It does not gate bdev init or `PutBlob`.
