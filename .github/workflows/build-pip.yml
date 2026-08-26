@@ -404,7 +404,18 @@ jobs:
               # AppStream module and put it ahead of the stock interpreter so
               # the venv below matches a wheel we actually ship. Newer distros
               # fall through to their default python3.
-              if dnf install -y -q python3.12 python3.12-pip >/dev/null 2>&1; then
+              #
+              # `expat` is upgraded EXPLICITLY. The rockylinux:8 base image
+              # ships expat 2.2.5, but python3.12-libs is built against 2.5.0
+              # and its RPM dependency is not pinned tightly enough to pull the
+              # newer one in. Without this, pyexpat fails to load with
+              #   undefined symbol:
+              #   XML_SetBillionLaughsAttackProtectionMaximumAmplification
+              # which surfaces as `python3 -m venv` dying inside ensurepip:
+              #   Command '[.../python3, -m, ensurepip, ...]' returned
+              #   non-zero exit status 1
+              # -- a message that names neither expat nor pyexpat.
+              if dnf install -y -q python3.12 python3.12-pip expat >/dev/null 2>&1; then
                 ln -sf /usr/bin/python3.12 /usr/local/bin/python3
               else
                 dnf install -y -q python3 python3-pip >/dev/null 2>&1
