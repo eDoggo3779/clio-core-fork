@@ -124,7 +124,7 @@ struct Mutex {
   static constexpr u32 kSpinRung = 64;
   /** sched_yield()s before escalating to a timed park. */
   static constexpr u32 kYieldRung = 1024;
-  /** Park duration. At/above the hrtimer slack on purpose -- see Backoff(). */
+  /** Upper bound on the rung-3 park, in microseconds. */
   static constexpr min_u64 kParkUs = 100;
 
   CTP_INLINE_CROSS_FUN
@@ -143,13 +143,25 @@ struct Mutex {
     if (ty != ThreadType::kPthread && ty != ThreadType::kStdThread) {
       return;
     }
-    // Rung 2 -- deschedule WITHOUT arming a timer. This rung is what was
-    // missing: on x86/arm CTP_THREAD_MODEL->Yield() is a bare PAUSE that does
-    // not deschedule (see pthread.h), so rung 1 went straight to a timed
-    // sleep. std::this_thread::yield() is sched_yield() on POSIX and
-    // SwitchToThread() on Windows -- it hands the core to a runnable holder at
-    // no timer cost, which is exactly what a contended lock needs.
-    if (spin_count < kSpinRung + kYieldRung) {
+    // Rung 2 -- deschedule WITHOUT arming a timer, but ONLY under the Pthread
+    // model. There, on x86/arm, CTP_THREAD_MODEL->Yield() is a bare PAUSE that
+    // does not deschedule (see pthread.h), so rung 1 went straight to a timed
+    // sleep and this rung is the missing step: std::this_thread::yield() is
+    // sched_yield() on POSIX and hands the core to a runnable holder for free.
+    //
+    // StdThread must NOT take this rung. Its Yield() already IS
+    // std::this_thread::yield(), so rung 2 would repeat the identical call
+    // kYieldRung more times -- pure overhead, and on Windows (where no
+    // pthreads means StdThread is the default model and the call is a
+    // SwitchToThread syscall) it raises the pre-park cost from 64 to 1088
+    // syscalls per wait. That regressed ctp_priv_umap_ll on windows-2025 from
+    // 30.4s to over its 120s timeout, while Linux moved 4%, because Linux uses
+    // the Pthread model where rung 1 costs ~20ns.
+    //
+    // Same reasoning applies to a Pthread build on an architecture whose
+    // Yield() falls back to sched_yield() (neither x86 nor arm); there rung 2
+    // is redundant rather than harmful.
+    if (ty == ThreadType::kPthread && spin_count < kSpinRung + kYieldRung) {
       std::this_thread::yield();
       return;
     }
@@ -168,8 +180,18 @@ struct Mutex {
     // but collapses above it -- 420 ops vs 97k at 16 threads -- and destroys
     // fairness (up to 152x spread), which is the issue #483 livelock this
     // escalation exists to prevent.
-    (void)ahead;
-    std::this_thread::sleep_for(std::chrono::microseconds(kParkUs));
+    // Park scaled by queue position, as before. Keeping the original duration
+    // matters for StdThread: it never takes rung 2, so this rung is reached
+    // immediately and its length dominates handoff latency. A flat 100us here
+    // measured ~7x slower than min(ahead, 100)us under StdThread at 8 threads.
+    // Under Pthread the value is close to irrelevant because rung 2 absorbs
+    // the wait -- which is why the sub-slack rounding that motivated this work
+    // is no longer on the critical path there.
+    min_u64 us = ahead < kParkUs ? ahead : kParkUs;
+    if (us == 0) {
+      us = 1;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(us));
 #else
     (void)spin_count;
     (void)ahead;
