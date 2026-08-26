@@ -417,25 +417,32 @@ jobs:
               # the venv below matches a wheel we actually ship. Newer distros
               # fall through to their default python3.
               #
-              # expat is upgraded EXPLICITLY. The rockylinux:8 base image
-              # ships expat 2.2.5, but python3.12-libs is built against 2.5.0
-              # and its RPM dependency is not pinned tightly enough to pull the
-              # newer one in. Without this, pyexpat fails to load with
-              #   undefined symbol:
-              #   XML_SetBillionLaughsAttackProtectionMaximumAmplification
-              # which surfaces as python3 -m venv dying inside ensurepip with
-              # a non-zero exit status that names neither expat nor pyexpat.
+              # The expat package is not a typo and not optional. The
+              # rockylinux:8 base image ships expat 2.2.5, but the current
+              # python3.12-3.12.14-1.el8_10
+              # (built 2026-08-24) links pyexpat against 2.4+ symbols, so
+              # importing pyexpat dies with:
+              #   undefined symbol: XML_SetBillionLaughsAttackProtection...
+              # pip imports it, so ensurepip fails and python3 -m venv
+              # aborts -- which is how this arrived, as every test-wheels leg
+              # going red overnight with no change on our side. Naming expat
+              # explicitly upgrades it to 2.5.0 alongside the interpreter.
               #
               # NOTE: this whole block is the body of a bash -c single-quoted
               # string, so no apostrophe may appear anywhere in it, comments
-              # included -- one would close the string and mangle the script
-              # for every distro in the matrix.
+              # included -- one would close the string and truncate the script
+              # for every distro in the matrix, not just this branch.
               if dnf install -y -q python3.12 python3.12-pip expat >/dev/null 2>&1; then
                 ln -sf /usr/bin/python3.12 /usr/local/bin/python3
               else
-                dnf install -y -q python3 python3-pip >/dev/null 2>&1
+                dnf install -y -q python3 python3-pip expat >/dev/null 2>&1
               fi
             fi
+
+            # Fail loudly here rather than 20 lines down. Both branches above
+            # swallow their output, so a broken interpreter used to surface as
+            # an opaque ensurepip traceback from the venv step.
+            python3 -c "import pyexpat, ssl, sys; print(\"interpreter OK:\", sys.version)"
 
             # Create clean venv
             python3 -m venv /tmp/test-venv

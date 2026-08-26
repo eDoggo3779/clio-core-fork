@@ -477,13 +477,25 @@ extern const struct fuse_operations cte_fuse_ops;
 
 #if !defined(_WIN32)
 #include <sys/statvfs.h>
-// Linux spellings of the shared-callback types (identical alias
-// redeclarations are legal; fuse_cte.cc declares the same set).
+#ifdef __APPLE__
+#include <sys/param.h>
+#include <sys/mount.h>  // struct statfs (macFUSE's statfs callback type)
+#endif
+// POSIX spellings of the shared-callback types. These MUST stay byte-identical
+// to the block in fuse_cte.cc: an alias may be redeclared only when it names
+// the SAME type, and macFUSE reports through Darwin's struct statfs where
+// libfuse reports statvfs. Declaring the Linux spelling unconditionally here
+// is what broke the macOS adapters build — 'struct statfs' vs 'struct statvfs'
+// redefinition, plus a statfs callback whose signature no longer matched.
 using cte_stat_t = struct stat;
 using cte_off_t = off_t;
 using cte_mode_t = mode_t;
 using cte_timespec_t = struct timespec;
+#ifdef __APPLE__
+using cte_statvfs_t = struct statfs;
+#else
 using cte_statvfs_t = struct statvfs;
+#endif
 #endif
 
 #ifndef _WIN32
