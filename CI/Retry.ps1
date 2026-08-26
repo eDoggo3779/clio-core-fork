@@ -5,10 +5,23 @@
 # install, never the build or the test.
 #
 # Usage:
-#   pwsh CI/Retry.ps1 -- choco install winfsp -y --no-progress
-#   pwsh CI/Retry.ps1 -Attempts 5 -DelaySeconds 10 -- <command> [args...]
+#   pwsh CI/Retry.ps1 choco install winfsp -y --no-progress
+#   pwsh CI/Retry.ps1 -Attempts 5 -DelaySeconds 10 <command> [args...]
+#
+# Do NOT pass a `--` separator, even though the bash half tolerates one and
+# the shape looks symmetric. PowerShell binds parameters BEFORE this script
+# runs, and a bare `--` binds as a parameter whose name is the empty string:
+#   Parameter cannot be processed because the parameter name (empty) is ambiguous.
+# The script cannot defend against that -- it never gets control. Trailing
+# dashed arguments of the wrapped command (-y, --no-progress) are fine: they
+# land in $Command via ValueFromRemainingArguments.
+#
+# PositionalBinding is off so a bare first argument is NOT swallowed by
+# -Attempts: without it, `pwsh CI/Retry.ps1 choco install ...` fails with
+#   Cannot convert value "choco" to type "System.Int32"
+# because $Attempts is the first positional parameter.
 
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [int]$Attempts = 3,
     [int]$DelaySeconds = 5,
