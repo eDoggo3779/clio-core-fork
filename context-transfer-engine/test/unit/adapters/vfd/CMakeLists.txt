@@ -83,7 +83,15 @@ if(CLIO_CORE_ENABLE_TESTS)
         # see the VOL I/O suite's note.
         ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
         RESOURCE_LOCK "clio_runtime"
-        TIMEOUT 120
+        # 300 rather than 120, matching the other runtime-based suites here.
+        # Warm, this binary runs in ~15s; the first run after a reboot took over
+        # 120s and was cut off mid-suite while still making steady progress
+        # (cold page-faulting of the runtime's shm segments, plus a virus
+        # scanner meeting freshly linked binaries). A timeout that fires on a
+        # healthy run reports as a failure with no failing assertion, which is
+        # the least actionable signal available -- the ceiling wants to be high
+        # enough that TIMEOUT here means genuinely stuck.
+        TIMEOUT 300
         LABELS "msan_skip")
 
     # No runtime, no fixtures, no resource lock -- the point is that this one
