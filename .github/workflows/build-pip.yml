@@ -36,6 +36,7 @@ jobs:
   check-version:
     name: Check tag matches version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
     - name: Checkout repository
@@ -106,7 +107,7 @@ jobs:
         python-version: '3.12'
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build wheels
       env:
@@ -186,22 +187,13 @@ jobs:
     # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
       run: |
-        $ok = $false
-        foreach ($attempt in 1..3) {
-          choco install winfsp -y --no-progress
-          if (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h") {
-            $ok = $true
-            break
-          }
-          Write-Host "WinFsp not installed after attempt $attempt; retrying in 30s..."
-          Start-Sleep -Seconds 30
-        }
-        if (-not $ok) {
-          throw "WinFsp SDK missing after 3 install attempts -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 -- choco install winfsp -y --no-progress
+        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+          throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
         }
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build Windows wheels
       env:
@@ -283,12 +275,12 @@ jobs:
         # cppzmq is the C++ header wrapper for zeromq; cereal and cppzmq
         # are header-only. msgpack-c is the C library (the recipe uses
         # the C API in serialize/msgpack_wrapper.h).
-        brew update
-        brew install cmake pkg-config \
+        bash CI/retry.sh brew update
+        bash CI/retry.sh brew install cmake pkg-config \
           yaml-cpp cereal msgpack-c libsodium zeromq cppzmq
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build macOS wheels
       env:
@@ -404,8 +396,8 @@ jobs:
 
             # Install Python
             if command -v apt-get &>/dev/null; then
-              apt-get update -qq
-              apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1
+              for i in 1 2 3; do apt-get update -qq && break || sleep 5; done
+              for i in 1 2 3; do apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1 && break || sleep 5; done
             elif command -v dnf &>/dev/null; then
               # RHEL8 family (rockylinux:8, #973): the stock python3 is 3.6,
               # older than the oldest wheel we build (cp310). Pull the 3.12
@@ -478,7 +470,7 @@ jobs:
             # fuse3 runtime like an end user would, then apply the same
             # signal-level heuristic as the benchmarks above.
             if command -v apt-get &>/dev/null; then
-              apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1
+              for i in 1 2 3; do apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1 && break || sleep 5; done
             elif command -v dnf &>/dev/null; then
               dnf install -y -q fuse3 fuse3-libs >/dev/null 2>&1
             fi
@@ -661,7 +653,7 @@ jobs:
     # install this from winfsp.dev. The DLL lives under
     # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
     - name: Install WinFsp (FUSE adapter runtime)
-      run: choco install winfsp -y --no-progress
+      run: pwsh CI/Retry.ps1 -- choco install winfsp -y --no-progress
 
     - name: Test wheel in clean venv
       shell: pwsh
@@ -747,6 +739,7 @@ jobs:
       - test-wheels-macos
       - test-wheels-windows
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
@@ -802,6 +795,7 @@ jobs:
       - test-wheels-macos
       - test-wheels-windows
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
