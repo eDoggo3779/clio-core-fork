@@ -1638,9 +1638,11 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # clio-fs zero-IPC read path (issue #817): correctness + latency
 #
-# UNIX-only: the descriptor layer it drives is built on unistd.h / sys/stat.h /
-# off_t and has no Windows port, so the filesystem client compiles it out there
-# exist there.
+# UNIX-only, but no longer because of the descriptor layer: that has a Windows
+# port now (FsOff/FsSsize via posix_compat.h) and is compiled on every platform.
+# What keeps this binary UNIX-only is its own harness -- RuntimeServer forks a
+# real clio_run daemon through unistd.h/sys/wait.h, which is the whole point of
+# the test (see the InitRuntime comment).
 # ------------------------------------------------------------------------------
 if(UNIX)
 add_executable(test_cfs_shm_read
