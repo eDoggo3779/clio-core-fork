@@ -404,12 +404,28 @@ jobs:
               # AppStream module and put it ahead of the stock interpreter so
               # the venv below matches a wheel we actually ship. Newer distros
               # fall through to their default python3.
-              if dnf install -y -q python3.12 python3.12-pip >/dev/null 2>&1; then
+              #
+              # The expat package is not a typo and not optional. The
+              # rockylinux:8 base image ships expat 2.2.5, but the current
+              # python3.12-3.12.14-1.el8_10
+              # (built 2026-08-24) links pyexpat against 2.4+ symbols, so
+              # importing pyexpat dies with:
+              #   undefined symbol: XML_SetBillionLaughsAttackProtection...
+              # pip imports it, so ensurepip fails and python3 -m venv
+              # aborts -- which is how this arrived, as every test-wheels leg
+              # going red overnight with no change on our side. Naming expat
+              # explicitly upgrades it to 2.5.0 alongside the interpreter.
+              if dnf install -y -q python3.12 python3.12-pip expat >/dev/null 2>&1; then
                 ln -sf /usr/bin/python3.12 /usr/local/bin/python3
               else
-                dnf install -y -q python3 python3-pip >/dev/null 2>&1
+                dnf install -y -q python3 python3-pip expat >/dev/null 2>&1
               fi
             fi
+
+            # Fail loudly here rather than 20 lines down. Both branches above
+            # swallow their output, so a broken interpreter used to surface as
+            # an opaque ensurepip traceback from the venv step.
+            python3 -c "import pyexpat, ssl, sys; print(\"interpreter OK:\", sys.version)"
 
             # Create clean venv
             python3 -m venv /tmp/test-venv
