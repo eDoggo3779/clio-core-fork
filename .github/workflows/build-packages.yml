@@ -389,6 +389,14 @@ jobs:
         name: appimage-${{ matrix.arch }}
         path: pkg/
 
+    - name: Check out CI helpers
+      # Sparse: this job needs only CI/retry.sh, not the tree. Without a
+      # checkout the helper is absent and the step dies with
+      # "bash: CI/retry.sh: No such file or directory".
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Install fuse + smoke test
       run: |
         set -e
@@ -524,6 +532,15 @@ jobs:
       with:
         name: windows-package-x86_64
         path: pkg/
+
+    - name: Check out CI helpers
+      # Sparse: this job needs only the retry helper, not the tree. Without a
+      # checkout the helper is simply absent -- "The argument 'CI/Retry.ps1' is
+      # not recognized as the name of a script file" -- which stayed latent
+      # while the build job this depends on was itself failing.
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
 
     # Same hardening for the runtime install used by the smoke test (#1004).
     - name: Install WinFsp (FUSE adapter runtime)

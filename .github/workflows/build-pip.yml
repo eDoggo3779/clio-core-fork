@@ -666,6 +666,15 @@ jobs:
     # WinFsp runtime for the fuse adapter smoke test (#899) — end users
     # install this from winfsp.dev. The DLL lives under
     # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
+    - name: Check out CI helpers
+      # Sparse: this job needs only the retry helper, not the tree. Without a
+      # checkout the helper is simply absent -- "The argument 'CI/Retry.ps1' is
+      # not recognized as the name of a script file" -- which stayed latent
+      # while the build job this depends on was itself failing.
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Install WinFsp (FUSE adapter runtime)
       run: pwsh CI/Retry.ps1 choco install winfsp -y --no-progress
 
