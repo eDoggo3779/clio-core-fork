@@ -73,8 +73,8 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends \
           cmake ninja-build build-essential pkg-config python3 \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
           libsodium-dev libfuse3-dev
@@ -211,8 +211,8 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends \
           cmake ninja-build build-essential pkg-config wget file \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
           libsodium-dev libfuse3-dev
@@ -281,7 +281,7 @@ jobs:
     - name: Install + smoke test
       run: |
         set -e
-        apt-get update
+        for i in 1 2 3; do apt-get update && break || sleep 5; done
         # dpkg-installs the .deb, then apt-get -f install pulls in any
         # runtime deps the package declared (libzmq, libyaml-cpp, ...).
         apt-get install -y ./pkg/*.deb || (apt-get -f install -y && apt-get install -y ./pkg/*.deb)
@@ -396,8 +396,8 @@ jobs:
         #   1. Mount via FUSE (requires libfuse2 on the runner)
         #   2. APPIMAGE_EXTRACT_AND_RUN=1 — extract to a tmpdir + exec
         # Use (2) so the test runs even on minimal runners without FUSE.
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends file
+        bash CI/retry.sh sudo apt-get update
+        bash CI/retry.sh sudo apt-get install -y --no-install-recommends file
         chmod +x pkg/*.AppImage
         echo "=== AppImage info ==="
         file pkg/*.AppImage
@@ -463,18 +463,9 @@ jobs:
     # community-feed 503, silently building the package without the adapter.
     - name: Install WinFsp (FUSE adapter SDK)
       run: |
-        $ok = $false
-        foreach ($attempt in 1..3) {
-          choco install winfsp -y --no-progress
-          if (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h") {
-            $ok = $true
-            break
-          }
-          Write-Host "WinFsp not installed after attempt $attempt; retrying in 30s..."
-          Start-Sleep -Seconds 30
-        }
-        if (-not $ok) {
-          throw "WinFsp SDK missing after 3 install attempts (#1004)"
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+          throw "WinFsp SDK missing after the install succeeded -- failing HERE rather than packaging without the FUSE adapter (#1004)"
         }
 
     # cpack -G NSIS below shells out to makensis. Nothing installed it, so the
@@ -483,7 +474,7 @@ jobs:
     # package, so it reads as a packaging-config problem rather than a missing
     # tool. The runner image does not ship NSIS.
     - name: Install NSIS (installer generator for cpack -G NSIS)
-      run: choco install nsis -y --no-progress
+      run: pwsh CI/Retry.ps1 choco install nsis -y --no-progress
 
     - name: Configure with CMake
       run: |
@@ -537,18 +528,9 @@ jobs:
     # Same hardening for the runtime install used by the smoke test (#1004).
     - name: Install WinFsp (FUSE adapter runtime)
       run: |
-        $ok = $false
-        foreach ($attempt in 1..3) {
-          choco install winfsp -y --no-progress
-          if (Test-Path "${env:ProgramFiles(x86)}\WinFsp\bin") {
-            $ok = $true
-            break
-          }
-          Write-Host "WinFsp not installed after attempt $attempt; retrying in 30s..."
-          Start-Sleep -Seconds 30
-        }
-        if (-not $ok) {
-          throw "WinFsp runtime missing after 3 install attempts (#1004)"
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\bin")) {
+          throw "WinFsp runtime missing after the install succeeded -- failing HERE rather than smoke-testing without it (#1004)"
         }
 
     - name: Extract ZIP + smoke test
