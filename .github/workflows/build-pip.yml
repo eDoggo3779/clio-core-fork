@@ -671,6 +671,17 @@ jobs:
     timeout-minutes: 30
 
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -685,15 +696,6 @@ jobs:
     # WinFsp runtime for the fuse adapter smoke test (#899) — end users
     # install this from winfsp.dev. The DLL lives under
     # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
-    - name: Check out CI helpers
-      # Sparse: this job needs only the retry helper, not the tree. Without a
-      # checkout the helper is simply absent -- "The argument 'CI/Retry.ps1' is
-      # not recognized as the name of a script file" -- which stayed latent
-      # while the build job this depends on was itself failing.
-      uses: actions/checkout@v4
-      with:
-        sparse-checkout: CI
-
     - name: Install WinFsp (FUSE adapter runtime)
       run: pwsh CI/Retry.ps1 choco install winfsp -y --no-progress
 
