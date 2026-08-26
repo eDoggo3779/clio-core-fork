@@ -130,6 +130,70 @@ the same logical payload; on the wire it is marginally *slower* than CLIO.
 
 ---
 
+### What the full 36-row sweep measured (2026-08-26)
+
+2 sizes × 6 concurrencies × 3 repeats, all 36 rows `success`. Wire MB/s, mean of
+the three repeats:
+
+| K | \| | CLIO 1M | rawput 1M | zarr 1M | zstd 1M | \| | CLIO 4M | rawput 4M | zarr 4M | zstd 4M |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1  | | 2.51 | 1.72 | 4.14 | 2.50 | | 6.13 | 4.76 | 4.84 | 3.61 |
+| 4  | | 2.60 | 4.04 | 9.49 | 7.74 | | 6.33 | 7.38 | 10.73 | 9.73 |
+| 8  | | 3.41 | 5.46 | 10.75 | 9.94 | | 7.64 | 9.18 | 11.08 | 10.81 |
+| 16 | | 3.92 | 7.75 | 10.87 | 10.68 | | 9.27 | 10.46 | 11.10 | 10.99 |
+| 32 | | 4.76 | 9.91 | 10.90 | 10.68 | | 9.91 | 10.83 | 11.06 | 10.91 |
+| 64 | | 4.87 | 9.95 | 10.83 | 10.51 | | 10.57 | 11.06 | 10.93 | 10.82 |
+
+**The K=64 rawput point settles the ceiling question.** rawput moves +0.3% (1
+MiB) and +2.2% (4 MiB) from K=32 to K=64 — flat. rawput forks K processes and
+uses no runtime worker, so a per-connection concurrency limit would still be
+climbing there. It is the **link**, ~11.1 MB/s, and nothing in CLIO can beat it.
+
+**At 4 MiB CLIO converges on the floor: 0.96× at K=64**, having climbed 0.86 →
+0.83 → 0.89 → 0.92 → 0.96. Report that ratio, not the MB/s.
+
+**At 1 MiB it does not.** CLIO plateaus at 4.87 MB/s — **0.49× the floor** —
+while rawput and zarr both reach ~10.9. Per the decision rule in the smoke
+YAML's header, *CLIO well below rawput ⇒ CLIO's own ceiling*, and this is that
+case. It is a **per-object** ceiling, not a bandwidth one: CLIO saturates at
+~5.5 objects/s, worth 5.5 MB/s at 1 MiB but 22 MB/s at 4 MiB — above the link,
+which is exactly why the 4 MiB rows look healthy and hide it.
+
+The K=1 latency fit says the fixed cost is not the problem. Fitting
+`latency = fixed + size/rate` through the two K=1 points:
+
+| stack | fixed | marginal rate |
+|---|---|---|
+| CLIO | 313 ms | 11.96 MB/s |
+| rawput | 497 ms | 11.64 MB/s |
+
+Both see the same ~12 MB/s link, and CLIO's *fixed* per-object cost is the
+**lower** of the two — 313 ms against the floor's 497 ms of fork+exec plus temp
+file. That is why CLIO beats the floor at K=1 (1.47× at 1 MiB, 1.29× at 4 MiB).
+CLIO's problem is that ~180 ms of that per-object work does not pipeline across
+concurrency, where the floor's does. Compare the scaling K=1→64: rawput 5.8×,
+CLIO 2.2×.
+
+The oversubscription check the full-sweep YAML calls for comes back **clean**:
+at K=64 (`runtime.num_threads: 64` on `cpus_per_task: 40`) CLIO does not dip
+below K=32 at either size — 4.76 → 4.87 and 9.91 → 10.57. No need to re-run
+that point at 48 threads.
+
+**zstd compresses 1.93× and is link-bound like everything else.** Its
+`agg_bw_mbps` reaches 20.6 — above the 11.1 MB/s link — purely because logical
+bytes exceed wire bytes. Quoting that as a throughput win over CLIO is the
+single easiest misread of this sweep; compare `wire_bw_mbps`.
+
+**Client memory is a clear CLIO win, by ~6×.** At 4 MiB / K=64: CLIO 266 MB,
+zarr 1664 MB, zstd 1724 MB. CLIO's K-slot SHM window grows as K × blob_size and
+nothing else; zarr materializes the whole 1 GiB array in-process. rawput is flat
+at 21 MB only because its bytes live in a temp file — `temp_file_bytes` reaches
+256 MiB at K=64, so it moved the cost to disk rather than avoiding it.
+
+Run-to-run spread over the 3 repeats: zarr is the steadiest (median 0.3% CV),
+CLIO and rawput median ~3% with occasional 16% outliers — shared-uplink weather,
+which is what `repeat: 3` is for.
+
 ## Addressing: the key prefix is mandatory
 
 CTE registers each target as `device.path_ + "_node<N>"`. For a cloud device
@@ -278,6 +342,46 @@ without bound even if a purge is skipped.
 
 ---
 
+## Plotting the results
+
+```bash
+python3 jarvis_clio_core/scripts/plot_s3_write_bench.py \
+    ~/s3_write_bench_full_results/results.csv [output_dir]
+```
+
+Needs `pandas` + `matplotlib` (the zarr venv has both). Prints the wire-MB/s
+table above, then writes five PNGs:
+
+| file | what it answers |
+|---|---|
+| `s3_write_wire_bw.png` | the cross-stack comparison — bytes actually on the wire |
+| `s3_write_agg_bw.png` | logical MB/s; the gap against the wire figure *is* compression |
+| `s3_write_ratio.png` | **the headline** — each stack ÷ the raw-PUT floor of the same row |
+| `s3_write_ops.png` | objects/s, where a per-object ceiling shows up as a flat bar |
+| `s3_write_max_rss.png` | client peak memory (log scale) |
+
+One subplot per blob size, x-axis concurrency, one bar per stack, error bars =
+repeat stddev. The transpose of the read bench's layout, because on the write
+side the question is scaling with K and the answer differs by size.
+
+**Read `s3_write_ratio.png` first.** When four stacks are all pinned to the same
+link, absolute MB/s says nothing about any of them; only the ratio to the floor
+separates "CLIO is slow" from "S3 is slow". Ratios are computed **per row**, not
+from column means, so numerator and denominator saw the same link weather and
+the error bars on the ratio are real.
+
+Bars are hatched where a cell is not measuring what it claims: K=1 in the ratio
+figure (the floor is fork+exec-bound there, not a floor), and any cell where
+requested K exceeds the object count (`effective_concurrency` caps at the object
+count, silently duplicating a lower-K cell — cannot happen at `num_blobs: 256`,
+but a smaller smoke can trip it).
+
+`share_y` is per-metric. MB/s, the ratio, and RSS are comparable between panels
+and share an axis; objects/s does **not**, because a 4 MiB object at the same
+bandwidth is a quarter the object rate.
+
+---
+
 ## Verifying a run
 
 1. **Every row `status: success`** — 2 for the smoke, 36 for the full sweep.
@@ -290,9 +394,26 @@ without bound even if a purge is skipped.
 4. **`clio_s3.write.objects_measured` equals `num_blobs`.** This one is a `list`
    of the bucket prefix rather than a number the benchmark computed, so it is
    the only column a run that wrote nothing cannot fabricate. Zero means the
-   row is fiction regardless of what the throughput columns say; more than
-   `num_blobs` means the allocator fragmented (not a failure — see
-   troubleshooting).
+   row is fiction regardless of what the throughput columns say.
+
+   **More than `num_blobs` does not necessarily mean the allocator
+   fragmented.** Check `put_count` first: if `put_count == objects_written ==
+   num_blobs` and only `objects_measured` is high, the allocator was fine and
+   the listing picked up **stale objects from an earlier row**. All 36 rows of
+   the 2026-08-26 sweep share one key prefix (`clio-s3-write-bench/bdev`), and
+   the 4 MiB rows all report `objects_measured: 448` against `num_blobs: 256`.
+   The excess is exactly 192 objects / 201326592 bytes = 192 × 1 MiB — orphaned
+   blocks from the 1 MiB rows that teardown's `FreeBlocks` never deleted. It is
+   constant across all eighteen 4 MiB rows, so it is a one-time orphaning, not
+   a leak that grows.
+
+   This contaminates nothing but the two `*_measured` columns: every throughput
+   figure is computed from `logical_bytes` and `wall_time_us`, which the
+   benchmark owns. But it does blunt the guard, because a row that wrote
+   nothing would still list its predecessors' objects. Confirm with
+   `python3 scripts/s3_cli.py ls "$S3_BENCH_BUCKET" --prefix clio-s3-write-bench/bdev`
+   (Ares has no AWS CLI) and fix by giving each row its own key prefix, or by
+   purging the prefix in the package's pre-run rather than only in `post_cmds`.
 5. **`rawput` is the fastest row *at K ≥ 8*, compared on `wire_bw_mbps`.**
    Two qualifications, both learned the hard way on 2026-08-26:
 
