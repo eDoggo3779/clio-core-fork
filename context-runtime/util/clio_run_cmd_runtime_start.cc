@@ -75,25 +75,31 @@ bool InitializeAdminChiMod() {
   }
 }
 
-void ShutdownAdminChiMod() {
-  HLOG(kDebug, "Shutting down admin ChiMod...");
-
-  try {
-    auto* pool_manager = CLIO_POOL_MANAGER;
-    if (pool_manager && pool_manager->HasPool(clio::run::kAdminPoolId)) {
-      if (pool_manager->DestroyLocalPool(clio::run::kAdminPoolId)) {
-        HLOG(kDebug, "Admin pool destroyed successfully");
-      } else {
-        HLOG(kError, "Failed to destroy admin pool");
-      }
-    }
-
-  } catch (const std::exception& e) {
-    HLOG(kError, "Exception during admin ChiMod shutdown: {}", e.what());
-  }
-
-  HLOG(kDebug, "Admin ChiMod shutdown complete");
-}
+// NOTE: there is deliberately no ShutdownAdminChiMod() here any more.
+//
+// This used to call PoolManager::DestroyLocalPool(kAdminPoolId) right after
+// RunUntilStopped() returned — i.e. while every worker was still running. The
+// admin container owns the periodic service pumps (kSend=14, kClientSend=21,
+// kHeartbeatProbe=28, kSystemMonitor=31); once its container is gone, each
+// reschedule routes to a pool that no longer exists, RouteTask gets
+// RouteResult::Dne, and Worker::AddToRetryQueue parks it. ProcessRetryQueue
+// then re-routes it, gets Dne again, and re-parks it: an unbounded spin that
+// DrainPendingTasks() can never drain, so the RequestStop watchdog force-exits
+// the daemon with code 2 instead of a clean 0.
+//
+// The race was always here but the window was microseconds wide (destroy →
+// return → atexit → StopWorkers), so nothing ever landed in it. Issue #990's
+// dashboard put VizServer::Stop() at the top of ServerFinalize(), between the
+// destroy and StopWorkers(); stopAll(true) drains in-flight HTTP requests and
+// takes real time, holding the window open long enough for the pumps to fire.
+// That is what broke cr_shutdown_bt_churn and
+// cte_replication_persist_integration on 2026-08-19.
+//
+// Destroying the admin pool early was never necessary: ServerFinalize() calls
+// PoolManager::DestroyAllContainers() after StopWorkers(), and that walks all
+// of pool_metadata_ — admin included. Letting admin live exactly as long as
+// every other pool restores the invariant that no container is torn down while
+// a worker can still route to it.
 
 bool InductNode() {
   auto* ipc_manager = CLIO_IPC;
@@ -305,7 +311,10 @@ int RuntimeStart(int argc, char* argv[]) {
   RunUntilStopped();
 
   HLOG(kDebug, "Shutting down Clio runtime...");
-  ShutdownAdminChiMod();
+  // The admin pool is NOT destroyed here — ServerFinalize()'s
+  // DestroyAllContainers() does it after StopWorkers(). See the
+  // "no ShutdownAdminChiMod()" note near the top of this file for why tearing
+  // it down while the workers still run wedges the shutdown.
   HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
   return 0;
 }
@@ -366,7 +375,10 @@ int RuntimeRestart(int argc, char* argv[]) {
   RunUntilStopped();
 
   HLOG(kDebug, "Shutting down Clio runtime...");
-  ShutdownAdminChiMod();
+  // The admin pool is NOT destroyed here — ServerFinalize()'s
+  // DestroyAllContainers() does it after StopWorkers(). See the
+  // "no ShutdownAdminChiMod()" note near the top of this file for why tearing
+  // it down while the workers still run wedges the shutdown.
   HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
   return 0;
 }

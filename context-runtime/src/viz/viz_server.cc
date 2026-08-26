@@ -40,10 +40,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <memory>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #include "clio_runtime/container.h"
 #include "clio_runtime/module_manager.h"
@@ -62,6 +66,7 @@
 #include <Poco/Net/ServerSocket.h>
 #include <Poco/Net/SocketAddress.h>
 #include <Poco/StreamCopier.h>
+#include <Poco/ThreadPool.h>
 #include <Poco/URI.h>
 #endif
 
@@ -672,6 +677,18 @@ bool VizServer::Dispatch(const Request &req, Response &resp) {
 /** Poco server state. Lives here so no Poco type reaches an installed header. */
 struct VizServer::Impl {
   Poco::Net::ServerSocket socket;
+  // A PRIVATE thread pool, deliberately NOT Poco's ThreadPool::defaultPool().
+  //
+  // The HTTPServer(factory, socket, params) overload silently borrows the
+  // process-wide default pool, and tearing the server down then joins THAT
+  // pool -- i.e. it waits on threads this dashboard never owned and cannot
+  // finish. stopAll() then never returns, ServerFinalize() stalls behind it,
+  // and the RequestStop watchdog force-exits the daemon with code 2. That is
+  // the 2026-08-19 regression in cr_shutdown_bt_churn (issue #990's dashboard).
+  //
+  // Declared BEFORE `server` so it is destroyed after it (members die in
+  // reverse declaration order): the server must not outlive its pool.
+  std::unique_ptr<Poco::ThreadPool> pool;
   std::unique_ptr<Poco::Net::HTTPServer> server;
   std::string bind_addr;
   u32 port = 0;
@@ -797,8 +814,11 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
     // misbehaving client cannot own a thread forever.
     params->setKeepAliveTimeout(Poco::Timespan(2, 0));
     params->setMaxKeepAliveRequests(100);
+    // Own the thread pool (see Impl) so teardown only ever joins our threads.
+    const int pool_max = static_cast<int>(std::max<u32>(max_threads, 2));
+    impl->pool = std::make_unique<Poco::ThreadPool>(/*minCapacity=*/1, pool_max);
     impl->server = std::make_unique<Poco::Net::HTTPServer>(
-        new PocoVizHandlerFactory(this), impl->socket, params);
+        new PocoVizHandlerFactory(this), *impl->pool, impl->socket, params);
     impl->server->start();
     impl->bind_addr = bind_addr;
     impl->port = impl->socket.address().port();
@@ -824,19 +844,68 @@ void VizServer::Stop() {
   }
   HLOG(kInfo, "Viz: stopping dashboard on {}:{}", impl_->bind_addr,
        impl_->port);
+  // Close the LISTENING SOCKET FIRST, before asking Poco to stop. Poco is
+  // thread-per-connection: TCPServer::start() spawns an acceptor parked in
+  // ServerSocket::poll() on this socket, and the stop path joins it. Closing
+  // first makes that poll return so the acceptor can observe the stop flag.
+  //
+  // (The old comment here also had Poco's flag backwards: per
+  // HTTPServer::stopAll's contract abortCurrent=TRUE shuts the client sockets
+  // down, aborting requests, and FALSE lets current requests finish. Waiting
+  // is the risky one, so keep true.)
   try {
-    if (impl_->server) {
-      // true = wait for in-flight requests. A handler blocked on a task Future
-      // uses a bounded timeout, so this cannot wait forever.
-      impl_->server->stopAll(true);
-      impl_->server.reset();
-    }
     impl_->socket.close();
   } catch (const Poco::Exception &e) {
-    HLOG(kWarning, "Viz: error while stopping the dashboard: {}",
+    HLOG(kWarning, "Viz: error closing the dashboard socket: {}",
          e.displayText());
   }
-  impl_.reset();
+
+  // Belt and braces. With the private pool (see Impl) stopAll() returns
+  // promptly, so this budget is never actually spent -- measured: teardown is
+  // instant and cr_shutdown_bt_churn is back to its pre-dashboard 58 s, versus
+  // 130 s when every cycle burned the timeout below. It stays as a backstop
+  // because a request handler is ChiMod code that can block on a task, and the
+  // dashboard is a debugging aid: it must never be the reason a daemon cannot
+  // exit. On timeout, abandon the Poco objects (the shared_ptr keeps them
+  // alive for the worker, and the process is seconds from exit anyway) and let
+  // the rest of ServerFinalize proceed. Losing the dashboard's memory at exit
+  // is strictly better than losing the graceful shutdown.
+  // Overridable with CLIO_VIZ_STOP_BUDGET_MS, the same env convention as
+  // CLIO_VIZ_ENABLE / _PORT / _BIND. An operator can shorten it on a node
+  // where a wedged handler must never delay shutdown, and the tests set 0 to
+  // exercise the abandon path deterministically instead of leaving it as a
+  // branch nothing ever takes.
+  int stop_budget_ms = 3000;
+  if (const char *env = clio::run::env::GetCompat("VIZ_STOP_BUDGET_MS")) {
+    char *end = nullptr;
+    long n = std::strtol(env, &end, 10);
+    if (end != env && n >= 0) {
+      stop_budget_ms = static_cast<int>(n);
+    }
+  }
+  std::shared_ptr<Impl> impl(std::move(impl_));  // impl_ is null from here on
+  auto finished = std::make_shared<std::promise<void>>();
+  std::future<void> done = finished->get_future();
+  std::thread([impl, finished]() mutable {
+    try {
+      if (impl->server) {
+        impl->server->stopAll(true);
+        impl->server.reset();
+      }
+    } catch (const Poco::Exception &e) {
+      HLOG(kWarning, "Viz: error while stopping the dashboard: {}",
+           e.displayText());
+    }
+    finished->set_value();
+  }).detach();
+
+  if (done.wait_for(std::chrono::milliseconds(stop_budget_ms)) !=
+      std::future_status::ready) {
+    HLOG(kWarning,
+         "Viz: dashboard teardown did not finish within {} ms; abandoning it "
+         "so the shutdown can proceed",
+         stop_budget_ms);
+  }
 }
 
 bool VizServer::IsRunning() const { return impl_ != nullptr; }
