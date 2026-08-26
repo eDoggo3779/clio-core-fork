@@ -973,6 +973,50 @@ if(CAE_SUMMARIZATION_ENABLED)
   )
 
   install(TARGETS test_summarizer_label_client DESTINATION bin)
+
+  #----------------------------------------------------------------------------
+  # GenerateSummary (chunk-and-concatenate) tests — stub server, no runtime.
+  #----------------------------------------------------------------------------
+  # The partial-failure and multi-chunk-join semantics that only a live model
+  # could reach before. Same libcurl gate as the label-client test above (the
+  # loop calls OllamaGenerate), but NO "integration" label: it needs no runtime,
+  # so it stays in the default/PR coverage phase.
+  #----------------------------------------------------------------------------
+  add_executable(test_summarizer_inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_summarizer_inference.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/summarizer_http_stub.cc
+  )
+
+  target_include_directories(test_summarizer_inference
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  target_link_libraries(test_summarizer_inference
+    PRIVATE
+      clio_cae_summarizer_runtime
+      clio_cae_summarizer_client
+      clio_cte_core_client
+      clio::run::admin_runtime
+      clio::run::bdev_runtime
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  if(WIN32)
+    target_link_libraries(test_summarizer_inference PRIVATE ws2_32)
+  endif()
+
+  add_test(NAME summarizer_inference COMMAND test_summarizer_inference)
+  # msan_skip for the same reason as the label client: HTTP through an
+  # uninstrumented libcurl.
+  set_tests_properties(summarizer_inference PROPERTIES
+    TIMEOUT 120
+    LABELS "coverage;cae;summarizer;inference;msan_skip"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  install(TARGETS test_summarizer_inference DESTINATION bin)
 endif()
 
 #------------------------------------------------------------------------------

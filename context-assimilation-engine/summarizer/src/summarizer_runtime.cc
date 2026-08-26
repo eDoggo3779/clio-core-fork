@@ -33,6 +33,7 @@
 
 #include <clio_cae/summarizer/summarizer_runtime.h>
 #include <clio_cae/summarizer/label_client.h>
+#include <clio_cae/summarizer/summarizer_inference.h>
 #include <clio_cae/summarizer/summarizer_rules.h>
 
 #include <cstring>
@@ -45,57 +46,6 @@ CLIO_TASK_CC(clio::cae::summarizer::Runtime)
 
 namespace clio::cae::summarizer {
 
-namespace {
-
-/**
- * Run the rule's prompt over every chunk of the payload and concatenate the
- * responses. A failure on any one chunk doesn't abort the whole summary — the
- * chunk is skipped and logged; the caller still gets a partial summary. A
- * production deploy would dispatch each chunk to a dedicated inference worker
- * pool; this runs them inline on the calling worker.
- *
- * @param endpoint Base URL of the Ollama-compatible inference server.
- * @param rule The matched rule (model, context_length, num_predict).
- * @param prompt_template Prompt text prepended to each chunk.
- * @param payload The blob bytes to summarize.
- * @param tag_name Tag name, for log context only.
- * @param blob_name Blob name, for log context only.
- * @return The concatenated summary, or "" when every chunk failed.
- */
-std::string GenerateSummary(const std::string &endpoint, const LabelMatch &rule,
-                            const std::string &prompt_template,
-                            const std::string &payload,
-                            const std::string &tag_name,
-                            const std::string &blob_name) {
-  std::vector<std::string_view> chunks =
-      SplitPayload(payload, prompt_template, rule.context_length_);
-  std::string summary;
-  size_t successful_chunks = 0;
-  for (size_t i = 0; i < chunks.size(); ++i) {
-    std::string full_prompt = prompt_template;
-    full_prompt.append("\n\n");
-    full_prompt.append(chunks[i].data(), chunks[i].size());
-
-    std::string chunk_summary;
-    bool ok = OllamaGenerate(endpoint, rule.model_, full_prompt,
-                             rule.context_length_, rule.num_predict_,
-                             chunk_summary);
-    if (!ok || chunk_summary.empty()) {
-      HLOG(kWarning,
-           "Summarizer: chunk {} of {} failed for tag='{}' blob='{}' "
-           "model='{}'",
-           i + 1, chunks.size(), tag_name, blob_name, rule.model_);
-      continue;
-    }
-    if (!summary.empty()) summary.append("\n\n");
-    summary.append(chunk_summary);
-    ++successful_chunks;
-  }
-  if (successful_chunks == 0) summary.clear();
-  return summary;
-}
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // Container lifecycle
