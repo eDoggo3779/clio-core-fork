@@ -101,6 +101,35 @@ The smoke pipeline does exactly this: `K=1` with 4 workers vs `K=32` with 48.
 
 ---
 
+### What the first real run measured (2026-08-26, 4 MiB blobs, 64 blobs)
+
+| | K=1 agg | K=1 wire | K=32 agg | K=32 wire | % of floor @ K=32 |
+|---|---|---|---|---|---|
+| raw PUT floor | 4.72 | 4.72 | 10.75 | **10.75** | — (is the floor) |
+| zarr (none) | 5.06 | 5.06 | 10.62 | 10.62 | 98.8% |
+| zarr (zstd) | 7.14 | 3.71 | **19.90** | 10.34 | 96.2% |
+| CLIO → S3 bdev | 6.08 | 6.03 | 12.17 | 10.11 | 94.0% |
+
+All MB/s. Both rows `status: success`, `objects_measured` = 64 = `num_blobs`,
+`bytes_measured` = 268435456 exactly, `put_count` = `objects_measured` (no
+allocator fragmentation), `--verify` clean on both.
+
+**The finding is the convergence, not any single number.** Four independent
+write paths landing within 6% of each other at K=32 is one shared constraint:
+roughly 85 Mbit/s of egress from an Ares compute node to S3. CLIO is not slow
+here — the link is. Report **ratio to floor**, which is a property of CLIO;
+the absolute MB/s is a property of the night you ran it.
+
+The corollary is that CLIO's apparently poor concurrency scaling (1.7× for 32×
+the concurrency) is *not* a CLIO property either. Zarr and the raw floor scale
+by the same amount and stop at the same place.
+
+Note the zstd row: **19.90 is the largest number in the file and it is the one
+that will get misquoted.** It moved 133 MiB of wire bytes to CLIO's 256 MiB for
+the same logical payload; on the wire it is marginally *slower* than CLIO.
+
+---
+
 ## Addressing: the key prefix is mandatory
 
 CTE registers each target as `device.path_ + "_node<N>"`. For a cloud device
@@ -207,15 +236,41 @@ jarvis ppl submit $PWD/s3_write_bench.yaml
 
 Output: `${HOME}/s3_write_bench_results/results.csv`, 2 rows.
 
-There is deliberately **no full grid yet**. Achievable write concurrency and
-latency are unknown until this has been measured once; sizing a 36-row grid
-before that would be guessing. Widen the sweep after reading the smoke.
+Run this first on any new machine, bucket, or build. It is the cheapest thing
+that proves credentials reach the daemon and bytes reach the bucket.
+
+### Full sweep (36 rows, ~3.6 h)
+
+```bash
+export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
+jarvis ppl submit $PWD/s3_write_bench_full.yaml
+```
+
+Output: `${HOME}/s3_write_bench_full_results/results.csv`, 36 rows —
+2 granularities (1 MiB, 4 MiB) × 6 concurrencies (1, 4, 8, 16, 32, 64) ×
+3 repeats. Sized for overnight; `time: "08:00:00"` in the scheduler block.
+
+Every gate and credential path is carried over from the smoke verbatim, so a
+green smoke is a strong predictor of a green sweep. Two deliberate differences:
+`verify` is **off** (the smoke settled byte-fidelity; `objects_measured` is the
+per-row guard and costs no egress), and `num_blobs` is 256 rather than 64 so
+that K=64 has several windows of work behind it instead of one.
+
+The grid is built around what the smoke found — see the header comment in
+`s3_write_bench_full.yaml` for why there is no 16 MiB axis and what the K=64
+`rawput` point is there to settle.
 
 ### Cost
 
 Writes are cheap: ingress to S3 is free and PUTs run ~$0.005/1000, so the smoke
-is effectively free — unlike the read grid's ~155 GiB of egress (~$14). Only
-leftover object storage accrues, and `post_cmds` purges the write prefix.
+is effectively free — unlike the read grid's ~155 GiB of egress (~$14). The full
+36-row sweep issues roughly 37k PUTs, about **$0.18**. Only leftover object
+storage accrues, and `post_cmds` purges the write prefix.
+
+The one thing that is *not* free on the write side is `verify`: it re-reads
+every blob, which is GET egress. That is why the smoke has it on (128 blobs,
+cents) and the full sweep has it off (~19 GiB, ~$1.70, to re-answer a settled
+question).
 
 Object keys are deterministic (`block_<offset>`, `raw_%06d.bin`, zarr chunk
 paths), so re-runs overwrite rather than accumulate. Storage does not grow
@@ -225,7 +280,8 @@ without bound even if a purge is skipped.
 
 ## Verifying a run
 
-1. **2 rows, both `status: success`.**
+1. **Every row `status: success`** — 2 for the smoke, 36 for the full sweep.
+   `post_cmds` prints the count; a short count means rows failed silently.
 2. **No blank throughput columns.** `post_cmds` asserts this, because a green
    row with a blank throughput column is a **failure**, not a success. The
    required columns are `clio_s3.write.agg_bw_mbps`, `zarr_s3.write.agg_bw_mbps`,
@@ -237,9 +293,25 @@ without bound even if a purge is skipped.
    row is fiction regardless of what the throughput columns say; more than
    `num_blobs` means the allocator fragmented (not a failure — see
    troubleshooting).
-5. **`rawput` is the fastest row.** If CLIO or Zarr beats the floor, something
-   is not actually reaching S3 — check that the CTE tier really is the S3 device
-   and not a local fallback.
+5. **`rawput` is the fastest row *at K ≥ 8*, compared on `wire_bw_mbps`.**
+   Two qualifications, both learned the hard way on 2026-08-26:
+
+   * **Not at K=1.** The floor forks one `cae_s3_tool` per object and stages
+     each through a temp file, so at concurrency 1 it pays `num_blobs`
+     serialized `fork+exec` calls in the critical path and came back *slower*
+     than CLIO (4.72 vs 6.03 MB/s). Its own fairness columns show why —
+     `subprocess_spawns: 64`, `temp_file_bytes: 4194304`. At K ≥ 8 that
+     overhead pipelines across the concurrent processes and the floor becomes
+     honest. It is a floor for **sustained throughput**, not for single-op
+     latency.
+   * **Compare `wire_bw_mbps`, not `agg_bw_mbps`.** `zarr_s3.writezstd`
+     legitimately beats every other stack on `agg_bw_mbps` because it moves
+     roughly half the bytes for the same logical payload. On the wire it is
+     no faster. See "Read the fairness columns" above.
+
+   If CLIO beats the floor on **wire** bandwidth at high K, *then* something
+   is not reaching S3 — check that the CTE tier really is the S3 device and
+   not a local fallback, and check `objects_measured`.
 6. **Run once with `clio_s3.verify: true`** to prove bytes round-tripped: it
    re-reads every blob through CTE and compares content byte-for-byte. Leave it
    off for timed rows.

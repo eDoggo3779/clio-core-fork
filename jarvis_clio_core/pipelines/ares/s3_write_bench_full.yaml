@@ -1,78 +1,94 @@
 # =============================================================================
-# Issue #968 - CLIO vs Zarr S3 WRITE benchmark: SMOKE TEST (2 rows).
+# Issue #968 - CLIO vs Zarr S3 WRITE benchmark: FULL SWEEP (36 rows).
 # =============================================================================
 #
-# The write-side counterpart of s3_read_bench_smoke.yaml. One blob size (4 MiB)
-# at two concurrencies (1 and 32), repeat 1 => 2 rows, ~10 minutes.
+# Widened from s3_write_bench.yaml (2-row smoke) after that smoke came back
+# green on 2026-08-26. Every gate, credential path and preflight below is
+# carried over from it VERBATIM -- only the grid, the walltime and `verify`
+# differ. Fix a bug in one file, fix it in the other.
 #
-# It answers the one question that decides whether a full grid is worth
-# running: DOES CLIO WRITE CONCURRENCY ACTUALLY SCALE?
+# WHAT THE SMOKE ESTABLISHED, AND WHY THIS GRID LOOKS LIKE IT DOES.
 #
-#   The S3 PUT blocks a runtime WORKER thread inside the bdev's WriteBlocks,
-#   so effective concurrency is capped by the worker count rather than by the
-#   requested K -- structurally the same ceiling the read bench hit with
-#   fork+waitpid, for a different reason. Compare clio_s3.write.agg_bw_mbps
-#   between the K=1 and K=32 rows:
+#   At K=32 all four engines converged on the same wire bandwidth:
 #
-# COMPARE AGAINST RAWPUT FIRST, NOT AGAINST K=1. An earlier version of this
-# note said "K=32 about equal to K=1 -> workers are the ceiling, raise
-# runtime.num_threads", and that rule is wrong: it reads CLIO in isolation.
-# When this actually ran (2026-08-26) CLIO returned only 1.7x for 32x the
-# concurrency -- but so did zarr, and so did the rawput floor, and all three
-# landed within 6% of each other at ~10.7 MB/s. The ceiling was the ~85
-# Mbit/s uplink, not the worker pool, and raising num_threads would have
-# bought nothing. The correct rule:
+#     raw PUT floor   10.75 MB/s      <- the ceiling
+#     zarr (none)     10.62 MB/s      98.8% of floor
+#     zarr (zstd)     10.34 MB/s      96.2% of floor  (wire, not logical)
+#     CLIO -> S3 bdev 10.11 MB/s      94.0% of floor
 #
-#     * CLIO well below rawput  -> CLIO's own ceiling. Worker pool, DPE
-#       placement, or the bdev. Raise runtime.num_threads first.
-#     * CLIO close to rawput    -> the link (or the bucket) is the ceiling.
-#       Nothing in CLIO can beat it; report ratio-to-floor, not MB/s.
+#   Four independent write paths landing inside 6% of each other is not four
+#   coincidences. It is one shared constraint: roughly 85 Mbit/s of egress
+#   from an Ares compute node to S3. CLIO is not slow here; the link is.
 #
-# The rawput floor is what makes that distinction possible: it forks
-# `cae_s3_tool put` and involves no runtime worker at all.
+#   That reframes the whole sweep. Blob size and concurrency cannot be
+#   explored usefully ABOVE the saturation point -- every such row just
+#   re-measures the same pipe and costs ~8 minutes to do it. So this grid
+#   spends its rows finding WHERE the knee is (K = 1,4,8,16,32,64) at two
+#   granularities, instead of pushing to larger blobs that only lengthen
+#   already-saturated rows.
 #
-# ONE CAVEAT ON THE FLOOR: it is a floor for SUSTAINED throughput, not for
-# single-op latency. At K=1 it came back SLOWER than CLIO (4.72 vs 6.03
-# MB/s) because it pays 64 serialized fork+exec calls plus a 4 MiB temp-file
-# write per object -- visible in its own fairness columns as
-# `subprocess_spawns: 64` and `temp_file_bytes`. At K>=8 that overhead
-# pipelines across the concurrent processes and the floor becomes honest.
-# Do not treat "rawput is not the fastest row at K=1" as a failure.
+#   K=64 is in the grid specifically to settle what kind of ceiling it is.
+#   The rawput floor forks K processes and involves no runtime worker at all,
+#   so it probes the link independently of CLIO's threading:
 #
-# Deliberately NOT a 36-row grid: achievable write concurrency and latency
-# are unknown until this has been measured once. Once it is green, widen
-# with s3_write_bench_full.yaml.
+#     * rawput flat from K=32 to K=64  -> the link is saturated. CLIO's
+#       plateau is the network and nothing in CLIO can beat it. Report the
+#       ratio-to-floor column, not the absolute MB/s.
+#     * rawput keeps climbing at K=64  -> the ~10.7 was a per-connection
+#       concurrency limit, and CLIO's plateau IS worth chasing. Raise
+#       runtime.num_threads and re-run the top of the K axis.
 #
-# Cost: writes are cheap. Ingress to S3 is free and PUTs run ~$0.005/1000, so
-# this smoke is effectively free -- unlike the read grid's ~155 GiB of egress.
-# Only leftover object storage accrues; see post_cmds.
+# READ ratio-to-floor, NOT absolute MB/s. On a shared uplink the absolute
+# numbers are a property of the night you ran them. The distance to the
+# rawput floor is a property of CLIO.
+#
+# DO NOT QUOTE zarr's zstd agg_bw AGAINST CLIO's. At K=32 zstd reads 19.90
+# MB/s to CLIO's 12.17 -- but zstd moved 133 MiB of wire bytes to CLIO's 256
+# MiB for the same logical payload. Its wire_bw is 10.34, i.e. slightly
+# SLOWER than CLIO on the wire. The fairness columns (compression,
+# bytes_moved, logical_bytes, wire_bw_mbps) exist for exactly this row, and
+# 19.90 is the largest number in the file, so it is the one that will get
+# misquoted.
+#
+# Cost: writes are cheap -- ingress to S3 is free, PUTs run ~$0.005/1000.
+# ~37k PUTs across the grid is about $0.18. `verify` is OFF here (it is GET
+# egress, and the smoke already proved byte-fidelity); per-row honesty comes
+# from objects_measured/bytes_measured, which are a LISTING of the bucket and
+# cost nothing. post_cmds purges the prefix.
+#
+# Runtime: ~70 min per repeat, ~3.6 h for all 3. Sized for overnight.
 #
 # Usage:
 #   export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench
 #   export S3_BENCH_REGION=us-east-2      # MANDATORY, and must be the bucket's
 #                                         # real region -- verified in pre_cmds
 #   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
-#   jarvis ppl submit <abs path>/s3_write_bench.yaml
+#   export PATH="$HOME/jarvis-venv/bin:$PATH"
+#   jarvis ppl submit <abs path>/s3_write_bench_full.yaml
 #
-# Output: ${HOME}/s3_write_bench_results/results.csv - 2 rows.
-#         Every *.agg_bw_mbps column must be populated. A green row with a
-#         blank throughput column is a FAILURE.
+# Output: ${HOME}/s3_write_bench_full_results/results.csv - 36 rows.
+#         Every *.agg_bw_mbps column must be populated, and every
+#         clio_s3.write.objects_measured must equal clio_s3.num_blobs. A
+#         green row with a blank throughput column, or with zero objects
+#         measured, is a FAILURE.
 
 scheduler:
   name: slurm
-  job_name: clio_s3_write_smoke
+  job_name: clio_s3_write_full
   nodes: 1
   ntasks_per_node: 1
   # Must stay large: Ares Slurm uses proctrack/cgroup with ConstrainCores, and
   # each S3 PUT occupies a whole runtime worker thread for its duration. A
   # narrow cgroup silently caps concurrency.
-  cpus_per_task: 40
+  cpus_per_task: 48
   partition: compute
-  time: "01:00:00"
-  output: ${HOME}/s3_write_bench-%j.out
-  error: ${HOME}/s3_write_bench-%j.err
+  # ~70 min per repeat x 3 repeats = ~3.6 h measured, with headroom for a
+  # bad-network night. Sized for overnight; raise `time` before adding rows.
+  time: "08:00:00"
+  output: ${HOME}/s3_write_bench_full-%j.out
+  error: ${HOME}/s3_write_bench_full-%j.err
   # MUST stay literally identical to config.hostfile below.
-  hostfile: "${HOME}/.jarvis-s3-bench/s3_write_bench_hostfile.txt"
+  hostfile: "${HOME}/.jarvis-s3-bench/s3_write_bench_full_hostfile.txt"
   pre_cmds:
     # 1) Toolchain. Pure PATH prepends -- never `spack load` / `conda activate`
     #    (they install shell functions that misbehave under `set -euo pipefail`).
@@ -184,7 +200,8 @@ scheduler:
     - '[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "ERROR: AWS_ACCESS_KEY_ID empty after reading profile [$AWS_PROFILE] — the runtime cannot sign without it" >&2; exit 1; }'
     - 'echo "credentials exported from [$AWS_PROFILE], region $AWS_DEFAULT_REGION"'
     # 3) The rawput floor forks cae_s3_tool; give it a node-local staging dir
-    #    with room for concurrency * object_size (32 x 4 MiB = 128 MiB).
+    #    with room for concurrency * object_size (64 x 4 MiB = 256 MiB at
+    #    the widest point of this grid). /tmp is node-local on Ares.
     - 'export CAE_S3_TOOL="$(command -v cae_s3_tool)"'
     - 'export TMPDIR=/tmp/clio_s3_wbench; mkdir -p "$TMPDIR"'
     # 4) Stale-state cleanup. pkill patterns are BRACKETED so they never match
@@ -197,7 +214,7 @@ scheduler:
     - 'rm -rf "$TMPDIR"/s3_raw_put_* /tmp/iowarp_chi* 2>/dev/null || true'
     # 5) Experiment dirs + repo registration + clean slate (the sweep runner
     #    RESUMES over an existing results.csv and would skip failed rows).
-    - 'mkdir -p "$HOME/s3_write_bench_results" "$HOME/.jarvis-s3-bench"'
+    - 'mkdir -p "$HOME/s3_write_bench_full_results" "$HOME/.jarvis-s3-bench"'
     # The runtime persists a perf model here and logs an ERROR per attempt if
     # it cannot. /tmp is node-local, so this must happen on the compute node --
     # creating it on the login node does nothing for the job.
@@ -232,7 +249,7 @@ scheduler:
       done
       jarvis repo add "$CLIO_REPO/jarvis_clio_core" 2>/dev/null || true
       echo "jarvis packages OK: $CLIO_REPO/jarvis_clio_core"
-    - 'rm -f "$HOME/s3_write_bench_results/results.csv"'
+    - 'rm -f "$HOME/s3_write_bench_full_results/results.csv"'
     # Pre-flight the EXACT call the S3 bdev makes at Init: a HEAD on the
     # bucket, signed with the RAW EXPORTED KEYS (not the profile -- the bdev
     # cannot read profiles). Cheap, and it separates four failures that
@@ -299,11 +316,11 @@ scheduler:
             f"{true_region}, with the exported keys")
       EOF
   post_cmds:
-    - 'RES="$HOME/s3_write_bench_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 2"'
+    - 'RES="$HOME/s3_write_bench_full_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 36"'
     # A green row with a blank throughput column is a FAILURE, not a success.
     # Assert it here instead of leaving it to manual inspection.
     - |
-      python3 - "$HOME/s3_write_bench_results/results.csv" <<'EOF'
+      python3 - "$HOME/s3_write_bench_full_results/results.csv" <<'EOF'
       import csv, os, sys
       path = sys.argv[1]
       if not os.path.exists(path):
@@ -356,10 +373,10 @@ scheduler:
       EOF
 
 config:
-  name: s3_write_bench
+  name: s3_write_bench_full
 
   # MUST stay literally identical to scheduler.hostfile above.
-  hostfile: "${HOME}/.jarvis-s3-bench/s3_write_bench_hostfile.txt"
+  hostfile: "${HOME}/.jarvis-s3-bench/s3_write_bench_full_hostfile.txt"
 
   pkgs:
     - pkg_type: jarvis_clio_core.clio_runtime
@@ -415,7 +432,7 @@ config:
     - pkg_type: jarvis_clio_core.clio_s3_write_bench
       pkg_name: clio_s3
       blob_size: "4m"                                 # SWEPT
-      num_blobs: 64                                   # SWEPT
+      num_blobs: 256                                  # SWEPT
       concurrency: 8                                  # SWEPT
       worker_threads: 16                              # SWEPT (reported only)
       # Count what actually landed in the bucket, instead of deriving it. The
@@ -429,18 +446,21 @@ config:
       tag_prefix: "s3wb"
       aws_region: "${S3_BENCH_REGION}"
       aws_profile: "${S3_BENCH_PROFILE}"
-      # ON for the smoke. It runs AFTER the timed loop, so it costs GET egress
-      # (~256 MiB, cents) but not measurement fidelity -- and it is the only
-      # thing in the pipeline that proves bytes actually round-tripped through
-      # S3 rather than being counted as written by a tier that swallowed them.
-      # Turn it off for the full grid, where the egress stops being trivial.
-      verify: true
+      # OFF for the grid. The smoke already proved byte-fidelity end to end
+      # (both rows green with verify on == 128 blobs read back byte-identical),
+      # and re-reading every blob on all 36 rows is ~19 GiB of GET egress to
+      # re-answer a settled question. Per-row honesty comes from
+      # objects_measured / bytes_measured instead: those are a LISTING of the
+      # bucket, so a row that wrote nothing cannot fake them, and a listing is
+      # free. If you change the bdev's write path, flip this back on for one
+      # confirming run before trusting the grid.
+      verify: false
 
     - pkg_type: jarvis_clio_core.zarr_s3_write_bench
       pkg_name: zarr_s3
       bucket: "${S3_BENCH_BUCKET}"
       store_prefix: "clio-s3-write-bench"
-      total_bytes: 268435456                          # SWEPT: 64 * 4 MiB
+      total_bytes: 1073741824                         # SWEPT: 256 * 4 MiB
       chunk_bytes: 4194304                            # SWEPT: == blob_size
       variants: ["none", "zstd"]
       # Source entropy is an explicit input: at 0.0 zstd cannot compress and
@@ -456,7 +476,7 @@ config:
       pkg_name: raw_put
       bucket: "${S3_BENCH_BUCKET}"
       key_prefix: "clio-s3-write-bench/rawput"
-      num_objects: 64                                 # SWEPT: == num_blobs
+      num_objects: 256                                # SWEPT: == num_blobs
       object_size: 4194304                            # SWEPT: == blob_size
       concurrency: 8                                  # SWEPT
       tmpdir: "/tmp/clio_s3_wbench"
@@ -464,20 +484,57 @@ config:
       aws_profile: "${S3_BENCH_PROFILE}"
 
 vars:
-  # One granularity only: 4 MiB unit, 64 of them, 256 MiB per stack.
-  clio_s3.blob_size:      ["4m"]
-  clio_s3.num_blobs:      [64]
-  zarr_s3.chunk_bytes:    [4194304]
-  zarr_s3.total_bytes:    [268435456]
-  raw_put.object_size:    [4194304]
-  raw_put.num_objects:    [64]
+  # ---------------------------------------------------------------------
+  # Axis 1: GRANULARITY (2 points). Blob count is held at 256 for BOTH
+  # sizes rather than holding total bytes constant. That is deliberate: the
+  # concurrency axis reaches K=64, and a window of K in-flight requests is
+  # only meaningful if there are several windows' worth of work behind it.
+  # 64 blobs (the smoke's count) would have been a single window at K=64 and
+  # would have measured startup, not steady state.
+  #
+  # The cost is that the 4m rows move 4x the bytes of the 1m rows and take
+  # correspondingly longer. That is the right trade at an ~85 Mbit/s
+  # ceiling: a short row at saturation tells you nothing a long one does not.
+  #
+  # Larger blobs (16m+) are deliberately ABSENT. At 4 MiB the link is
+  # already saturated from K=16 up, so a 16m axis would spend ~25 min/row
+  # re-deriving the same 10.7 MB/s. Add it only if the K=64 rawput point
+  # shows the ceiling is NOT the link.
+  # ---------------------------------------------------------------------
+  clio_s3.blob_size:      ["1m",      "4m"]
+  clio_s3.num_blobs:      [256,       256]
+  zarr_s3.chunk_bytes:    [1048576,   4194304]
+  zarr_s3.total_bytes:    [268435456, 1073741824]
+  raw_put.object_size:    [1048576,   4194304]
+  raw_put.num_objects:    [256,       256]
 
-  # The whole point of the smoke test: K=1 vs K=32.
-  clio_s3.concurrency:       [1, 32]
-  zarr_s3.async_concurrency: [1, 32]
-  raw_put.concurrency:       [1, 32]
-  runtime.num_threads:       [4, 48]
-  clio_s3.worker_threads:    [4, 48]
+  # ---------------------------------------------------------------------
+  # Axis 2: CONCURRENCY (6 points) -- the axis this sweep exists for.
+  # The smoke measured only K=1 and K=32 and found 6.03 -> 10.11 MB/s of
+  # wire bandwidth: a 1.7x return on 32x the concurrency. Where between
+  # those two the curve flattens is the actual deliverable, because it is
+  # the number that tells you how many in-flight PUTs are worth issuing.
+  #
+  # runtime.num_threads is zipped to stay >= K. Each S3 PUT blocks a runtime
+  # WORKER for its duration inside the bdev's WriteBlocks, so a worker pool
+  # narrower than K caps effective concurrency below the requested value and
+  # the row silently measures the pool instead of the link.
+  #
+  # 64 workers against cpus_per_task: 48 is intentional oversubscription:
+  # these threads are parked in a socket read, not spinning on CPU. The
+  # smoke already ran 48 workers on 40 cpus without trouble. Do not read
+  # that as licence to go much further -- if a future row needs K >> 64,
+  # confirm the workers are not spin-polling first.
+  #
+  # clio_s3.worker_threads is REPORTED ONLY (it lands in the fairness block
+  # as `Runtime worker threads`); it must track runtime.num_threads or the
+  # fairness column will describe a pool that was never configured.
+  # ---------------------------------------------------------------------
+  clio_s3.concurrency:       [1, 4,  8,  16, 32, 64]
+  zarr_s3.async_concurrency: [1, 4,  8,  16, 32, 64]
+  raw_put.concurrency:       [1, 4,  8,  16, 32, 64]
+  runtime.num_threads:       [4, 8,  16, 32, 48, 64]
+  clio_s3.worker_threads:    [4, 8,  16, 32, 48, 64]
 
 loop:
   - [clio_s3.blob_size, clio_s3.num_blobs, zarr_s3.chunk_bytes,
@@ -486,8 +543,17 @@ loop:
      runtime.num_threads, clio_s3.worker_threads]
 
 # Per-combination wall-clock backstop. Expiry marks that row failed and the
-# sweep continues, so one wedged row cannot lose the other.
-run_timeout: 1800
+# sweep continues, so one wedged row cannot lose the other 35.
+#
+# The slowest combination is 4m x 256 blobs at K=1: the smoke's K=1 row moved
+# 256 MiB per engine in 255 s, so 1 GiB per engine across four engines is
+# ~730 s. 2400 leaves room for a bad night without letting a genuinely hung
+# row burn 40 minutes of the allocation.
+run_timeout: 2400
 
-repeat: 1
-output: "${HOME}/s3_write_bench_results"
+# 3 repeats, because absolute throughput on a shared uplink is a property of
+# the night you measured it. Without repeats there is no way to tell a real
+# difference between two K values from ordinary link variance, and "CLIO is
+# 6% off the floor" needs an error bar before it is a claim.
+repeat: 3
+output: "${HOME}/s3_write_bench_full_results"
