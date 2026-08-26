@@ -161,8 +161,26 @@ struct Mutex {
     // Same reasoning applies to a Pthread build on an architecture whose
     // Yield() falls back to sched_yield() (neither x86 nor arm); there rung 2
     // is redundant rather than harmful.
-    if (ty == ThreadType::kPthread && spin_count < kSpinRung + kYieldRung) {
-      std::this_thread::yield();
+    if (ty == ThreadType::kPthread) {
+      if (spin_count < kSpinRung + kYieldRung) {
+        std::this_thread::yield();
+        return;
+      }
+    } else if (spin_count < kSpinRung + kYieldRung) {
+      // StdThread: rung 1 already yielded, so just keep doing that rather than
+      // parking after only kSpinRung iterations.
+      //
+      // This matters most on Windows, which has no pthreads (so StdThread is
+      // the default model) and whose default timer resolution is ~15.6ms: a
+      // sub-millisecond sleep_for() parks for ~15ms, roughly 150x what is
+      // asked. The RwLock that now sits on this mutex is taken on every
+      // unordered_map_ll operation, and at ~15ms per park that test crawls --
+      // ctp_priv_umap_ll timed out at 120s on windows-2025, stalling in a
+      // different concurrent case on each retry (progressing, just far too
+      // slow). The lock it replaced never parked at all on Windows; it
+      // yield-spun. Extending the yield phase from kSpinRung to
+      // kSpinRung + kYieldRung cuts park frequency ~17x while keeping the
+      // rung-3 backstop for a holder that really is gone.
       return;
     }
     // Rung 3 -- genuinely stuck (holder descheduled and not coming back
