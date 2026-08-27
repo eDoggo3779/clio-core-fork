@@ -290,21 +290,24 @@ jobs:
 
       # The run_tests.sh scripts tear their clusters down on success and failure;
       # this only fires if a step was killed before its own cleanup.
+      #
+      # A step killed by `timeout-minutes` never reaches its own teardown, so its
+      # network survives into the NEXT step. That is how the coherence step timing
+      # out at 20 minutes took the grayscott step down with it:
+      #   failed to create network grayscott_congestion_gs-cluster:
+      #     invalid pool request: Pool overlaps with other one on this address space
+      # Both stacks had been sharing 172.30.0.0/24. The subnets are unique per
+      # stack now, so a leak can no longer block a DIFFERENT stack -- but the leak
+      # still has to be swept, and grayscott_congestion was missing from this list
+      # entirely. Every compose file that declares a network belongs here, not
+      # just the ones that had already caused trouble.
       - name: Cleanup clusters
         if: always()
         run: |
-          for f in \
-            context-runtime/test/integration/alltoone/docker-compose.yml \
-            context-runtime/test/integration/distributed/docker-compose.yml \
-            context-runtime/test/integration/expand/docker-compose.yml \
-            context-runtime/test/integration/migrate/docker-compose.yml \
-            context-runtime/test/integration/reconnect/docker-compose.yml \
-            context-runtime/test/integration/leader_elect/docker-compose.yml \
-            context-runtime/test/integration/recovery/docker-compose.yml \
-            context-transfer-engine/test/integration/distributed/docker-compose.yaml \
-            context-transfer-engine/test/integration/cfs_distributed/docker-compose.yaml \
-            context-transfer-engine/test/integration/coherence/docker-compose.yaml \
-            context-transfer-engine/test/integration/client_crash/docker-compose.yaml \
-            context-transfer-engine/test/integration/fuse/docker-compose.yaml ; do
-            docker compose -f "$f" down -v 2>/dev/null || true
+          for f in             context-runtime/test/integration/alltoone/docker-compose.yml             context-runtime/test/integration/distributed/docker-compose.yml             context-runtime/test/integration/expand/docker-compose.yml             context-runtime/test/integration/migrate/docker-compose.yml             context-runtime/test/integration/reconnect/docker-compose.yml             context-runtime/test/integration/leader_elect/docker-compose.yml             context-runtime/test/integration/recovery/docker-compose.yml             context-runtime/test/integration/collective_restart/docker-compose.yml             context-runtime/test/integration/dashboard/docker-compose.yml             context-runtime/test/integration/interactive/docker-compose.yml             context-transfer-engine/test/integration/distributed/docker-compose.yaml             context-transfer-engine/test/integration/cfs_distributed/docker-compose.yaml             context-transfer-engine/test/integration/coherence/docker-compose.yaml             context-transfer-engine/test/integration/client_crash/docker-compose.yaml             context-transfer-engine/test/integration/grayscott_congestion/docker-compose.yaml             context-transfer-engine/test/integration/mpi_producer_consumer/docker-compose.yaml             context-transfer-engine/test/integration/fuse/docker-compose.yaml ; do
+            docker compose -f "$f" down -v --remove-orphans 2>/dev/null || true
           done
+          # Sweep anything the loop could not name -- a stack whose compose file
+          # moved, or a network orphaned by a killed `docker compose up`. Safe on
+          # a CI runner: prune only removes networks with no attached container.
+          docker network prune -f 2>/dev/null || true
