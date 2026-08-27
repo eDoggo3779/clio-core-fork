@@ -4033,6 +4033,125 @@ struct GetBlobSizeTask : public clio::run::Task {
 };
 
 /**
+ * Ask the tier whether a byte range of a blob is physically present.
+ *
+ * The question this exists to answer is the one a client CANNOT answer from
+ * its shared-memory mirror: a lookup miss there means "not in the mirror",
+ * which conflates "no such bytes exist" with "exists, but not reachable from
+ * here". Those need opposite responses — the first is a hole, where zeros are
+ * the correct data and no round trip is needed; the second requires the RPC
+ * path. Only the runtime is authoritative about which it is.
+ *
+ * Deliberately one operation, not a residency framework: it reports what the
+ * tier already knows from BlobInfo's block list and does not build, cache or
+ * maintain interval state of its own. Interval bookkeeping in a telemetry or
+ * lookup path is what this is meant to prevent, not introduce.
+ */
+struct GetResidencyTask : public clio::run::Task {
+  IN TagId tag_id_;                       // Tag owning the blob
+  IN clio::run::priv::string blob_name_;  // Blob name (required)
+  IN clio::run::u64 offset_;              // Start of the range of interest
+  IN clio::run::u64 size_;                // Length of the range, 0 = whole blob
+
+  /** 1 if the blob exists at all. 0 means a hole: zeros are the correct
+   *  answer for the range and the caller needs no further round trip. */
+  OUT clio::run::u32 exists_;
+  /** Bytes of the requested range physically present, counting from
+   *  `offset_`. Short of the request means the range runs off the end of what
+   *  is stored (a sparse write or an ftruncate-grow), and the remainder is a
+   *  hole.
+   *
+   *  Derived from the total of the blob's stored blocks, which the block list
+   *  represents in logical order with no per-block logical offset -- so this
+   *  is the length of the stored PREFIX, not a map of which sub-ranges exist.
+   *  A caller needing per-range detail inside a blob does not get it here. */
+  OUT clio::run::u64 present_bytes_;
+  /** 1 if a shared-memory read can serve the requested range: every block
+   *  covering it is on a directly-readable target AND the range lies inside
+   *  the prefix the SHM record actually describes. 0 means present but only
+   *  reachable through the RPC path — a file/remote/GPU tier, transformed
+   *  bytes, or a range past the record's cached prefix. */
+  OUT clio::run::u32 direct_readable_;
+
+  // SHM constructor
+  GetResidencyTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        blob_name_(CLIO_PRIV_ALLOC),
+        offset_(0),
+        size_(0),
+        exists_(0),
+        present_bytes_(0),
+        direct_readable_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit GetResidencyTask(const clio::run::TaskId &task_id,
+                                          const clio::run::PoolId &pool_id,
+                                          const clio::run::PoolQuery &pool_query,
+                                          const TagId &tag_id,
+                                          const std::string &blob_name,
+                                          clio::run::u64 offset = 0,
+                                          clio::run::u64 size = 0)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kGetResidency),
+        tag_id_(tag_id),
+        blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        offset_(offset),
+        size_(size),
+        exists_(0),
+        present_bytes_(0),
+        direct_readable_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kGetResidency;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(exists_, present_bytes_, direct_readable_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<GetResidencyTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    offset_ = other->offset_;
+    size_ = other->size_;
+    exists_ = other->exists_;
+    present_bytes_ = other->present_bytes_;
+    direct_readable_ = other->direct_readable_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetResidencyTask>();
+    // The blob lives on one container; non-owners answer 0 for all three, so
+    // max yields the owner's verdict for one replica and for many. exists_ and
+    // direct_readable_ are 0/1, where max is a logical OR.
+    if (replica->exists_ > exists_) {
+      exists_ = replica->exists_;
+    }
+    if (replica->present_bytes_ > present_bytes_) {
+      present_bytes_ = replica->present_bytes_;
+    }
+    if (replica->direct_readable_ > direct_readable_) {
+      direct_readable_ = replica->direct_readable_;
+    }
+  }
+};
+
+/**
  * Block information for GetBlobInfo response
  * Contains the target pool ID and size for each block
  */
