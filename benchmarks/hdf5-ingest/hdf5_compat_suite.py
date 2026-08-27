@@ -1562,6 +1562,33 @@ def _run_instant_reopen_check():
     return {"vol/instant_reopen": checks}
 
 
+def _summary_failure_detail(path, exc):
+    """Say what the summary actually contained when a lookup into it failed.
+
+    `KeyError: 'm'` was the entire diagnostic these checks emitted on macOS --
+    it named the key we wanted and nothing about what was there instead, so a
+    reader could not tell an empty `datasets` (nothing was traced at all) from
+    a renamed key (traced under a different path) without a macOS runner in
+    hand. Both fail identically; only one is a tracing bug. Print the keys, the
+    file, and the top-level shape so the log answers that on its own.
+    """
+    try:
+        blob = json.load(open(path))
+    except Exception as e:                      # not JSON at all
+        size = os.path.getsize(path) if os.path.exists(path) else -1
+        return f"summary at {path} is not readable JSON ({e}); {size}B on disk"
+    dsets = blob.get("datasets")
+    if dsets is None:
+        return (f"summary {os.path.basename(path)} has no 'datasets' key at all; "
+                f"top-level keys={sorted(blob.keys())} ({type(exc).__name__}: {exc})")
+    if not dsets:
+        return (f"summary {os.path.basename(path)} has an EMPTY 'datasets' map -- "
+                f"no dataset access was traced; producer="
+                f"{blob.get('producer')!r} file={blob.get('file')!r}")
+    return (f"summary {os.path.basename(path)} has datasets={sorted(dsets.keys())}, "
+            f"missing what the check asked for ({type(exc).__name__}: {exc})")
+
+
 def _run_bbox_fetch_check():
     """§4(A): does serving a selection fetch only the chunks its bounding box
     touches, or the whole cached image?
@@ -1604,7 +1631,7 @@ def _run_bbox_fetch_check():
             detail = (f"fetched {fetched}B for {served} cache-served reads; "
                       f"whole-image would be {whole_image_cost}B")
         except Exception as e:
-            detail = f"summary unreadable: {e}"
+            detail = _summary_failure_detail(summaries[0], e)
     checks["fetch_narrowed"] = narrowed
     ok = all(checks.values())
     print(f"  {'bbox_fetch':<20} {'PASS' if ok else 'FAIL'}  ({detail})")
@@ -1650,8 +1677,11 @@ def _run_trace_check():
                          # latency split is present and non-negative
                          and d["read_latency_us"]["cache_mean"] >= 0.0)
             repeat_ok = d["max_repeated_selection"] >= 2  # A and B read the same hyperslab
-        except Exception:
-            pass
+        except Exception as e:
+            # Was a bare `except: pass`, so this check reported FAIL with no
+            # reason at all -- on macOS it failed for the same missing-'m' key
+            # as bbox_fetch and the log said only "telemetry FAIL". Say why.
+            print(f"    telemetry: {_summary_failure_detail(summaries[0], e)}")
     checks["fields_sane"] = fields_ok
     checks["repeat_detected"] = repeat_ok
 
