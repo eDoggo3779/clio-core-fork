@@ -19,8 +19,15 @@
 #
 # The command's own dashed flags need no protection -- ValueFromRemaining-
 # Arguments collects '-y' and '--no-progress' into $Command unharmed.
+#
+# PositionalBinding is off for a second, independent reason: without it the
+# first bare argument binds to -Attempts, so the two call sites that do not
+# pass -Attempts (build-pip test-wheels-windows, build-packages nsis) fail with
+#   Cannot convert value "choco" to type "System.Int32"
+# even after the '--' above is gone. Removing the separator and turning
+# positional binding off are both required; either alone still fails.
 
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [int]$Attempts = 3,
     [int]$DelaySeconds = 5,

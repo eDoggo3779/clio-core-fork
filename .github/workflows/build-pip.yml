@@ -378,13 +378,25 @@ jobs:
     - name: Checkout repository (for test script)
       uses: actions/checkout@v4
       with:
-        sparse-checkout: installers/pip
+        # CI/ as well as installers/pip: the image pull below goes through
+        # CI/retry.sh, which has to exist in the workspace.
+        sparse-checkout: |
+          installers/pip
+          CI
 
     - name: Download wheels
       uses: actions/download-artifact@v4
       with:
         name: wheels-${{ matrix.arch }}
         path: wheels/
+
+    # Pull with retry BEFORE the run. A registry hiccup makes `docker run`
+    # exit 125 -- "Error response from daemon: Get
+    # https://registry-1.docker.io/v2/..." -- which reads as a wheel failure
+    # but is Docker Hub being briefly unreachable. Pulling separately keeps the
+    # retry on the network step and off the test itself.
+    - name: Pull ${{ matrix.distro }}
+      run: bash CI/retry.sh docker pull ${{ matrix.distro }}
 
     - name: Test wheel in ${{ matrix.distro }}
       run: |
@@ -415,6 +427,11 @@ jobs:
               # aborts -- which is how this arrived, as every test-wheels leg
               # going red overnight with no change on our side. Naming expat
               # explicitly upgrades it to 2.5.0 alongside the interpreter.
+              #
+              # NOTE: this whole block is the body of a bash -c single-quoted
+              # string, so no apostrophe may appear anywhere in it, comments
+              # included -- one would close the string and truncate the script
+              # for every distro in the matrix, not just this branch.
               if dnf install -y -q python3.12 python3.12-pip expat >/dev/null 2>&1; then
                 ln -sf /usr/bin/python3.12 /usr/local/bin/python3
               else
@@ -654,6 +671,17 @@ jobs:
     timeout-minutes: 30
 
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:

@@ -383,6 +383,17 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Download AppImage artifact
       uses: actions/download-artifact@v4
       with:
@@ -519,6 +530,17 @@ jobs:
     timeout-minutes: 45
     if: always() && needs.build-windows.result == 'success'
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: CI
+
     - name: Download Windows package
       uses: actions/download-artifact@v4
       with:
