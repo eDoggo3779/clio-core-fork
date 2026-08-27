@@ -46,36 +46,110 @@ below).
 100 warmup, Release build. Latency in microseconds, **max across ranks** (a
 collective is not done until its slowest participant returns):
 
-| arm              |    mean |     p50 |     p99 |     max |
-|------------------|--------:|--------:|--------:|--------:|
-| `mpi_barrier`    |   27.85 |   26.34 |   60.33 |   97.83 |
-| `mpi_allreduce`  |   24.64 |   20.84 |   46.99 |   91.05 |
-| `clio_barrier`   | 1096.05 | 1165.49 | 1747.42 | 2226.20 |
-| `clio_allreduce` |  963.53 | 1143.89 | 1580.17 | 2095.91 |
+| arm               |    mean |     p50 |     p99 |     max |
+|-------------------|--------:|--------:|--------:|--------:|
+| `mpi_barrier`     |   27.02 |   26.35 |   34.29 |   62.37 |
+| `mpi_allreduce`   |   22.73 |   20.22 |   40.34 |   63.18 |
+| `clio_barrier`    |  320.89 |  305.41 |  897.69 | 1734.59 |
+| `clio_allreduce`  |  345.31 |  321.15 |  787.13 | 1505.10 |
+| `clio_local_rtt`  |   22.32 |   11.87 |  188.91 |  427.32 |
+| `clio_remote_rtt` |  316.63 |  302.95 |  633.80 | 1669.57 |
 
-- `clio_barrier` / `mpi_barrier`: **39.4×**
-- `clio_allreduce` / `mpi_allreduce`: **39.1×**
+- `clio_barrier` / `mpi_barrier`: **11.9×**
+- `clio_allreduce` / `mpi_allreduce`: **15.2×**
 
-A second run of the same configuration gave 37.7× and 41.3×, so treat the
-ratio as "roughly 40×", not as three significant figures. Run-to-run spread on
-the clio arms is a few percent at the mean and considerably more at p99.
+The last two rows are not collectives. They are ordinary empty `Custom` tasks —
+one to the caller's own daemon, one to a peer — and they are what makes the
+collective numbers interpretable:
 
-Two things worth reading off this table:
+```
+  plain local task round trip           22.32
+  plain remote task round trip         316.63  (+294.31 for the network hop)
+  collective barrier                   320.89  (+4.26 for the collective machinery)
+  MPI barrier, for scale                27.02
+```
 
-1. **The reduction is free; the machinery is everything.** `clio_allreduce` and
-   `clio_barrier` land within run-to-run noise of each other (the reduce came
-   out marginally *faster* here), so summing four `u64`s costs nothing
-   measurable. The whole ~1 ms is task routing, the forward to the
-   leader, parking in the `BatchManager`, the flush poll, and the 1→N
-   completion broadcast. Optimizing the aggregate is pointless; the round trip
-   is the target.
-2. **MPI's barrier and allreduce cost the same too** (~25 µs), and that is
-   roughly one docker-bridge RTT times the tree depth. We are ~1 ms against
-   ~25 µs, i.e. the gap is not a constant-factor inefficiency in one place but
-   several full round trips plus a polling flush.
+**The collective machinery costs ~4 µs.** Parking in the `BatchManager`,
+waiting for the count, running the aggregate, and broadcasting the result back
+to four nodes is essentially free. A `clio` barrier costs what it costs because
+*one cross-node task round trip* costs 317 µs — against a local round trip of
+22 µs and an entire 4-rank MPI barrier of 27 µs. The reduction is free too:
+`clio_allreduce` and `clio_barrier` differ by less than run-to-run noise.
 
-These are latency numbers on a single host's docker bridge; on real hardware
-with a real fabric both columns move, and the ratio is the portable part.
+So the headline ratio is not a statement about collectives. It is a statement
+about the cross-node task path, and that is where the remaining work is.
+
+### Where the 317 µs goes
+
+Measured with the env-gated profilers below (`CLIO_NET_QPROF=1`,
+`CLIO_NET_TRACE=1`), per one-way hop:
+
+| stage                                    |   cost |
+|------------------------------------------|-------:|
+| wait on the outbound net queue           | ~45-65 µs |
+| serialize the task                       |  ~0.5 µs |
+| ZMQ transmit                             |    ~5 µs |
+| wire (docker bridge)                     |   ~5-10 µs |
+| receiving node: arrival → response queued |  ~30-60 µs |
+
+Serialization and the wire are noise. The cost is queueing and wakeup at both
+ends — the task waiting to be picked up for sending, and the receiving node
+waiting to run it and hand back a response.
+
+### The 3.1× already recovered
+
+`clio_barrier` was **987 µs** and is now **321 µs**; a cross-node round trip was
+652 µs and is now 317 µs. One line did it:
+
+```cpp
+client_.AsyncSendPoll(clio::run::PoolQuery::Local(), 0, 500);  // was
+client_.AsyncSendPoll(clio::run::PoolQuery::Local(), 0, 25);   // now
+```
+
+The period is not a delay — it is a **bucket selector**.
+`Worker::AddToBlockedQueue` files a periodic task by its period, and
+`ContinueBlockedTasks` services the buckets at very different rates: `<=50 µs`
+every 4 worker-loop iterations, `<=200 µs` every 8, `<=50 ms` every **64**. This
+poll drives every cross-node send, so at 500 µs the entire outbound network path
+was serviced every 64 iterations and tasks sat ~300 µs on the send queue. At
+25 µs it lands in the fastest bucket and waits ~45 µs. A `static_assert` at the
+call site now pins it below the 50 µs boundary, because the failure mode is
+silent: nothing breaks, everything just gets 16× less responsive.
+
+### What did NOT work (measured, not assumed)
+
+Each of these was implemented and benchmarked, and changed nothing:
+
+- **Servicing the fast periodic bucket every iteration** instead of every 4.
+- **Waking the net worker on every enqueue** instead of only on empty→non-empty.
+- **Decoupling the per-tick maintenance scans** (`ProcessRetryQueues`,
+  `ScanSendMapTimeouts`, `ScanTaskProgress`) from the drain. Kept anyway: after
+  the period change those liveness scans would otherwise run 16× more often
+  than before, which is a CPU regression the latency numbers do not show.
+- **Never parking** (`first_busy_wait` huge). Much *worse* — 3798 µs. Four
+  containers × 8 spinning workers oversubscribes a 16-core host and starves the
+  client processes and ZMQ threads. Do not benchmark this configuration.
+
+That the poll rate no longer matters is itself the finding: the net send and
+recv workers are **parked** most of the time (`CLIO_WORKER_RATE=1` shows ~82 µs
+and ~157 µs of wall time per loop iteration for workers 6 and 7, versus ~1.3 µs
+for the scheduler worker). Their *wakeup*, not their poll cadence, is what sets
+send latency now.
+
+### The remaining lever
+
+Move the outbound send off the worker-periodic and onto a dedicated thread
+woken on enqueue — exactly what commit `c6c1ef7d` already did for the *inbound*
+path, and for the same reason ("the worker scheduler's yield/wake/epoll cycle
+added too much latency"). That commit explicitly left the outbound side on the
+periodic. Doing so should remove most of the ~50 µs per-hop queue wait, worth
+roughly 100 µs of the 317.
+
+It is not a small change: `IpcCpu2CpuZmq::SendOut` currently relies on running
+on the net worker's thread so the transport's deferred-completion callbacks
+(`DelTask`) can touch coroutine-aware container state, and ZMQ sockets must be
+used from the thread that created them. Both constraints have to be carried
+over deliberately.
 
 ## Running it
 
@@ -133,6 +207,23 @@ A third fix accompanies them: `BatchManager::OnAggregateComplete` now restores
 an owning `RunFuture` handle before `EndTask` on a remote member, because
 completing one is an asynchronous `SendOut` and the batch's owning reference
 drops as soon as the broadcast loop ends.
+
+## Profiling knobs
+
+All are env-gated and cost nothing when unset. Pass them to `run_tests.sh`;
+`docker-compose` forwards them and the daemon logs land in `logs/`.
+
+| var | what it reports |
+|-----|-----------------|
+| `CLIO_COLL_PROF=1` | `[COLLPROF]` collective stages: member skew, flusher notice delay, aggregate build/exec, broadcast |
+| `CLIO_NET_QPROF=1` | `[NETQPROF]` net-queue enqueue→pop wait per priority, and server-side residency (arrival → response queued) |
+| `CLIO_NET_TRACE=1` | `[NETTRACE]` serialize/transmit/recv timings and the send-poll tick rate |
+| `CLIO_WORKER_RATE=1` | `[WORKERRATE]` wall time per worker-loop iteration (includes parked time — compare workers, don't read as CPU) |
+
+Note all four test for a non-EMPTY value, not a non-null pointer. A harness that
+forwards a knob as `"${VAR:-}"` sets it to the empty string when unset, and a
+null check leaves profiling permanently on — which silently happened here and
+put clock reads into "clean" measurements.
 
 ## Notes
 

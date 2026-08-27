@@ -62,7 +62,15 @@ static std::atomic<uint64_t> sendout_ser_ns{0}, sendout_tx_ns{0},
 static std::atomic<uint64_t> recv_ns{0}, recvin_ns{0}, recvout_ns{0},
     recv_n{0};
 inline bool On() {
-  static bool on = std::getenv("CLIO_NET_TRACE") != nullptr;
+  // Non-EMPTY, not merely non-null: a harness that forwards the knob as
+  // "${CLIO_NET_TRACE:-}" (docker-compose environment:, and any `VAR=${VAR:-}`
+  // prefix) sets it to the empty string when unset, and a null check then
+  // leaves tracing permanently on -- silently adding clock reads and log
+  // volume to every measurement that was supposed to be clean.
+  static bool on = [] {
+    const char *e = std::getenv("CLIO_NET_TRACE");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
   return on;
 }
 inline uint64_t NowNs() {
@@ -545,6 +553,7 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   future.GetTaskPtr()->BeginRunContext();
+  ipc_manager->NetProfMarkRecvIn(task_ptr);
   task_ptr->SetRouted();
 
   if (ipc_manager->GetScheduler() != nullptr) {

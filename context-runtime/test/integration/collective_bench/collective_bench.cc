@@ -200,7 +200,8 @@ void PrintRatio(const char *label, const Stats &ours, const Stats &theirs) {
 
 void WriteCsv(const char *path, int size, int iters, const Stats &mpi_bar,
               const Stats &mpi_ar, const Stats &clio_bar,
-              const Stats &clio_ar) {
+              const Stats &clio_ar, const Stats &local_rtt,
+              const Stats &remote_rtt) {
   std::FILE *f = std::fopen(path, "w");
   if (f == nullptr) {
     std::fprintf(stderr, "warning: could not open CSV path %s\n", path);
@@ -213,7 +214,9 @@ void WriteCsv(const char *path, int size, int iters, const Stats &mpi_bar,
   } rows[] = {{"mpi_barrier", &mpi_bar},
               {"mpi_allreduce", &mpi_ar},
               {"clio_barrier", &clio_bar},
-              {"clio_allreduce", &clio_ar}};
+              {"clio_allreduce", &clio_ar},
+              {"clio_local_rtt", &local_rtt},
+              {"clio_remote_rtt", &remote_rtt}};
   for (const auto &r : rows) {
     std::fprintf(f, "%s,%d,%d,%.3f,%.3f,%.3f,%.3f\n", r.name, size, iters,
                  r.s->mean_us, r.s->p50_us, r.s->p99_us, r.s->max_us);
@@ -335,11 +338,45 @@ int main(int argc, char **argv) {
 
   Log(rank, "clio_allreduce done");
 
+  // ---- Baseline arms: what a plain task costs on the same path ----------
+  // The collective arms above are only interpretable against the cost of the
+  // task machinery they are built on. These two are NOT collectives -- they are
+  // ordinary Custom tasks with an empty body -- so they measure the floor:
+  //
+  //   clio_local_rtt   client -> its own daemon -> back (SHM, no network)
+  //   clio_remote_rtt  client -> own daemon -> a PEER daemon -> back (one
+  //                    network hop each way, the same hop a member takes to
+  //                    reach the leader)
+  //
+  // Whatever clio_barrier costs ABOVE clio_remote_rtt is what the collective
+  // machinery itself adds: parking in the BatchManager, waiting for the flusher
+  // to notice, running the aggregate, and the 1->N completion broadcast.
+  // Each rank targets its right-hand neighbour so every remote probe really
+  // crosses the network (targeting a fixed node would make one rank's "remote"
+  // probe local and skew the max-across-ranks number).
+  const clio::run::u32 peer = static_cast<clio::run::u32>((rank + 1) % size);
+
+  Stats clio_local_rtt = RunArm(warmup, iters, [&client](int) {
+    auto f = client.AsyncCustom(clio::run::PoolQuery::Local(), "", 0);
+    f.Wait();
+    return f->return_code_ == 0;
+  }, &failures);
+  Log(rank, "clio_local_rtt done");
+
+  Stats clio_remote_rtt = RunArm(warmup, iters, [&client, peer](int) {
+    auto f = client.AsyncCustom(clio::run::PoolQuery::Physical(peer), "", 0);
+    f.Wait();
+    return f->return_code_ == 0;
+  }, &failures);
+  Log(rank, "clio_remote_rtt done");
+
   // ---- Report --------------------------------------------------------------
   Stats r_mpi_barrier = ReduceMax(mpi_barrier);
   Stats r_mpi_allreduce = ReduceMax(mpi_allreduce);
   Stats r_clio_barrier = ReduceMax(clio_barrier);
   Stats r_clio_allreduce = ReduceMax(clio_allreduce);
+  Stats r_clio_local_rtt = ReduceMax(clio_local_rtt);
+  Stats r_clio_remote_rtt = ReduceMax(clio_remote_rtt);
 
   int total_failures = 0;
   MPI_Reduce(&failures, &total_failures, 1, MPI_INT, MPI_SUM, 0,
@@ -355,11 +392,27 @@ int main(int argc, char **argv) {
     PrintRow("mpi_allreduce", r_mpi_allreduce);
     PrintRow("clio_barrier", r_clio_barrier);
     PrintRow("clio_allreduce", r_clio_allreduce);
+    PrintRow("clio_local_rtt", r_clio_local_rtt);
+    PrintRow("clio_remote_rtt", r_clio_remote_rtt);
     std::printf("\n");
     PrintRatio("clio_barrier   / mpi_barrier  ", r_clio_barrier,
                r_mpi_barrier);
     PrintRatio("clio_allreduce / mpi_allreduce", r_clio_allreduce,
                r_mpi_allreduce);
+    std::printf("\n");
+    // The decomposition: how much of a collective is just "a task went to
+    // another node and came back", and how much is the collective itself.
+    std::printf("breakdown (mean us):\n");
+    std::printf("  plain local task round trip        %8.2f\n",
+                r_clio_local_rtt.mean_us);
+    std::printf("  plain remote task round trip       %8.2f  (+%.2f for the network hop)\n",
+                r_clio_remote_rtt.mean_us,
+                r_clio_remote_rtt.mean_us - r_clio_local_rtt.mean_us);
+    std::printf("  collective barrier                 %8.2f  (+%.2f for the collective machinery)\n",
+                r_clio_barrier.mean_us,
+                r_clio_barrier.mean_us - r_clio_remote_rtt.mean_us);
+    std::printf("  MPI barrier, for scale             %8.2f\n",
+                r_mpi_barrier.mean_us);
     std::printf("\n");
     if (total_mismatches > 0) {
       std::printf("FAIL: %d allreduce result mismatches -- the collective did "
@@ -375,7 +428,8 @@ int main(int argc, char **argv) {
     const char *csv = std::getenv("COLL_BENCH_CSV");
     if (csv != nullptr && *csv != '\0') {
       WriteCsv(csv, size, iters, r_mpi_barrier, r_mpi_allreduce,
-               r_clio_barrier, r_clio_allreduce);
+               r_clio_barrier, r_clio_allreduce, r_clio_local_rtt,
+               r_clio_remote_rtt);
     }
     std::fflush(stdout);
   }

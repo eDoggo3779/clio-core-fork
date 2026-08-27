@@ -83,9 +83,17 @@ wait_and_report() {
     local rc
     rc=$(docker wait cb-node1 2>/dev/null || echo 1)
 
-    # Pull the CSV out of the container before it is torn down.
+    # Pull artifacts out of the containers before they are torn down. The
+    # daemon logs carry the [COLLPROF]/[NETQPROF] stage timings, which are the
+    # only way to attribute a slow collective to a stage -- and they are gone
+    # the moment `docker compose down` runs.
     docker cp cb-node1:/tmp/coll_bench_results.csv "${SCRIPT_DIR}/results.csv" \
         >/dev/null 2>&1 || true
+    mkdir -p "${SCRIPT_DIR}/logs"
+    for n in $(seq 1 "${NUM_NODES}"); do
+        docker cp "cb-node${n}:/tmp/clio_daemon.log" \
+            "${SCRIPT_DIR}/logs/daemon-node${n}.log" >/dev/null 2>&1 || true
+    done
 
     say "=== Node 1 (launcher) log ==="
     docker logs cb-node1 2>&1 | tail -80
@@ -100,6 +108,15 @@ wait_and_report() {
     if [ -f "${SCRIPT_DIR}/results.csv" ]; then
         say "=== results.csv ==="
         cat "${SCRIPT_DIR}/results.csv"
+    fi
+    if grep -qha "COLLPROF\|NETQPROF" "${SCRIPT_DIR}"/logs/*.log 2>/dev/null; then
+        say "=== stage profiles (last sample per node) ==="
+        for n in $(seq 1 "${NUM_NODES}"); do
+            local f="${SCRIPT_DIR}/logs/daemon-node${n}.log"
+            [ -f "$f" ] || continue
+            grep -ha "COLLPROF" "$f" | tail -1 | sed "s/^/node${n} /"
+            grep -ha "NETQPROF" "$f" | tail -6 | sed "s/^/node${n} /"
+        done
     fi
 
     if [ "$rc" = "0" ]; then

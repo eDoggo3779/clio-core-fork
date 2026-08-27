@@ -35,6 +35,14 @@ x-node-env: &node-env
   LD_LIBRARY_PATH: /workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
   OMPI_ALLOW_RUN_AS_ROOT: "1"
   OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+  # Set to 1 to make each daemon emit [COLLPROF] collective stage timings.
+  CLIO_COLL_PROF: "${CLIO_COLL_PROF:-}"
+  # Set to 1 for [NETQPROF] net-queue enqueue->pop wait timings.
+  CLIO_NET_QPROF: "${CLIO_NET_QPROF:-}"
+  # Set to 1 for [NETTRACE] serialize/transmit timings.
+  CLIO_NET_TRACE: "${CLIO_NET_TRACE:-}"
+  # Set to 1 for [WORKERRATE] worker-loop iteration cost.
+  CLIO_WORKER_RATE: "${CLIO_WORKER_RATE:-}"
 
 services:
   # Node 1 — mpirun launcher; hosts rank 0
