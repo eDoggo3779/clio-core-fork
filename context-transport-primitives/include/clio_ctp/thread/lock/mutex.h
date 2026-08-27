@@ -40,9 +40,41 @@
 #if !CTP_IS_DEVICE_PASS
 #include <chrono>
 #include <thread>
+#if defined(_MSC_VER)
+// Umbrella intrinsics header: _mm_pause on x64/x86, __yield on ARM64. The
+// ARM64 one is NOT in <immintrin.h>, and windows-11-arm is in the CI matrix.
+#include <intrin.h>
+#endif
 #endif
 
 namespace ctp {
+
+/** CPU spin hint: relax the pipeline for a few tens of nanoseconds WITHOUT
+ *  entering the kernel.
+ *
+ *  Deliberately not CTP_THREAD_MODEL->Yield(). That is only a pause under the
+ *  Pthread model on x86/arm; under StdThread -- the default on Windows, which
+ *  has no pthreads -- it is std::this_thread::yield(), i.e. a SwitchToThread
+ *  SYSCALL of roughly 0.5-1us. Backoff pays rung 1 on every iteration of the
+ *  ticket wait loop, so routing it through the thread model made the Windows
+ *  spin ~30-50x more expensive than the same rung on Linux and turned
+ *  ctp_priv_umap_ll's ~100k lock acquisitions into 143M spin iterations. */
+CTP_INLINE_CROSS_FUN void CpuRelax() {
+#if !CTP_IS_DEVICE_PASS
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+  _mm_pause();
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+  __yield();
+#elif defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+  __asm__ __volatile__("yield" ::: "memory");
+#else
+  // No pause hint on this ISA; a bare compiler barrier keeps the loop honest.
+  __asm__ __volatile__("" ::: "memory");
+#endif
+#endif
+}
 
 struct Mutex {
   ipc::atomic<ctp::min_u64> lock_;
@@ -68,6 +100,7 @@ struct Mutex {
   void Lock(u32 owner) {
     min_u64 tkt = lock_.fetch_add(1);
     u32 spin_count = 0;
+    BackoffState st;
     do {
       // Use load_device() for cross-SM L2 visibility on GPU.
       // Unlock() advances head_ via fetch_add (L2 atomic), but
@@ -91,7 +124,7 @@ struct Mutex {
       // chain reaches a non-const static which DPC++ rejects in kernels,
       // and there's no host scheduler to yield to anyway.
 #if !CTP_IS_DEVICE_PASS
-      Backoff(++spin_count, tkt - cur);
+      Backoff(++spin_count, tkt - cur, st);
 #endif
     } while (true);
   }
@@ -122,65 +155,83 @@ struct Mutex {
    */
   /** PAUSE spins before escalating to a descheduling yield. */
   static constexpr u32 kSpinRung = 64;
-  /** sched_yield()s before escalating to a timed park. */
-  static constexpr u32 kYieldRung = 1024;
+  /** How long a waiter yield-spins before it is treated as genuinely stuck
+   *  and parks.
+   *
+   *  A DURATION, not an iteration count, because the same count means wildly
+   *  different amounts of waiting per platform: sched_yield() under contention
+   *  on Linux costs ~1us, while SwitchToThread() on Windows returns in ~100ns
+   *  when no other thread is ready. The previous fixed 1024 iterations
+   *  therefore spanned ~1ms on Linux but only ~100us on Windows -- short
+   *  enough that routine contention reached rung 3, and once one waiter in a
+   *  FIFO ticket queue parks, every waiter behind it waits at least a park and
+   *  parks too. That cascade is what pushed ctp_priv_umap_ll from 31s to a
+   *  hang on windows-2025: ~1M parks in a run that needs a few thousand. */
+  static constexpr min_u64 kYieldWindowUs = 2000;
+  /** Yields between clock samples in rung 2. Must be a power of two. */
+  static constexpr u32 kClockEvery = 64;
   /** Upper bound on the rung-3 park, in microseconds. */
   static constexpr min_u64 kParkUs = 100;
 
-  CTP_INLINE_CROSS_FUN
-  void Backoff(u32 spin_count, min_u64 ahead) {
+  /** Per-wait escalation state. Stack-local to Lock(), never shared, so it
+   *  costs nothing in the uncontended case and needs no thread-local. */
+  struct BackoffState {
 #if !CTP_IS_DEVICE_PASS
-    // Rung 1 -- cheap PAUSE / std::yield / ULT yield.
-    CTP_THREAD_MODEL->Yield();
+    bool yielding = false;
+    std::chrono::steady_clock::time_point yield_start{};
+#endif
+  };
+
+  CTP_INLINE_CROSS_FUN
+  void Backoff(u32 spin_count, min_u64 ahead, BackoffState &st) {
+#if !CTP_IS_DEVICE_PASS
+    // Rungs 2 and 3 are for OS-thread models only. Under a user-level-thread
+    // model (Argobots) the model's own Yield() is ABT_thread_yield, which
+    // deschedules the ULT and lets the holder run; sleeping the execution
+    // stream there would block sibling ULTs, possibly the holder itself.
+    const ThreadType ty = CTP_THREAD_MODEL->GetType();
+    const bool os_thread =
+        ty == ThreadType::kPthread || ty == ThreadType::kStdThread;
+    // Rung 1 -- cheap CPU pause. An OS-thread model must NOT go through
+    // CTP_THREAD_MODEL->Yield() here: under StdThread that is a SwitchToThread
+    // syscall (see CpuRelax). A ULT model must, or the holder -- a sibling ULT
+    // on this execution stream -- never gets scheduled at all.
+    if (os_thread) {
+      CpuRelax();
+    } else {
+      CTP_THREAD_MODEL->Yield();
+    }
     if (spin_count < kSpinRung) {
       return;
     }
-    // Rungs 2 and 3 are for OS-thread models only. Under a user-level-thread
-    // model (Argobots) rung 1 is already ABT_thread_yield, which deschedules
-    // the ULT and lets the holder run; sleeping the execution stream there
-    // would block sibling ULTs, possibly the holder itself.
-    ThreadType ty = CTP_THREAD_MODEL->GetType();
-    if (ty != ThreadType::kPthread && ty != ThreadType::kStdThread) {
+    if (!os_thread) {
       return;
     }
-    // Rung 2 -- deschedule WITHOUT arming a timer, but ONLY under the Pthread
-    // model. There, on x86/arm, CTP_THREAD_MODEL->Yield() is a bare PAUSE that
-    // does not deschedule (see pthread.h), so rung 1 went straight to a timed
-    // sleep and this rung is the missing step: std::this_thread::yield() is
-    // sched_yield() on POSIX and hands the core to a runnable holder for free.
+    // Rung 2 -- deschedule WITHOUT arming a timer. Rung 1 is a bare CPU pause
+    // under both OS-thread models, so this is the first step that actually
+    // hands the core to a runnable holder: std::this_thread::yield() is
+    // sched_yield() on POSIX and SwitchToThread() on Windows. One syscall per
+    // iteration is affordable here, where a wait has already proven itself
+    // long; it was not at rung 1 -- see CpuRelax.
     //
-    // StdThread must NOT take this rung. Its Yield() already IS
-    // std::this_thread::yield(), so rung 2 would repeat the identical call
-    // kYieldRung more times -- pure overhead, and on Windows (where no
-    // pthreads means StdThread is the default model and the call is a
-    // SwitchToThread syscall) it raises the pre-park cost from 64 to 1088
-    // syscalls per wait. That regressed ctp_priv_umap_ll on windows-2025 from
-    // 30.4s to over its 120s timeout, while Linux moved 4%, because Linux uses
-    // the Pthread model where rung 1 costs ~20ns.
-    //
-    // Same reasoning applies to a Pthread build on an architecture whose
-    // Yield() falls back to sched_yield() (neither x86 nor arm); there rung 2
-    // is redundant rather than harmful.
-    if (ty == ThreadType::kPthread) {
-      if (spin_count < kSpinRung + kYieldRung) {
-        std::this_thread::yield();
-        return;
-      }
-    } else if (spin_count < kSpinRung + kYieldRung) {
-      // StdThread: rung 1 already yielded, so just keep doing that rather than
-      // parking after only kSpinRung iterations.
-      //
-      // This matters most on Windows, which has no pthreads (so StdThread is
-      // the default model) and whose default timer resolution is ~15.6ms: a
-      // sub-millisecond sleep_for() parks for ~15ms, roughly 150x what is
-      // asked. The RwLock that now sits on this mutex is taken on every
-      // unordered_map_ll operation, and at ~15ms per park that test crawls --
-      // ctp_priv_umap_ll timed out at 120s on windows-2025, stalling in a
-      // different concurrent case on each retry (progressing, just far too
-      // slow). The lock it replaced never parked at all on Windows; it
-      // yield-spun. Extending the yield phase from kSpinRung to
-      // kSpinRung + kYieldRung cuts park frequency ~17x while keeping the
-      // rung-3 backstop for a holder that really is gone.
+    if (!st.yielding) {
+      st.yielding = true;
+      st.yield_start = std::chrono::steady_clock::now();
+      std::this_thread::yield();
+      return;
+    }
+    // Sample the clock every kClockEvery yields rather than every one. At the
+    // ~100ns-1us cost of a yield that bounds the sampling error to a few tens
+    // of microseconds against a millisecond-scale window, and keeps
+    // steady_clock::now() off all but 1/kClockEvery of the wait iterations.
+    if ((spin_count & (kClockEvery - 1)) != 0) {
+      std::this_thread::yield();
+      return;
+    }
+    if (std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - st.yield_start)
+            .count() < static_cast<long long>(kYieldWindowUs)) {
+      std::this_thread::yield();
       return;
     }
     // Rung 3 -- genuinely stuck (holder descheduled and not coming back
@@ -198,21 +249,21 @@ struct Mutex {
     // but collapses above it -- 420 ops vs 97k at 16 threads -- and destroys
     // fairness (up to 152x spread), which is the issue #483 livelock this
     // escalation exists to prevent.
-    // Park scaled by queue position, as before. Keeping the original duration
-    // matters for StdThread: it never takes rung 2, so this rung is reached
-    // immediately and its length dominates handoff latency. A flat 100us here
-    // measured ~7x slower than min(ahead, 100)us under StdThread at 8 threads.
-    // Under Pthread the value is close to irrelevant because rung 2 absorbs
-    // the wait -- which is why the sub-slack rounding that motivated this work
-    // is no longer on the critical path there.
+    // Park scaled by queue position, as before. Routed through the thread
+    // model rather than std::this_thread::sleep_for: on Windows the latter
+    // rounds any sub-millisecond request up to the ~15.6ms timer tick, so a
+    // "100us" park actually idled the whole FIFO queue for ~15ms.
+    // SleepForUs uses a high-resolution waitable timer there (system_info.cc)
+    // and nanosleep/usleep on POSIX, where behaviour is unchanged.
     min_u64 us = ahead < kParkUs ? ahead : kParkUs;
     if (us == 0) {
       us = 1;
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(us));
+    CTP_THREAD_MODEL->SleepForUs(static_cast<size_t>(us));
 #else
     (void)spin_count;
     (void)ahead;
+    (void)st;
 #endif
   }
 
