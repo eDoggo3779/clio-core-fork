@@ -40,6 +40,66 @@ non-zero. Without that check the benchmark could happily time a collective that
 had silently stopped being collective (which is exactly what it caught — see
 below).
 
+## Are the barriers actually barriers?
+
+Yes — verified, not assumed. This matters because a return code cannot tell you:
+a "barrier" that completed every request independently would hand `rc=0` to
+everyone and look perfectly healthy. That is not hypothetical here — it is
+exactly the failure the cross-node path already had (see below). And unlike the
+allreduce, `BarrierTask` has no payload, so there is no result to check.
+
+So the run forces the question before it times anything. Arrivals are staggered
+by `COLL_BENCH_STAGGER_MS`, rotating which rank arrives last each round, and
+every rank's exit is compared against the **latest entry across all ranks** on a
+clock the ranks share (all containers are on one host and Docker does not
+virtualize `CLOCK_MONOTONIC`; the check measures the actual clock spread first
+and declares itself inconclusive if the clocks disagree by more than 5 ms).
+
+12 rounds, 50 ms stagger, measured rank clock spread 22.7 µs:
+
+| check                      | verdict | earliest exit vs. last arrival |
+|----------------------------|---------|-------------------------------:|
+| `MPI_Barrier` (control)    | HELD    | +48.8 µs |
+| clio barrier               | HELD    | +121.3 µs |
+| clio allreduce             | HELD    | +168.9 µs |
+| plain local task (neg ctrl)| BROKEN  | −150 050.6 µs |
+
+No participant ever returned before the last one arrived. The margins are also
+the right size: clio exits ~120-170 µs after the last arrival because that is
+roughly what it costs to propagate the release, against MPI's ~49 µs.
+
+The last row is the point. A plain local task is definitively not a barrier, and
+the check catches it by −150 ms — exactly `(ranks-1) × stagger`, with 36
+violations = 12 rounds × 3 ranks. Without that negative control, "0 violations"
+would only prove the check was inert, so the run **fails** if the negative
+control ever comes back clean.
+
+The allreduce is held to the same standard *and* verifies its arithmetic: each
+rank's contribution encodes the iteration and its rank, so the expected total
+cannot be matched by a batch that mixed iterations, dropped a member, or
+double-counted one.
+
+### One real caveat: the release counts arrivals, not participants
+
+`BatchManager::FlushDue` releases on
+
+```cpp
+ready = (num_containers > 0) && (it->second.members.size() >= num_containers);
+```
+
+and `BatchManager::Add` appends every arrival unconditionally. Nothing checks
+that the N tasks came from N *distinct* containers. So the guarantee actually
+implemented is "wait for N arrivals sharing this (pool, method, hash, key)",
+which coincides with a barrier only while each participant keeps at most one
+request outstanding on a given key.
+
+Every caller today satisfies that — a participant waits for its own completion
+before issuing the next — which is why the checks above pass. But a caller that
+issued two barriers concurrently on one key would let the group reach N while a
+peer had not arrived, and the barrier would release early. That is a latent
+sharp edge, not a bug being hit; fixing it means keying membership on the
+contributing container rather than counting.
+
 ## Results
 
 4 nodes, 1 rank each, Docker bridge network on one host, 1000 iterations after

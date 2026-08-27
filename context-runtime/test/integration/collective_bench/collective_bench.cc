@@ -172,6 +172,102 @@ std::uint64_t Contribution(int iter, int rank) {
          static_cast<std::uint64_t>(rank + 1);
 }
 
+
+/**
+ * Absolute steady-clock nanoseconds. Every rank runs in a container on the SAME
+ * host, and Docker does not virtualize CLOCK_MONOTONIC (no time namespace), so
+ * these values are directly comparable across ranks. VerifyBarrier does not
+ * assume that -- it measures the actual spread first and refuses to judge if
+ * the clocks turn out not to be comparable.
+ */
+std::int64_t NowNsAbs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             Clock::now().time_since_epoch())
+      .count();
+}
+
+/** Result of a barrier semantics check. */
+struct BarrierCheck {
+  bool conclusive = false;
+  std::int64_t clock_spread_ns = 0;  /**< disagreement between rank clocks */
+  double worst_margin_us = 0.0;      /**< min over ranks of (exit - last_enter) */
+  int violations = 0;                /**< rounds where someone left too early */
+};
+
+/**
+ * Does `op` actually behave as a barrier?
+ *
+ * The defining property is: NO participant may return before the LAST
+ * participant has arrived. Return codes cannot show this -- a "barrier" that
+ * simply completed each request independently would return 0 to everyone and
+ * look perfectly healthy, which is precisely the failure this benchmark has
+ * already seen once on the cross-node path.
+ *
+ * So force the question. Stagger the arrivals by `stagger_ms` (rotating which
+ * rank is last each round, so no single rank's behaviour carries the result),
+ * timestamp entry and exit on a clock all ranks share, and check every rank's
+ * exit against the LATEST entry across ranks. A real barrier gives every rank a
+ * non-negative margin; a fake one lets the early ranks out ~stagger_ms before
+ * the last one even arrives, which is enormous next to the ~0.3ms the
+ * collective itself takes and cannot be mistaken for noise.
+ *
+ * The same check is run against MPI_Barrier as a control: if the methodology
+ * were broken it would fail there too.
+ */
+template <typename Op>
+BarrierCheck VerifyBarrier(int rank, int size, int rounds, int stagger_ms,
+                           Op &&op) {
+  BarrierCheck res;
+
+  // Are the ranks' clocks comparable at all? Line them up with an MPI barrier
+  // and see how far apart their readings are. Anything under a millisecond is
+  // far below the stagger and cannot manufacture or hide a violation.
+  MPI_Barrier(MPI_COMM_WORLD);
+  std::int64_t t_now = NowNsAbs();
+  std::vector<std::int64_t> now_all(static_cast<size_t>(size), 0);
+  MPI_Allgather(&t_now, 1, MPI_LONG_LONG, now_all.data(), 1, MPI_LONG_LONG,
+                MPI_COMM_WORLD);
+  res.clock_spread_ns = *std::max_element(now_all.begin(), now_all.end()) -
+                        *std::min_element(now_all.begin(), now_all.end());
+  if (res.clock_spread_ns > 5000000) {  // 5ms: clocks are not a shared timebase
+    return res;
+  }
+  res.conclusive = true;
+  res.worst_margin_us = 1e30;
+
+  std::vector<std::int64_t> enters(static_cast<size_t>(size), 0);
+  std::vector<std::int64_t> exits(static_cast<size_t>(size), 0);
+  for (int round = 0; round < rounds; ++round) {
+    // Rotate the arrival order so every rank takes a turn being last.
+    const int slot = (rank + round) % size;
+    std::this_thread::sleep_for(std::chrono::milliseconds(slot * stagger_ms));
+
+    std::int64_t t_enter = NowNsAbs();
+    op();
+    std::int64_t t_exit = NowNsAbs();
+
+    MPI_Allgather(&t_enter, 1, MPI_LONG_LONG, enters.data(), 1, MPI_LONG_LONG,
+                  MPI_COMM_WORLD);
+    MPI_Allgather(&t_exit, 1, MPI_LONG_LONG, exits.data(), 1, MPI_LONG_LONG,
+                  MPI_COMM_WORLD);
+
+    const std::int64_t last_enter =
+        *std::max_element(enters.begin(), enters.end());
+    for (int r = 0; r < size; ++r) {
+      const double margin_us =
+          static_cast<double>(exits[static_cast<size_t>(r)] - last_enter) /
+          1000.0;
+      if (margin_us < res.worst_margin_us) res.worst_margin_us = margin_us;
+      // Charge a violation only beyond the measured clock disagreement, so
+      // clock noise can never be reported as a broken barrier.
+      if (margin_us < -static_cast<double>(res.clock_spread_ns) / 1000.0) {
+        ++res.violations;
+      }
+    }
+  }
+  return res;
+}
+
 void PrintHeader(int size, int iters, int warmup) {
   std::printf("\n");
   std::printf("=== Collective latency: Clio PoolQuery::AllToOne vs MPI ===\n");
@@ -300,7 +396,89 @@ int main(int argc, char **argv) {
   MPI_Barrier(MPI_COMM_WORLD);
 
   clio::run::MOD_NAME::Client client(pool_id);
-  Log(rank, "pool ready; starting clio_barrier arm");
+  Log(rank, "pool ready");
+
+  // ---- Do the collectives actually synchronize? -------------------------
+  // Run BEFORE the timed arms: timing a collective that is not collective is
+  // meaningless, and the return code alone cannot tell the difference.
+  const int verify_rounds = EnvInt("COLL_BENCH_VERIFY_ROUNDS", 4);
+  const int stagger_ms = EnvInt("COLL_BENCH_STAGGER_MS", 20);
+  int barrier_violations = 0;
+  if (verify_rounds > 0) {
+    // MPI_Barrier first: a known-good barrier, so a failure here would mean the
+    // CHECK is wrong rather than the collective.
+    BarrierCheck mpi_chk = VerifyBarrier(rank, size, verify_rounds, stagger_ms,
+                                         []() { MPI_Barrier(MPI_COMM_WORLD); });
+    BarrierCheck clio_chk = VerifyBarrier(
+        rank, size, verify_rounds, stagger_ms, [&client]() {
+          auto q =
+              clio::run::PoolQuery::AllToOne(kContainerHash, kBarrierBatchKey);
+          auto f = client.AsyncBarrier(q);
+          f.Wait();
+        });
+    // The allreduce is held to the same standard: it must synchronize, not just
+    // return the right sum.
+    BarrierCheck ar_chk = VerifyBarrier(
+        rank, size, verify_rounds, stagger_ms, [&client]() {
+          auto q = clio::run::PoolQuery::AllToOne(kContainerHash,
+                                                  kAllReduceBatchKey);
+          auto f = client.AsyncAllReduce(q, 1);
+          f.Wait();
+        });
+
+    // Negative control: a plain LOCAL task is definitively not a barrier. If the
+    // check above cannot catch this, then "0 violations" only means the check
+    // is inert. This one is EXPECTED to be reported BROKEN and is deliberately
+    // excluded from the exit code.
+    BarrierCheck none_chk = VerifyBarrier(
+        rank, size, verify_rounds, stagger_ms, [&client]() {
+          auto f = client.AsyncCustom(clio::run::PoolQuery::Local(), "", 0);
+          f.Wait();
+        });
+
+    if (rank == 0) {
+      std::printf("\n=== Barrier semantics (staggered arrivals, %d rounds, "
+                  "%dms stagger) ===\n",
+                  verify_rounds, stagger_ms);
+      std::printf("rank clock spread: %.1f us (must be small for the check to "
+                  "mean anything)\n",
+                  static_cast<double>(mpi_chk.clock_spread_ns) / 1000.0);
+      const struct {
+        const char *name;
+        const BarrierCheck *c;
+      } checks[] = {{"MPI_Barrier (control)", &mpi_chk},
+                    {"clio barrier", &clio_chk},
+                    {"clio allreduce", &ar_chk},
+                    {"local task (neg ctrl)", &none_chk}};
+      for (const auto &c : checks) {
+        if (!c.c->conclusive) {
+          std::printf("  %-22s INCONCLUSIVE (rank clocks not comparable)\n",
+                      c.name);
+          continue;
+        }
+        std::printf("  %-22s %s  earliest exit was %+.1f us after the last "
+                    "arrival (%d violations)\n",
+                    c.name, c.c->violations == 0 ? "HELD  " : "BROKEN",
+                    c.c->worst_margin_us, c.c->violations);
+      }
+      if (none_chk.conclusive && none_chk.violations == 0) {
+        std::printf("  WARNING: the negative control did not register as "
+                    "broken -- the check is not discriminating and the HELD "
+                    "verdicts above mean nothing\n");
+      }
+      std::printf("\n");
+      std::fflush(stdout);
+    }
+    barrier_violations =
+        clio_chk.violations + ar_chk.violations + mpi_chk.violations;
+    // A negative control that comes back clean means the detector is inert, so
+    // the HELD verdicts prove nothing -- fail rather than report a false pass.
+    if (none_chk.conclusive && none_chk.violations == 0) {
+      ++barrier_violations;
+    }
+  }
+
+  Log(rank, "barrier verification done; starting clio_barrier arm");
 
   // ---- Clio arms -----------------------------------------------------------
   // Every participant uses the same (container_hash, batch_key), which is what
@@ -384,6 +562,9 @@ int main(int argc, char **argv) {
   int total_mismatches = 0;
   MPI_Reduce(&mismatches, &total_mismatches, 1, MPI_INT, MPI_SUM, 0,
              MPI_COMM_WORLD);
+  int total_barrier_violations = 0;
+  MPI_Reduce(&barrier_violations, &total_barrier_violations, 1, MPI_INT,
+             MPI_SUM, 0, MPI_COMM_WORLD);
 
   int exit_code = 0;
   if (rank == 0) {
@@ -414,7 +595,13 @@ int main(int argc, char **argv) {
     std::printf("  MPI barrier, for scale             %8.2f\n",
                 r_mpi_barrier.mean_us);
     std::printf("\n");
-    if (total_mismatches > 0) {
+    if (total_barrier_violations > 0) {
+      std::printf("FAIL: %d barrier violations -- a participant returned before "
+                  "the last one arrived, so this is not a barrier and its "
+                  "timings describe nothing\n",
+                  total_barrier_violations);
+      exit_code = 6;
+    } else if (total_mismatches > 0) {
       std::printf("FAIL: %d allreduce result mismatches -- the collective did "
                   "not combine correctly, so its timings are not meaningful\n",
                   total_mismatches);

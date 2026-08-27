@@ -69,6 +69,8 @@ services:
       NUM_NODES: "${NUM_NODES:-4}"
       COLL_BENCH_ITERS: "${COLL_BENCH_ITERS:-1000}"
       COLL_BENCH_WARMUP: "${COLL_BENCH_WARMUP:-100}"
+      COLL_BENCH_VERIFY_ROUNDS: "${COLL_BENCH_VERIFY_ROUNDS:-4}"
+      COLL_BENCH_STAGGER_MS: "${COLL_BENCH_STAGGER_MS:-20}"
     entrypoint:
       - /bin/bash
       - /workspace/context-runtime/test/integration/collective_bench/node1_entrypoint.sh

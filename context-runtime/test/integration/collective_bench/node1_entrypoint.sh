@@ -13,6 +13,10 @@ SSH_SHARE="${CB_DIR}/.mpi_ssh"
 export CLIO_SERVER_CONF="${CB_DIR}/clio_conf.yaml"
 export COLL_BENCH_ITERS="${COLL_BENCH_ITERS:-1000}"
 export COLL_BENCH_WARMUP="${COLL_BENCH_WARMUP:-100}"
+# Barrier-semantics check: rounds of staggered arrivals run before the timed
+# arms. Set ROUNDS=0 to skip it.
+export COLL_BENCH_VERIFY_ROUNDS="${COLL_BENCH_VERIFY_ROUNDS:-4}"
+export COLL_BENCH_STAGGER_MS="${COLL_BENCH_STAGGER_MS:-20}"
 # Write the CSV inside the container (/tmp), not into the mounted workspace:
 # the mount is owned by the host user and the container user may not be able
 # to create files there. run_tests.sh docker-cp's it out afterwards.
@@ -65,6 +69,7 @@ MPIRUN_ARGS=(
     -np "${NUM_NODES}" --hostfile "${CB_DIR}/mpi_hostfile"
     -x LD_LIBRARY_PATH -x PATH -x CLIO_SERVER_CONF
     -x COLL_BENCH_ITERS -x COLL_BENCH_WARMUP -x COLL_BENCH_CSV
+    -x COLL_BENCH_VERIFY_ROUNDS -x COLL_BENCH_STAGGER_MS
     -x OMPI_ALLOW_RUN_AS_ROOT -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
 )
 

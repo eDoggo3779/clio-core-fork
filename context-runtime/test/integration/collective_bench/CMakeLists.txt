@@ -42,6 +42,9 @@ set_tests_properties(cr_collective_bench_docker PROPERTIES
     TIMEOUT 900  # 15 minutes: cluster bring-up plus four timed arms
     # Keep the ctest run short; the harness default is larger for a real
     # measurement run (see run_tests.sh / README.md).
+    # The default 4 verification rounds run too, so this entry gates barrier
+    # SEMANTICS (nobody exits before the last arrival, checked against a
+    # negative control) and not just latency.
     ENVIRONMENT "NUM_NODES=4;COLL_BENCH_ITERS=200;COLL_BENCH_WARMUP=20"
 )
 
