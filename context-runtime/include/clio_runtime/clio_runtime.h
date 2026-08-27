@@ -80,10 +80,24 @@ enum class RuntimeMode {
  * @return true if initialization successful, false otherwise
  *
  * Environment variable:
- *   CLIO_WITH_RUNTIME=1 - Start runtime regardless of mode
+ *   CLIO_WITH_RUNTIME=1 - Make sure a runtime is available (see below)
  *   CLIO_WITH_RUNTIME=0 - Don't start runtime (client only)
  *   (CLIO_WITH_RUNTIME is honored as a legacy alias via env::GetCompat.)
  *   If not set, uses default_with_runtime parameter
+ *
+ * In kClient mode, "with runtime" means ATTACH-OR-START (issue #1015): the
+ * configured port is probed first, and
+ *   - a live clio runtime already there  -> this process attaches to it as a
+ *     plain client and returns success (it does NOT become a second runtime),
+ *   - nothing there                      -> the runtime comes up in-process,
+ *   - the port held by some other program -> initialization FAILS, because a
+ *     foreign listener is not a runtime this process can talk to.
+ * The probe runs under a node-wide, port-scoped start lock, so N processes
+ * launched at once (e.g. mpirun -np 4) elect exactly one runtime host between
+ * them. See clio_runtime/runtime_probe.h.
+ *
+ * kServer/kRuntime mode is unchanged: `clio_run runtime start` is an explicit
+ * "be the runtime" and still fails when one is already running.
  */
 bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
                   bool is_restart);

@@ -92,6 +92,13 @@ set(RUNTIME_CLEANUP_TEST_SOURCES
   test_runtime_cleanup.cc
 )
 
+# Runtime attach-or-start probe test executable (issue #1015; pure host: no
+# server, no IPC, no GPU)
+set(RUNTIME_PROBE_TEST_TARGET clio_run_runtime_probe_tests)
+set(RUNTIME_PROBE_TEST_SOURCES
+  test_runtime_probe.cc
+)
+
 # IPC Errors test executable
 set(IPC_ERRORS_TEST_TARGET clio_run_ipc_errors_tests)
 set(IPC_ERRORS_TEST_SOURCES
@@ -713,6 +720,32 @@ set_target_properties(${BDEV_ALLOC_POLICY_TEST_TARGET} PROPERTIES
 )
 
 
+# Runtime attach-or-start probe tests (issue #1015).
+# Drives runtime_probe.h directly (port bind test + start lock), so it needs no
+# runtime server and no GPU.
+add_executable(${RUNTIME_PROBE_TEST_TARGET} ${RUNTIME_PROBE_TEST_SOURCES})
+
+target_include_directories(${RUNTIME_PROBE_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+)
+
+target_link_libraries(${RUNTIME_PROBE_TEST_TARGET}
+  clio_run_cxx                # Main CLIO Runtime library
+  ctp::cxx                    # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}   # Threading support
+)
+
+set_target_properties(${RUNTIME_PROBE_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${RUNTIME_PROBE_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+
 # GPU runtime tests removed — kernels now submit tasks to the CPU
 # runtime via gpu2cpu_queue (see test/unit/gpu/test_sycl_*.cc).
 if(FALSE)
@@ -1181,6 +1214,17 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_runtime_cleanup_tests PROPERTIES
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 120
+  )
+
+  # Runtime attach-or-start probe tests (no server, no GPU — issue #1015)
+  add_test(
+    NAME cr_runtime_probe_tests
+    COMMAND ${RUNTIME_PROBE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_runtime_probe_tests PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
   )
 

@@ -67,6 +67,7 @@
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/pool_manager.h"
 #include "clio_runtime/runtime_pid_record.h"
+#include "clio_runtime/runtime_probe.h"
 #include "clio_runtime/scheduler/scheduler_factory.h"
 #include "clio_runtime/task_archives.h"
 
@@ -3071,6 +3072,14 @@ size_t IpcManager::ClearUserIpcs() {
 
   for (const auto &name : ctp::SystemInfo::ListDirectory(memfd_dir)) {
     std::string full_path = memfd_dir + "/" + name;
+
+    // Never reap a start lock (issue #1015). We are running INSIDE the locked
+    // region — unlinking the lock would let the next starter create a fresh
+    // inode and flock that instead, which excludes nobody, and two runtimes
+    // would come up on the same port after all.
+    if (name.rfind(kRuntimeStartLockPrefix, 0) == 0) {
+      continue;
+    }
 
     // The per-user memfd dir is shared by every runtime on this node (the
     // fallback topology runs several). Only reap leftovers from DEAD processes
