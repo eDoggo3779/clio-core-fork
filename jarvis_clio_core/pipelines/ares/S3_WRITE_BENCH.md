@@ -399,21 +399,40 @@ bandwidth is a quarter the object rate.
    **More than `num_blobs` does not necessarily mean the allocator
    fragmented.** Check `put_count` first: if `put_count == objects_written ==
    num_blobs` and only `objects_measured` is high, the allocator was fine and
-   the listing picked up **stale objects from an earlier row**. All 36 rows of
-   the 2026-08-26 sweep share one key prefix (`clio-s3-write-bench/bdev`), and
-   the 4 MiB rows all report `objects_measured: 448` against `num_blobs: 256`.
-   The excess is exactly 192 objects / 201326592 bytes = 192 × 1 MiB — orphaned
-   blocks from the 1 MiB rows that teardown's `FreeBlocks` never deleted. It is
-   constant across all eighteen 4 MiB rows, so it is a one-time orphaning, not
-   a leak that grows.
+   the listing picked up **stale objects from an earlier row**. That is what
+   the 2026-08-26 sweep hit: all 36 rows share one key prefix
+   (`clio-s3-write-bench/bdev`), and every 4 MiB row reported
+   `objects_measured: 448` against `num_blobs: 256`. The excess was exactly 192
+   objects / 201326592 bytes = 192 × 1 MiB — orphaned blocks from the 1 MiB
+   rows that teardown's `FreeBlocks` never deleted, constant across all
+   eighteen 4 MiB rows rather than accumulating.
 
-   This contaminates nothing but the two `*_measured` columns: every throughput
-   figure is computed from `logical_bytes` and `wall_time_us`, which the
-   benchmark owns. But it does blunt the guard, because a row that wrote
-   nothing would still list its predecessors' objects. Confirm with
+   It contaminated nothing but the two `*_measured` columns — every throughput
+   figure comes from `logical_bytes` and `wall_time_us`, which the benchmark
+   owns — but it blunted this guard from an equality into a lower bound,
+   because a row that wrote nothing would still have listed its predecessors'
+   objects.
+
+   **Fixed by `purge_prefix` (default on):** the package empties the bdev
+   prefix at the start of every row, so the count is exact again. Only that
+   prefix is in range — zarr's store sits one level up and rawput's keys in a
+   sibling — and an empty prefix is refused outright rather than widening to
+   the whole bucket.
+
+   Two consequences worth knowing:
+
+   * **`objects_purged` is a new per-row column.** Nonzero means the *previous*
+     row leaked that many objects. It is there because the purge fixes the
+     measurement, **not the leak**: something in the bdev teardown path is
+     still failing to issue a `DeleteObject` per block, and this column is what
+     keeps that visible instead of papering over it. A sweep where
+     `objects_purged` is 0 everywhere but the first row means the leak is gone.
+   * **If the purge fails, it says so and the row still runs.** The log line
+     names it, and `objects_measured` reverts to a lower bound for that row —
+     compare it against `put_count` rather than `num_blobs`.
+
+   To check the prefix by hand (Ares has no AWS CLI):
    `python3 scripts/s3_cli.py ls "$S3_BENCH_BUCKET" --prefix clio-s3-write-bench/bdev`
-   (Ares has no AWS CLI) and fix by giving each row its own key prefix, or by
-   purging the prefix in the package's pre-run rather than only in `post_cmds`.
 5. **`rawput` is the fastest row *at K ≥ 8*, compared on `wire_bw_mbps`.**
    Two qualifications, both learned the hard way on 2026-08-26:
 

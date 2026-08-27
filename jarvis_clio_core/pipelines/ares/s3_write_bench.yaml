@@ -425,6 +425,16 @@ config:
       # FreeBlocks issues a DeleteObject per block, so a later count reads 0.
       bucket: "${S3_BENCH_BUCKET}"
       key_prefix: "clio-s3-write-bench/bdev"
+      # Empty this prefix before each row. Every row of the sweep shares it,
+      # so without the purge objects_measured counts earlier rows' leftovers
+      # too: the 2026-08-26 grid had every 4 MiB row report 448 objects
+      # against num_blobs 256, the excess being exactly 192 x 1 MiB orphans
+      # the 1 MiB rows' teardown never deleted. Throughput was unaffected
+      # (those columns come from logical_bytes/wall_time_us), but the guard
+      # degraded from an equality to a lower bound. Only this prefix is
+      # deleted -- zarr's store is one level up, rawput's keys are a sibling.
+      # The per-row objects_purged column keeps the underlying leak visible.
+      purge_prefix: true
       venv: "${ZARR_VENV}"
       tag_prefix: "s3wb"
       aws_region: "${S3_BENCH_REGION}"

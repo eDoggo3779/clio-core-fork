@@ -47,6 +47,7 @@ class ClioS3WriteBench(Application):
         self.output_path = None
         self.rss_path = None
         self.objects_path = None
+        self.purged_count = None
 
     def _configure_menu(self):
         """
@@ -131,6 +132,19 @@ class ClioS3WriteBench(Application):
                 'help': 'Adds a full read pass. Enable for one-off validation '
                         'runs, not for the sweep. This is what proves bytes '
                         'round-tripped through S3.'
+            },
+            {
+                'name': 'purge_prefix',
+                'msg': 'Delete stale objects under key_prefix before running',
+                'type': bool,
+                'default': True,
+                'help': 'Every row of a sweep shares one key prefix, so '
+                        'without this objects_measured also counts what '
+                        'earlier rows left behind and stops being an exact '
+                        'check. Only the bdev prefix is deleted -- the zarr '
+                        "store sits one level up and the raw-PUT floor's keys "
+                        'in a sibling, so neither is in range. Needs bucket, '
+                        'key_prefix and venv, and is skipped without them.'
             },
             {
                 'name': 'aws_region',
@@ -241,12 +255,19 @@ class ClioS3WriteBench(Application):
                                      'clio_s3_write_time.txt')
         self.objects_path = os.path.join(self.shared_dir,
                                          'clio_s3_write_objects.txt')
+        # Same reasoning as the paths: never trust _configure to have run.
+        self.purged_count = None
 
         # Stale output from a previous combination is the blank-column failure
         # mode -- a crash here would otherwise be scored with old numbers.
         for path in (self.output_path, self.rss_path, self.objects_path):
             if path and os.path.exists(path):
                 os.remove(path)
+
+        # Stale objects in the bucket are the same failure mode one level out:
+        # objects_measured lists the prefix, so a previous row's leftovers
+        # would be counted as this row's work. Must happen before the run.
+        self._purge_prefix()
 
         cmd = self._build_cmd()
         exec_info = LocalExecInfo(
@@ -273,6 +294,185 @@ class ClioS3WriteBench(Application):
         self._measure_objects()
         self.log(f'Benchmark completed. Output: {self.output_path}')
 
+    # ------------------------------------------------------------------
+    # Shared botocore plumbing. Ares has no AWS CLI, so every S3 control-plane
+    # call here shells into the zarr venv's botocore. Both the pre-run purge
+    # and the post-run count need the same credential resolution, so it lives
+    # in one place rather than being duplicated between them.
+    # ------------------------------------------------------------------
+
+    def _bucket_target(self, what):
+        """
+        Resolve (bucket, prefix) for the bdev tier, or (None, None).
+
+        The prefix is required, not defaulted. An empty prefix would widen
+        every caller to the whole bucket -- harmless for a listing, but the
+        purge would then delete the zarr baseline's store, which sits one
+        level up at `clio-s3-write-bench` against the bdev's
+        `clio-s3-write-bench/bdev`.
+
+        Args:
+            what (str): Label for the skip message.
+
+        Returns:
+            tuple: (bucket, prefix), or (None, None) when unset.
+        """
+        bucket = str(self.config.get('bucket') or '').strip()
+        prefix = str(self.config.get('key_prefix') or '').strip().strip('/')
+        if not bucket or not prefix:
+            self.log(f'{what}: skipped (bucket/key_prefix not set)')
+            return None, None
+        return bucket, prefix
+
+    def _botocore_env(self):
+        """
+        Build the environment for a botocore subprocess.
+
+        AWS_PROFILE + HOME resolve through botocore's shared credentials file.
+        mod_env carries both (jarvis copies HOME out of COMMON_ENV_VARS), and
+        the job script's raw keys are inherited by this process, so those are
+        passed through too for the profile-less case.
+
+        Returns:
+            dict: Environment for the subprocess.
+        """
+        env = dict(self.mod_env) if isinstance(self.mod_env, dict) \
+            else dict(os.environ)
+        for name in ('HOME', 'AWS_PROFILE', 'AWS_ACCESS_KEY_ID',
+                     'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'):
+            if not env.get(name) and os.environ.get(name):
+                env[name] = os.environ[name]
+        env['AWS_DEFAULT_REGION'] = str(self.config.get('aws_region')
+                                        or env.get('AWS_DEFAULT_REGION')
+                                        or 'us-east-1')
+        return env
+
+    def _run_botocore(self, script, args, what, timeout=300):
+        """
+        Run a botocore snippet in the configured venv.
+
+        Never raises: both callers are diagnostics around a measurement that
+        has its own success criteria, and neither should be able to fail a row
+        on its own.
+
+        Args:
+            script (str): Python source to run with `-c`.
+            args (list): Positional arguments appended after the script.
+            what (str): Label for log messages.
+            timeout (int): Seconds before the subprocess is killed.
+
+        Returns:
+            str: stdout on success, or None.
+        """
+        python = str(self.config.get('venv') or '').strip()
+        python = os.path.join(python, 'bin', 'python3') if python \
+            else sys.executable
+        if not os.path.exists(python):
+            self.log(f'{what}: skipped ({python} not found)')
+            return None
+        try:
+            proc = subprocess.run([python, '-c', script] + list(args),
+                                  env=self._botocore_env(),
+                                  capture_output=True, timeout=timeout,
+                                  text=True)
+        except Exception as e:
+            self.log(f'{what}: failed ({e})')
+            return None
+        if proc.returncode != 0:
+            self.log(f'{what}: failed rc={proc.returncode}: '
+                     f'{(proc.stderr or "").strip()[-400:]}')
+            return None
+        return proc.stdout
+
+    def _purge_prefix(self):
+        """
+        Delete every object under the bdev key prefix before the run.
+
+        WHY THIS EXISTS. All rows of a sweep share one key prefix, and
+        `objects_measured` is a listing of that prefix -- so it counts
+        whatever earlier rows left behind alongside what this row wrote. The
+        36-row sweep of 2026-08-26 hit exactly that: every 4 MiB row reported
+        448 objects against `num_blobs: 256`, the excess being precisely 192 x
+        1 MiB orphans that the 1 MiB rows' teardown never deleted. Throughput
+        was unaffected -- those columns come from logical_bytes/wall_time_us,
+        which the benchmark owns -- but the guard was blunted into a lower
+        bound, and a row that wrote nothing would still have listed its
+        predecessors' objects and looked plausible.
+
+        Purging here rather than subtracting a baseline in the count is
+        deliberate: it restores `objects_measured == num_blobs` as an exact
+        equality instead of leaving a comparison against a moving reference.
+
+        WHY DELETING HERE IS SAFE. At start() this row has written nothing, so
+        every object under the prefix belongs to a row that has already
+        finished. That rests on the runtime tearing down between rows, which
+        the sweep evidence supports: the orphan count held at exactly 192
+        across all eighteen 4 MiB rows rather than accumulating, so each row
+        does free its own blocks. If that ever stops holding, the failure is
+        loud rather than silent -- purging live blocks shows up immediately as
+        objects_measured < num_blobs, which the gate already catches.
+
+        Only the bdev prefix is in range. The zarr baseline's store sits one
+        level up and the raw-PUT floor's keys in a sibling prefix, so neither
+        can be reached; `_bucket_target` refuses an empty prefix outright, and
+        the snippet asserts it again on the far side.
+
+        NOT A ROOT-CAUSE FIX. Something in the bdev teardown path is still
+        orphaning blocks -- FreeBlocks issues a DeleteObject per block, and 192
+        of them did not happen. This makes the measurement honest; it does not
+        explain the leak. `objects_purged` is recorded per row precisely so
+        the leak stays visible: a nonzero value names the row whose
+        predecessor leaked, and how much.
+
+        Never raises: a purge problem must not fail a row that can still run.
+        """
+        if not self.config.get('purge_prefix'):
+            return
+        bucket, prefix = self._bucket_target('purge_prefix')
+        if not bucket:
+            return
+
+        # Keys are collected across all pages BEFORE any delete: deleting
+        # while the paginator is mid-listing invalidates its continuation
+        # token and can silently skip a page.
+        script = (
+            'import os, sys, botocore.session\n'
+            'b, p = sys.argv[1], sys.argv[2]\n'
+            'assert p, "refusing to purge an empty prefix"\n'
+            'c = botocore.session.get_session().create_client(\n'
+            '    "s3", region_name=os.environ.get("AWS_DEFAULT_REGION"))\n'
+            'keys = []\n'
+            'for page in c.get_paginator("list_objects_v2").paginate(\n'
+            '        Bucket=b, Prefix=p):\n'
+            '    for o in page.get("Contents", []):\n'
+            '        keys.append({"Key": o["Key"]})\n'
+            'n = 0\n'
+            'for i in range(0, len(keys), 1000):\n'
+            '    batch = keys[i:i + 1000]\n'
+            '    r = c.delete_objects(Bucket=b, Delete={"Objects": batch})\n'
+            '    n += len(r.get("Deleted", []))\n'
+            '    for e in r.get("Errors", []):\n'
+            '        print("ERROR", e.get("Key"), e.get("Message"),\n'
+            '              file=sys.stderr)\n'
+            'print(n)\n')
+        out = self._run_botocore(script, [bucket, prefix], 'purge_prefix')
+        if out is None:
+            self.log('purge_prefix: FAILED. objects_measured is now a lower '
+                     'bound, not an exact count -- compare it against '
+                     'put_count rather than num_blobs for this row.')
+            return
+        try:
+            self.purged_count = int(out.split()[0])
+        except Exception:
+            self.log(f'purge_prefix: unparseable output: {out!r}')
+            return
+        if self.purged_count:
+            self.log(f'purge_prefix: deleted {self.purged_count} stale '
+                     f'object(s) under s3://{bucket}/{prefix} left by an '
+                     f'earlier row')
+        else:
+            self.log(f'purge_prefix: s3://{bucket}/{prefix} was already clean')
+
     def _measure_objects(self):
         """
         List the bdev's key prefix and record how many objects exist.
@@ -286,35 +486,16 @@ class ClioS3WriteBench(Application):
         objects_measured != put_count the allocator fragmented -- or, if it is
         zero, nothing reached S3 at all and the throughput column is fiction.
 
+        The count is exact only because `_purge_prefix` emptied the prefix
+        before the run. With the purge disabled or failed it is a lower bound
+        that includes earlier rows' leftovers.
+
         Never raises: a listing problem must not fail a row whose measurement
         already succeeded.
         """
-        bucket = str(self.config.get('bucket') or '').strip()
-        prefix = str(self.config.get('key_prefix') or '').strip().strip('/')
-        if not bucket or not prefix:
-            self.log('objects_measured: skipped (bucket/key_prefix not set)')
+        bucket, prefix = self._bucket_target('objects_measured')
+        if not bucket:
             return
-        python = str(self.config.get('venv') or '').strip()
-        python = os.path.join(python, 'bin', 'python3') if python \
-            else sys.executable
-        if not os.path.exists(python):
-            self.log(f'objects_measured: skipped ({python} not found)')
-            return
-
-        # Credentials: AWS_PROFILE + HOME resolve through botocore's shared
-        # credentials file. mod_env carries both (jarvis copies HOME out of
-        # COMMON_ENV_VARS), and the job script's raw keys are inherited by
-        # this process, so pass those through too for the profile-less case.
-        env = dict(self.mod_env) if isinstance(self.mod_env, dict) \
-            else dict(os.environ)
-        for name in ('HOME', 'AWS_PROFILE', 'AWS_ACCESS_KEY_ID',
-                     'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN'):
-            if not env.get(name) and os.environ.get(name):
-                env[name] = os.environ[name]
-        env['AWS_DEFAULT_REGION'] = str(self.config.get('aws_region')
-                                        or env.get('AWS_DEFAULT_REGION')
-                                        or 'us-east-1')
-
         script = (
             'import os, sys, botocore.session\n'
             'b, p = sys.argv[1], sys.argv[2]\n'
@@ -326,26 +507,22 @@ class ClioS3WriteBench(Application):
             '    for o in page.get("Contents", []):\n'
             '        n += 1; tot += o["Size"]\n'
             'print(n, tot)\n')
-        try:
-            proc = subprocess.run([python, '-c', script, bucket, prefix],
-                                  env=env, capture_output=True, timeout=180,
-                                  text=True)
-        except Exception as e:
-            self.log(f'objects_measured: listing failed ({e})')
-            return
-        if proc.returncode != 0:
-            self.log(f'objects_measured: listing failed rc={proc.returncode}: '
-                     f'{(proc.stderr or "").strip()[-400:]}')
+        out = self._run_botocore(script, [bucket, prefix], 'objects_measured',
+                                 timeout=180)
+        if out is None:
             return
         try:
-            count, total = proc.stdout.split()[:2]
+            count, total = out.split()[:2]
             int(count), int(total)
         except Exception:
-            self.log(f'objects_measured: unparseable listing output: '
-                     f'{proc.stdout!r}')
+            self.log(f'objects_measured: unparseable listing output: {out!r}')
             return
         with open(self.objects_path, 'w') as f:
             f.write(f'objects_measured {count}\nbytes_measured {total}\n')
+            # Diagnostic, and the reason the purge is not silent: a nonzero
+            # value in results.csv names the row whose predecessor leaked.
+            if self.purged_count is not None:
+                f.write(f'objects_purged {self.purged_count}\n')
         self.log(f'objects_measured: {count} objects, {total} bytes under '
                  f's3://{bucket}/{prefix}')
         if int(count) == 0:
