@@ -79,6 +79,54 @@ rank's contribution encodes the iteration and its rank, so the expected total
 cannot be matched by a batch that mixed iterations, dropped a member, or
 double-counted one.
 
+### Where the release time goes
+
+The margins above are **release propagation**: last participant arrives → that
+participant gets out. Reporting only the minimum flatters the collective, so the
+check reports min/median/max. On a quiet host, 40 rounds at 20 ms stagger:
+
+| check                   |    min |   median |     max |
+|-------------------------|-------:|---------:|--------:|
+| `MPI_Barrier` (control) |  58.2  |   93.6   |  156.0  |
+| clio barrier            | 119.5  |  459.9   | 1643.8  |
+| clio allreduce          |  71.2  |  443.5   | 2006.8  |
+
+The minimum is the participant co-located with the leader — it needs no network
+hop to be told the barrier opened. The median includes the remote ones.
+
+The leader's own contribution is measured directly (`CLIO_COLL_PROF=1`), in µs:
+
+| stage  | what it is                                            | hot | staggered |
+|--------|-------------------------------------------------------|----:|----------:|
+| notice | flusher spotting that the count was reached           |   0 |     0 |
+| build  | constructing the aggregate + folding in `AggregateIn` |   0 |     2 |
+| exec   | `Send` the aggregate → schedule → run → `EndTask`     |  20 |    37 |
+| bcast  | serialize OUT once, load into all 4 members, complete |   3 |    19 |
+|        | **leader total**                                      |  **23** | **58** |
+
+So of a ~444 µs median release, the leader accounts for ~58 µs. **The other
+~385 µs is the two cross-node legs** — the last participant's request reaching
+the leader, and the release reaching each participant — at roughly 150-190 µs
+per one-way leg, which is the same per-hop cost broken down in the table above
+(send-queue wait ~45-65 µs, receiving-node residency ~30-60 µs, and wakeups;
+serialization ~0.5 µs and the wire ~5-10 µs are noise).
+
+Two things follow. First, `notice` and `build` are ~0: the count-based release
+and the aggregation are free, so there is nothing to win in the `BatchManager`.
+Second, the largest item that *is* the collective's own is `exec` — 20 µs hot,
+37 µs staggered, to schedule and run an aggregate whose body does nothing. That
+is a full `ipc_->Send` → route → lane → worker-pickup → `ExecTask` → `EndTask`
+round for a no-op. Running the aggregate inline on the flushing worker, rather
+than submitting it as an ordinary task, is the one optimization the collective
+path itself still offers — and it is worth ~20-37 µs of ~444, so it is a
+rounding error next to the network legs.
+
+`skew` (first member arriving at the leader → last) is 305 µs even with the
+ranks looping back-to-back, and 60 ms by construction in the staggered test. It
+is not a cost of this implementation — it is how far apart the callers actually
+are — but it is what every early arriver waits through, so a real application's
+barrier cost is its own skew plus the release above.
+
 ### One real caveat: the release counts arrivals, not participants
 
 `BatchManager::FlushDue` releases on
@@ -279,6 +327,12 @@ All are env-gated and cost nothing when unset. Pass them to `run_tests.sh`;
 | `CLIO_NET_QPROF=1` | `[NETQPROF]` net-queue enqueue→pop wait per priority, and server-side residency (arrival → response queued) |
 | `CLIO_NET_TRACE=1` | `[NETTRACE]` serialize/transmit/recv timings and the send-poll tick rate |
 | `CLIO_WORKER_RATE=1` | `[WORKERRATE]` wall time per worker-loop iteration (includes parked time — compare workers, don't read as CPU) |
+
+`CLIO_NET_QPROF` is the heavy one: its server-residency tracker takes a mutex
+and hits an `unordered_map` on every task arrival and every response enqueue.
+That is fine for attributing a stage, but it distorts absolute latency — do not
+read headline numbers off a run with it enabled. `CLIO_COLL_PROF` is cheap (a
+few timestamps per collective) and safe to leave on while measuring.
 
 Note all four test for a non-EMPTY value, not a non-null pointer. A harness that
 forwards a knob as `"${VAR:-}"` sets it to the empty string when unset, and a

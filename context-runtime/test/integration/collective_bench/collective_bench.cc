@@ -191,7 +191,17 @@ struct BarrierCheck {
   bool conclusive = false;
   std::int64_t clock_spread_ns = 0;  /**< disagreement between rank clocks */
   double worst_margin_us = 0.0;      /**< min over ranks of (exit - last_enter) */
+  double med_margin_us = 0.0;        /**< median release-propagation time */
+  double max_margin_us = 0.0;        /**< slowest participant's release */
   int violations = 0;                /**< rounds where someone left too early */
+  /**
+   * Every (round, rank) margin. A margin is the RELEASE PROPAGATION time: how
+   * long after the last participant arrived that participant got out. The min
+   * is the fastest path through the release (typically the participant
+   * co-located with the leader, which needs no network hop to be told); the max
+   * is the slowest. Reporting only the min flatters the collective.
+   */
+  std::vector<double> margins_us;
 };
 
 /**
@@ -258,12 +268,19 @@ BarrierCheck VerifyBarrier(int rank, int size, int rounds, int stagger_ms,
           static_cast<double>(exits[static_cast<size_t>(r)] - last_enter) /
           1000.0;
       if (margin_us < res.worst_margin_us) res.worst_margin_us = margin_us;
+      res.margins_us.push_back(margin_us);
       // Charge a violation only beyond the measured clock disagreement, so
       // clock noise can never be reported as a broken barrier.
       if (margin_us < -static_cast<double>(res.clock_spread_ns) / 1000.0) {
         ++res.violations;
       }
     }
+  }
+  if (!res.margins_us.empty()) {
+    std::vector<double> sorted = res.margins_us;
+    std::sort(sorted.begin(), sorted.end());
+    res.med_margin_us = sorted[sorted.size() / 2];
+    res.max_margin_us = sorted.back();
   }
   return res;
 }
@@ -456,10 +473,11 @@ int main(int argc, char **argv) {
                       c.name);
           continue;
         }
-        std::printf("  %-22s %s  earliest exit was %+.1f us after the last "
-                    "arrival (%d violations)\n",
+        std::printf("  %-22s %s  release propagation min/med/max = "
+                    "%+.1f / %+.1f / %+.1f us (%d violations)\n",
                     c.name, c.c->violations == 0 ? "HELD  " : "BROKEN",
-                    c.c->worst_margin_us, c.c->violations);
+                    c.c->worst_margin_us, c.c->med_margin_us,
+                    c.c->max_margin_us, c.c->violations);
       }
       if (none_chk.conclusive && none_chk.violations == 0) {
         std::printf("  WARNING: the negative control did not register as "
