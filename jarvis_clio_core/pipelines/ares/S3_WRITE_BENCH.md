@@ -324,6 +324,60 @@ The grid is built around what the smoke found — see the header comment in
 `s3_write_bench_full.yaml` for why there is no 16 MiB axis and what the K=64
 `rawput` point is there to settle.
 
+### Targeted diagnostic (18 rows, ~45 min)
+
+```bash
+jarvis ppl submit $PWD/jarvis_clio_core/pipelines/ares/s3_write_bench_diag.yaml
+```
+
+Scaled down from the full grid to resolve one open defect: CLIO's ~5.5
+objects/s ceiling. It is **not** a comparison sweep and should be deleted or
+ignored once the defect is fixed — scale back up with
+`s3_write_bench_full.yaml`.
+
+What it changes, and why each change is load-bearing:
+
+| | full sweep | diagnostic | why |
+|---|---|---|---|
+| blob size | 1m, 4m | **256k**, 1m, 4m | 256k is where the two hypotheses are 7× apart |
+| concurrency | swept 1→64 | **pinned 32** | the knee is known; sit past it |
+| worker pool | **zipped to K** | **16 vs 48, un-zipped** | removes the confound — see below |
+| baselines | zarr + zstd + rawput | **rawput only** | zarr's question is closed; it cost ~40% of each row |
+| rows | 36 (~3.6 h) | 18 (~45 min) | |
+
+**The confound this removes.** The full sweep zipped `clio_s3.concurrency`,
+`runtime.num_threads` and `clio_s3.worker_threads` onto one axis. That was
+right for finding the knee, but it means "CLIO stops improving past K=32" and
+"CLIO stops improving past 48 workers" are *the same data points* — nothing in
+those 36 rows separates them. Pinning K and moving only the pool separates them
+in one step.
+
+**`objects/s`, not MB/s, is the measurement.** `num_blobs` is held at 256 at
+every size so the object count is constant and obj/s is comparable down the
+axis. (This inverts the full sweep's reasoning for the same knob, which held
+blob count constant to keep the K=64 window meaningful.)
+
+**Exclude link-bound rows before concluding anything.** A row at ratio ≈ 1.0 is
+doing what the network allows, not what CLIO allows, so its obj/s says nothing
+about a per-object cost. 4 MiB is exactly such a row — 5.5 obj/s there would be
+22 MB/s, twice the link — and including it makes a perfectly flat series read as
+2× variable. That is the same trap that made 4 MiB look healthy in the 36-row
+sweep. `post_cmds` does this exclusion for you and prints the verdict directly
+in the job log, so the answer arrives without opening the CSV.
+
+How to read the two verdicts:
+
+* **Axis 1** — obj/s flat across sizes *below the link* ⇒ a fixed per-object
+  cost is real, and the printout names its size in ms. Varying ⇒ it is not a
+  per-object quantum and the 1 MiB plateau needs another explanation.
+* **Axis 2** — obj/s rising 16→48 workers ⇒ **pool-bound**: effective
+  concurrency was capped below K all along, and the fix is worker accounting.
+  Flat ⇒ the pool is innocent and the serialization is in the DPE, the
+  allocator, or the bdev's per-block path — profile the runtime, do not add
+  threads.
+
+Cost is ~9k PUTs, under $0.10.
+
 ### Cost
 
 Writes are cheap: ingress to S3 is free and PUTs run ~$0.005/1000, so the smoke
