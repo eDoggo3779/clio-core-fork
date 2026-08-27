@@ -23,6 +23,7 @@
  */
 
 #include "clio_vol.h"
+#include "adapter/clio_coherence_stamp.h"
 
 #include <H5PLextern.h>     /* H5PLget_plugin_type / H5PLget_plugin_info */
 #ifdef H5_HAVE_PARALLEL
@@ -932,66 +933,12 @@ static void clio_resolve_config(hid_t fapl_id, size_t *chunk_size,
    which HDF5 always renders with a leading '/'. */
 static constexpr const char *kStampBlobName = "__clio_coherence_stamp";
 
-/* The file's modification time, split into whole seconds and nanoseconds.
- *
- * `struct stat` does not agree across the platforms this connector builds on:
- * POSIX-2008 (and glibc) names the timespec member st_mtim, Darwin predates
- * that name and calls the same member st_mtimespec, and MSVC's struct stat has
- * no sub-second member at all -- only st_mtime, in whole seconds. Reading
- * st_mtim unconditionally is what stopped this file compiling anywhere but
- * glibc; every use goes through here instead.
- *
- * Callers keep the two halves separate rather than taking a single nanosecond
- * count, because the stamp string embeds them as "<sec>.<nsec>" and that text
- * is compared against stamps already stored in a tier. */
-static void clio_stat_mtime(const struct stat &st, long long *sec,
-                            long long *nsec) {
-#if defined(_WIN32)
-  /* No sub-second field exists; see clio_stamp_granularity_ns, which widens the
-     ambiguity window to match this coarser clock. */
-  *sec = static_cast<long long>(st.st_mtime);
-  *nsec = 0;
-#elif defined(__APPLE__)
-  *sec = static_cast<long long>(st.st_mtimespec.tv_sec);
-  *nsec = static_cast<long long>(st.st_mtimespec.tv_nsec);
-#else
-  *sec = static_cast<long long>(st.st_mtim.tv_sec);
-  *nsec = static_cast<long long>(st.st_mtim.tv_nsec);
-#endif
-}
-
-/* Wall-clock now, in nanoseconds since the epoch.
- *
- * std::chrono::system_clock rather than clock_gettime(CLOCK_REALTIME): MSVC has
- * neither the function nor the macro, and system_clock is the same wall clock
- * on every implementation this builds against. It also cannot fail, so callers
- * need no "clock unreadable" arm. */
-static long long clio_realtime_now_ns() {
-  return static_cast<long long>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::system_clock::now().time_since_epoch())
-          .count());
-}
-
-/* Identity + state of the native file, as a string. dev/ino catch the file
-   being replaced (a new inode at the same path -- h5repack, rsync, mv); size
-   and mtime catch it being modified in place.
-
-   The leading "2:" is the cache-layout version. A tier populated under a
-   different blob layout reads back hole-zeros while the file itself is
-   unchanged -- the one staleness file identity cannot catch -- so any layout
-   change must bump this and let the mismatch drop the tag. */
+/* "2:" is this connector's cache-layout version -- bump it when the blob
+   layout changes, so the mismatch drops the tag. */
 static std::string clio_file_stamp(const char *path) {
-  struct stat st;
-  if (!path || stat(path, &st) != 0) return std::string();
-  long long mtime_sec = 0, mtime_nsec = 0;
-  clio_stat_mtime(st, &mtime_sec, &mtime_nsec);
-  return std::string("2:") +
-         std::to_string(static_cast<unsigned long long>(st.st_dev)) + ":" +
-         std::to_string(static_cast<unsigned long long>(st.st_ino)) + ":" +
-         std::to_string(static_cast<unsigned long long>(st.st_size)) + ":" +
-         std::to_string(mtime_sec) + "." +
-         std::to_string(mtime_nsec);
+  const std::string id = clio::adapter::stamp::FileIdentity(path);
+  if (id.empty()) return std::string();
+  return std::string("2:") + id;
 }
 
 /* Does the stored stamp still describe this file? Anything but kMatched means
@@ -1025,78 +972,6 @@ static clio::trace::Stamp clio_stamp_matches(
                        : clio::trace::Stamp::kMismatched;
 }
 
-/* Width of the window in which mtime cannot discriminate, in nanoseconds.
- *
- * Filesystem timestamps are coarse: the kernel stamps an inode from a clock it
- * samples on a tick, so two writes inside one tick get byte-identical mtimes.
- * Measured on ext4-over-overlayfs here: consecutive in-place writes report
- * deltas of either exactly 0 or ~1.00002 ms, never anything between -- a 1 ms
- * granule at HZ=1000.
- *
- * There is no portable way to ASK a filesystem for this number (clock_getres
- * describes the clock, not the inode), so this is a bound rather than a
- * measurement. Too large costs cache misses; too small costs correctness, so
- * the default is deliberately several granules wide and covers the common
- * cases (HZ=1000 -> 1 ms, HZ=250 -> 4 ms). It does NOT cover a filesystem with
- * second-granularity timestamps (some NFS mounts, FAT); raise it there, and
- * consider that such a filesystem is where storing a content hash at close
- * starts to earn its cost. */
-static uint64_t clio_stamp_granularity_ns() {
-  static const uint64_t g = []() -> uint64_t {
-    if (const char *e = std::getenv("CLIO_VOL_STAMP_GRANULARITY_NS")) {
-      if (*e != '\0') {
-        char *end = nullptr;
-        unsigned long long v = std::strtoull(e, &end, 10);
-        if (end != e && *end == '\0') return static_cast<uint64_t>(v);
-      }
-    }
-#if defined(_WIN32)
-    /* Windows' stat() reports mtime in whole seconds (and only to two on a
-       FAT-formatted volume), so a 10 ms granule would call a file unambiguous
-       whose very next write lands in the same reported second -- exactly the
-       case this check exists to refuse. One second is the smallest default that
-       still fails closed there. */
-    return 1000ull * 1000ull * 1000ull;  /* 1 s */
-#else
-    return 10ull * 1000ull * 1000ull;  /* 10 ms */
-#endif
-  }();
-  return g;
-}
-
-/* Can this file's mtime still discriminate a LATER modification?
- *
- * The stamp's only signal for an in-place, same-size edit is mtime: dev, ino
- * and size are unchanged by definition. So if the file's mtime is younger than
- * one timestamp granule, a write happening right now would land in the same
- * granule and produce an identical stamp -- and the next open would conclude
- * "unchanged" about a file that changed. That is the corrupt-checksum parity
- * case: it passed or failed purely on whether the test's write happened to
- * cross a tick boundary, which is why it looked flaky rather than broken.
- *
- * True means "cannot tell", and the caller withholds the stamp so the next
- * open fails closed -- the same rule the rest of the stamp path follows, where
- * absent, unreadable and unstattable all mean do-not-trust. */
-static bool clio_stamp_ambiguous(const char *path) {
-  struct stat st;
-  if (!path || stat(path, &st) != 0) return true;
-  long long mtime_sec = 0, mtime_nsec = 0;
-  clio_stat_mtime(st, &mtime_sec, &mtime_nsec);
-  const int64_t now_ns = static_cast<int64_t>(clio_realtime_now_ns());
-  const int64_t mtime_ns = static_cast<int64_t>(mtime_sec) * 1000000000LL +
-                           static_cast<int64_t>(mtime_nsec);
-  /* A negative age means the mtime is in the future (clock skew, or a network
-     filesystem stamping from a different host). Nothing can be concluded from
-     it, so it is ambiguous too. */
-  const int64_t age_ns = now_ns - mtime_ns;
-  return age_ns < 0 ||
-         static_cast<uint64_t>(age_ns) < clio_stamp_granularity_ns();
-}
-
-/* Record the file's current identity as consistent with the cache. Called
-   AFTER the native close, so size and mtime are final -- stamping before it
-   would record a state the file has not reached yet and the next open would
-   reject a cache that is actually good. */
 static void clio_write_stamp(clio::cte::core::Client *cte_client,
                              const clio::cte::core::TagId &tag_id,
                              const char *path, clio::trace::FileTrace *ft) {
@@ -1107,7 +982,7 @@ static void clio_write_stamp(clio::cte::core::Client *cte_client,
      instead, which makes the next open see kAbsent and fail closed
      deterministically -- rather than leaving an older stamp whose mismatch
      happens to produce the same outcome for a different reason. */
-  if (clio_stamp_ambiguous(path)) {
+  if (clio::adapter::stamp::Ambiguous(path)) {
     clio::trace::record_stamp(ft, clio::trace::Stamp::kAmbiguous);
     auto del = cte_client->AsyncDelBlob(tag_id, std::string(kStampBlobName));
     del.Wait();
@@ -1142,10 +1017,9 @@ static void clio_write_stamp(clio::cte::core::Client *cte_client,
                                       kCliovolPutFlags);
   put.Wait();  /* the stamp must land before the tag is reused */
   if (put->GetReturnCode() != 0) {
-    /* Checked, and loudly. An unchecked failure here is invisible at the moment
-       it happens and reappears later as "the cache stopped working", because
-       the next open finds no stamp, fails closed and drops a tag that was
-       perfectly good. That is exactly how this defect hid. */
+    /* Loudly: unchecked, this is invisible now and resurfaces later as "the
+       cache stopped working", when the next open finds no stamp, fails closed
+       and drops a tag that was perfectly good. */
     HLOG(kWarning, "clio-vol: coherence stamp for {} failed to store (rc={}); "
                    "the cache will be dropped on the next open",
          path, put->GetReturnCode());
@@ -1249,15 +1123,10 @@ static bool clio_file_bind_tag(clio_file_t *file) {
   }
   file->tag_id = tag_task->tag_id_;
 
-  /* Coherence check. A tag we did not just create may describe a file that
-     changed on disk while this connector was not watching, and the cache must
-     not answer for it -- serving a pre-change copy would mask the file's own
-     state, including its errors. Compare the stamp written at the last close
-     against the file as it is now; anything but an exact match drops the tag,
-     the same response H5F_ACC_TRUNC gets above.
-
-     Skipped when we just truncated: the tag is empty, so there is nothing to
-     be stale. */
+  /* A tag we did not just create may describe a file that changed on disk
+     while this connector was not watching; serving a pre-change copy would
+     mask the file's own state, including its errors. Anything but an exact
+     match drops the tag. Skipped after a truncate: the tag is already empty. */
   const clio::trace::Stamp verdict =
       truncated ? clio::trace::Stamp::kAbsent
                 : clio_stamp_matches(cte_client, file->tag_id,
