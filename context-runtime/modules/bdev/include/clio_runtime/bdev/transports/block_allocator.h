@@ -16,8 +16,6 @@
 #include <atomic>
 #include <vector>
 #include <list>
-#include <mutex>
-#include <string>
 
 namespace clio::run::bdev {
 
@@ -94,18 +92,6 @@ class Heap {
   bool Allocate(size_t block_size, int block_type, Block& block);
   clio::run::u64 GetRemainingSize() const;
 
-  /**
-   * Raise the bump pointer to at least `end_offset` (issue: restart
-   * overwrites live data). Init() resets the pointer to 0, which is correct
-   * for a fresh device and CATASTROPHIC for one whose backing file still
-   * holds blocks that restored metadata points at -- the next allocation
-   * hands out offset 0 and the first write lands on top of live data.
-   */
-  void ReserveUpTo(clio::run::u64 end_offset);
-
-  /** Current bump pointer (bytes handed out from the heap so far). */
-  clio::run::u64 Current() const { return heap_.load(); }
-
  private:
   std::atomic<clio::run::u64> heap_;
   clio::run::u64 total_size_;
@@ -132,38 +118,12 @@ class StandardBlockAllocator {
   clio::run::u64 GetRemainingSize() const;
   clio::run::u64 GetCapacity() const { return capacity_; }
 
-  /**
-   * Make the heap watermark durable in `path` (issue: restart overwrites
-   * live data). Call once, right after Init(), for PERSISTENT devices only:
-   * a memory tier's contents do not survive the process, so its heap must
-   * restart at 0.
-   *
-   * On call, any watermark previously stored in `path` is read back and the
-   * heap is advanced past it, so a restarted device never re-hands-out an
-   * extent whose bytes are still referenced by restored metadata. The file
-   * holds one decimal u64 and is rewritten in CHUNKS (see kWatermarkChunk):
-   * a crash can therefore only ever leave the stored value AHEAD of what was
-   * really handed out, which wastes a little space and is safe, never behind
-   * it, which would corrupt.
-   */
-  void InitPersistence(const std::string& path);
-
  private:
   GlobalBlockMap global_block_map_;
   Heap heap_;
   clio::run::u32 alignment_;
   clio::run::u64 capacity_;
   std::atomic<clio::run::u64> allocated_bytes_{0};
-
-  /** Durable-watermark state; inert unless InitPersistence() was called. */
-  std::string watermark_path_;
-  std::atomic<clio::run::u64> watermark_persisted_{0};
-  std::mutex watermark_mutex_;
-  /** Persist in 8 MiB steps: one small fsync per 8 MiB of fresh heap. */
-  static constexpr clio::run::u64 kWatermarkChunk = 8ULL << 20;
-
-  /** Ensure the stored watermark covers `needed` before it is handed out. */
-  void PersistWatermark(clio::run::u64 needed);
 
   clio::run::u64 AlignSize(clio::run::u64 size) {
     if (alignment_ == 0) alignment_ = 4096;

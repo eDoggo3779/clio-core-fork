@@ -7,10 +7,6 @@
 
 #include <clio_runtime/bdev/transports/block_allocator.h>
 
-#include <cstdio>
-#include <filesystem>
-#include <string>
-
 namespace clio::run::bdev {
 
 // The implementation of WorkerBlockMap, GlobalBlockMap, Heap 
@@ -177,80 +173,12 @@ bool Heap::Allocate(size_t block_size, int block_type, Block &block) {
   return true;
 }
 
-void Heap::ReserveUpTo(clio::run::u64 end_offset) {
-  clio::run::u64 cur = heap_.load();
-  while (cur < end_offset) {
-    if (heap_.compare_exchange_weak(cur, end_offset)) return;
-  }
-}
-
 clio::run::u64 Heap::GetRemainingSize() const {
   clio::run::u64 current_heap = heap_.load();
   if (total_size_ > current_heap) {
     return total_size_ - current_heap;
   }
   return 0;
-}
-
-void StandardBlockAllocator::InitPersistence(const std::string& path) {
-  watermark_path_ = path;
-  clio::run::u64 stored = 0;
-  if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
-    char buf[64] = {0};
-    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
-    std::fclose(f);
-    if (n > 0) {
-      stored = std::strtoull(buf, nullptr, 10);
-    }
-  }
-  if (stored > 0 && capacity_ > 0 && stored > capacity_) {
-    // The watermark outran the device: the data file was replaced by a
-    // smaller one (or removed and recreated) while this file survived. Do
-    // NOT ignore it -- if it is genuine, handing out those extents corrupts
-    // live data. Clamp instead, which reports the device full: a loud, safe
-    // failure rather than a silent overwrite.
-    HLOG(kWarning,
-         "BlockAllocator: stored watermark {} exceeds device capacity {} "
-         "({}); clamping. Delete this file only if the backing device was "
-         "intentionally reset.",
-         stored, capacity_, path);
-    stored = capacity_;
-  }
-  if (stored > 0) {
-    // Anything below `stored` may still be referenced by restored metadata.
-    heap_.ReserveUpTo(stored);
-    allocated_bytes_.store(stored, std::memory_order_relaxed);
-    HLOG(kInfo,
-         "BlockAllocator: recovered heap watermark {} from {} (device holds "
-         "live extents below it)",
-         stored, path);
-  }
-  watermark_persisted_.store(stored, std::memory_order_relaxed);
-}
-
-void StandardBlockAllocator::PersistWatermark(clio::run::u64 needed) {
-  if (watermark_path_.empty()) return;
-  if (needed <= watermark_persisted_.load(std::memory_order_acquire)) return;
-  std::lock_guard<std::mutex> guard(watermark_mutex_);
-  if (needed <= watermark_persisted_.load(std::memory_order_relaxed)) return;
-  clio::run::u64 target =
-      ((needed + kWatermarkChunk - 1) / kWatermarkChunk) * kWatermarkChunk;
-  if (capacity_ > 0 && target > capacity_) target = capacity_;
-  if (target < needed) target = needed;
-  // Rewrite in place: the file is one short decimal number, so a torn write
-  // cannot produce a LARGER value than intended -- and a smaller one is
-  // caught because the next allocation re-persists.
-  std::FILE* f = std::fopen(watermark_path_.c_str(), "wb");
-  if (f == nullptr) {
-    HLOG(kWarning, "BlockAllocator: cannot persist heap watermark to {}",
-         watermark_path_);
-    watermark_path_.clear();  // stop retrying every allocation
-    return;
-  }
-  std::fprintf(f, "%llu", static_cast<unsigned long long>(target));
-  std::fflush(f);
-  std::fclose(f);
-  watermark_persisted_.store(target, std::memory_order_release);
 }
 
 bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
@@ -279,10 +207,6 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
     whole_type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
   }
   if (heap_.Allocate(aligned_total_size, whole_type, block)) {
-    // Make the extent durable in the watermark BEFORE handing it out, so a
-    // crash right after this cannot leave a restarted device believing the
-    // space is free while metadata still points into it.
-    PersistWatermark(block.offset_ + aligned_total_size);
     block.size_ = total_size;  // logical size the caller reads/writes
     blocks.push_back(block);
     // Charge the ALIGNED size (the heap advanced by it, and FreeBlocks credits
