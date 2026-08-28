@@ -153,6 +153,14 @@ bool FsBdevTransport::Init(const CreateParams& params,
   clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
   allocator_.Init(num_workers, file_size, params.alignment_);
+  // A file-backed device KEEPS its bytes across a restart, so its allocator
+  // must keep its watermark too. Without this, Heap::Init's reset to 0 makes
+  // the next allocation hand out offset 0 while restored metadata still
+  // points there, and the first write silently overwrites live blob data
+  // (seen as a restored replica reading back as a NEIGHBOURING blob's
+  // bytes). Memory-class transports deliberately do NOT do this: their
+  // contents really are gone, so restarting at 0 is correct there.
+  allocator_.InitPersistence(file_path_ + ".alloc");
 
   return true;
 }
