@@ -203,6 +203,19 @@ void StandardBlockAllocator::InitPersistence(const std::string& path) {
       stored = std::strtoull(buf, nullptr, 10);
     }
   }
+  if (stored > 0 && capacity_ > 0 && stored > capacity_) {
+    // The watermark outran the device: the data file was replaced by a
+    // smaller one (or removed and recreated) while this file survived. Do
+    // NOT ignore it -- if it is genuine, handing out those extents corrupts
+    // live data. Clamp instead, which reports the device full: a loud, safe
+    // failure rather than a silent overwrite.
+    HLOG(kWarning,
+         "BlockAllocator: stored watermark {} exceeds device capacity {} "
+         "({}); clamping. Delete this file only if the backing device was "
+         "intentionally reset.",
+         stored, capacity_, path);
+    stored = capacity_;
+  }
   if (stored > 0) {
     // Anything below `stored` may still be referenced by restored metadata.
     heap_.ReserveUpTo(stored);
