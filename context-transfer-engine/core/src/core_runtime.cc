@@ -5843,6 +5843,17 @@ void Runtime::RestoreMetadataFromLog() {
           }
         }
         if (is_volatile) {
+          // TEMPORARY DIAGNOSTIC (macOS cte_replication_persist_integration).
+          // The census proved every blob had replicas=1 at snapshot time and
+          // none was skipped, so the replica IS in the log and the loss is on
+          // THIS side. This is the only place a restored replica block is
+          // discarded. If the lost blob appears here, its replica was placed
+          // on a VOLATILE target rather than the disk tier the test asked for
+          // -- a placement bug, with restore correctly reacting to it.
+          HLOG(kWarning,
+               "[RESTORE-DROP] volatile replica key='{}' rep_idx={} "
+               "bdev=({}.{})",
+               composite_key, rep_idx, bdev_major, bdev_minor);
           continue;  // Volatile data is lost on restart
         }
 
