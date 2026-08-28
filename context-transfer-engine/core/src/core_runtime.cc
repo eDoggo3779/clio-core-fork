@@ -6047,6 +6047,25 @@ void Runtime::ReplayTransactionLogs() {
                                     std::to_string(tag_id.minor_) + "." +
                                     txn.blob_name_;
         std::shared_ptr<BlobInfo> blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+        // WAL shards are per-WORKER (blob_txn_logs_[wid % N]), NOT per-blob,
+        // and replay walks shards in index order rather than in time order.
+        // A blob's kCreateNewBlob is logged by the worker that served the
+        // PutBlob, while its replica records are logged by the ASYNC
+        // replication sweep running on a DIFFERENT worker -- so the two land
+        // in different shards and this record can be replayed BEFORE the blob
+        // exists. Skipping it then loses the layout permanently: the later
+        // kCreateNewBlob recreates the blob with an empty blocks_, and the
+        // copy is gone with no error anywhere (issue #886 -- the same
+        // per-worker-shard hazard already documented on that carry-over).
+        // Create the blob instead, so replay is order-independent; the
+        // kCreateNewBlob that follows carries this state forward.
+        if (!blob_info_ptr) {
+          BlobInfo fresh;
+          fresh.blob_name_ = txn.blob_name_;
+          tag_blob_name_to_info_.insert_or_assign(
+              composite_key, std::make_shared<BlobInfo>(fresh));
+          blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+        }
         if (blob_info_ptr) {
           // Replace blocks with replayed blocks (full replacement semantics)
           blob_info_ptr->blocks_.clear();
@@ -6076,10 +6095,11 @@ void Runtime::ReplayTransactionLogs() {
 
       } else if (type == TxnType::kExtendReplica) {
         // issue #886: full replacement of ONE replica's layout, same
-        // volatile-target filtering as kExtendBlob. Ordering with the
-        // blob's other records holds for free: replica writes happen under
-        // the same write token as primary writes, so this record can only
-        // follow the kCreateNewBlob that made the blob exist.
+        // volatile-target filtering as kExtendBlob. NOTE: this record does
+        // NOT reliably follow the kCreateNewBlob that made the blob exist.
+        // The write token orders the two in TIME, but the WAL is sharded per
+        // worker and replayed in shard-index order, so a later write can be
+        // replayed first. See the upsert below.
         auto txn = TransactionLog::DeserializeExtendReplica(payload);
         TagId tag_id{txn.tag_major_, txn.tag_minor_};
         std::string composite_key = std::to_string(tag_id.major_) + "." +
@@ -6087,6 +6107,25 @@ void Runtime::ReplayTransactionLogs() {
                                     txn.blob_name_;
         std::shared_ptr<BlobInfo> blob_info_ptr =
             tag_blob_name_to_info_.get(composite_key);
+        // WAL shards are per-WORKER (blob_txn_logs_[wid % N]), NOT per-blob,
+        // and replay walks shards in index order rather than in time order.
+        // A blob's kCreateNewBlob is logged by the worker that served the
+        // PutBlob, while its replica records are logged by the ASYNC
+        // replication sweep running on a DIFFERENT worker -- so the two land
+        // in different shards and this record can be replayed BEFORE the blob
+        // exists. Skipping it then loses the layout permanently: the later
+        // kCreateNewBlob recreates the blob with an empty replicas_, and the
+        // copy is gone with no error anywhere (issue #886 -- the same
+        // per-worker-shard hazard already documented on that carry-over).
+        // Create the blob instead, so replay is order-independent; the
+        // kCreateNewBlob that follows carries this state forward.
+        if (!blob_info_ptr) {
+          BlobInfo fresh;
+          fresh.blob_name_ = txn.blob_name_;
+          tag_blob_name_to_info_.insert_or_assign(
+              composite_key, std::make_shared<BlobInfo>(fresh));
+          blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+        }
         if (blob_info_ptr && txn.replica_ > 0) {
           Replica *rep = blob_info_ptr->GetReplica(
               static_cast<int>(txn.replica_), /*create=*/true);
