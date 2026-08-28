@@ -584,10 +584,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   auto params = task->GetParams();
   config_ = params.config_;
   HLOG(kDebug,
-       "CTE Create: GetParams() returned, storage devices in config: {}, "
-       "gpu_metadata_cache.enabled={}",
-       config_.storage_.devices_.size(),
-       config_.gpu_metadata_cache_.enabled_);
+       "CTE Create: GetParams() returned, storage devices in config: {}",
+       config_.storage_.devices_.size());
 
   // Configuration is now loaded from compose pool_config via
   // CreateParams::LoadConfig()
@@ -834,15 +832,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
   }
 
-  // Allocate the optional GPU metadata cache. The OUT pointer is
-  // re-serialized back into chimod_params_ (a clio::run::priv::string) so
-  // the client's GetParams() sees the populated gpu_cache_ptr_ after
-  // Wait().
+  // Re-serialize the params back into chimod_params_ (a
+  // clio::run::priv::string) so the client's GetParams() sees the OUT
+  // fields after Wait().
   CreateParams out_params;
   out_params.config_ = config_;
-  out_params.gpu_cache_ptr_ =
-      GpuCacheCreate() ? reinterpret_cast<clio::run::u64>(gpu_cache_)
-                       : static_cast<clio::run::u64>(0);
   // issue #783: hand the client the offset of the SHM metadata cache root.
   // An OFFSET, not a pointer -- the client maps the same segment at a
   // different base address, so only a segment-relative value survives the
@@ -1457,7 +1451,6 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
         tag_search_.Insert(ResolveTagName(tag_name), preferred_id);
       }
       task->tag_id_ = preferred_id;
-      GpuCacheOnGetOrCreateTag(preferred_id, tag_name);
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -1492,7 +1485,6 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
                      tag_info_ptr->last_modified_, now);
       }
     }
-    GpuCacheOnGetOrCreateTag(tag_id, tag_name);
     task->return_code_ = 0;
 
   } catch (const std::exception &e) {
@@ -2123,7 +2115,6 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
 
     LogTelemetry(CteOp::kPutBlob, offset, size, tag_id, now,
                  blob_info_ptr->last_read_);
-    GpuCacheOnPutBlob(tag_id, blob_name, *blob_info_ptr);
     // issue #783: mirror into the SHM cache HERE, at the successful end of the
     // put -- not when the BlobInfo is first inserted into the map. At insert
     // time the blob is still empty (blocks and total_size_cache_ are filled in
@@ -2927,7 +2918,6 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
                                 std::to_string(tag_id.minor_) + "." + blob_name;
           MirrorBlobToShm(shm_key, blob_info);
         }
-        GpuCacheOnDelBlob(tag_id, blob_name);
         HLOG(kDebug,
              "ReorganizeBlob: dropped primary of blob={} (new_score={} < "
              "persistent replica score {})",
@@ -3116,7 +3106,6 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
                             std::to_string(tag_id.minor_) + "." + blob_name;
       MirrorBlobToShm(shm_key, blob_info);
     }
-    GpuCacheOnPutBlob(tag_id, blob_name, blob_info);
 
     ipc_manager->FreeBuffer(blob_data_buffer);
 
@@ -3649,7 +3638,6 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
     }
 
     // Success
-    GpuCacheOnDelBlob(tag_id, blob_name);
     task->return_code_ = 0;
     HLOG(kDebug, "DelBlob successful: name={}, blob_size={}", blob_name,
          blob_size);
@@ -4665,7 +4653,6 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
       {
         tag_id_to_info_.erase(del_id);
       }
-      GpuCacheOnDelTag(del_id);
     }
 
     // Step 7b: prune now-empty auto-created parent directories, bottom-up. Stop
@@ -4714,7 +4701,6 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         txn.tag_minor_ = anc.minor_;
         tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
       }
-      GpuCacheOnDelTag(anc);
     }
 
     // Log telemetry for the DelTag operation (attributed to the target tag).
@@ -5805,6 +5791,20 @@ void Runtime::RestoreMetadataFromLog() {
       std::shared_ptr<BlobInfo> blob_info_ptr =
           tag_blob_name_to_info_.get(composite_key);
       Replica *rep = nullptr;
+      // TEMPORARY DIAGNOSTIC (macOS cte_replication_persist_integration).
+      // Everything upstream is now eliminated by measurement: the census
+      // showed 150/150 blobs with replicas=1 at snapshot time, [FLUSH-SKIP]
+      // never fired, and [RESTORE-DROP] never fired -- so the replica is
+      // written to the log and is not discarded as volatile. What is left is
+      // reading it back. A type-3 entry attaches to the BlobInfo its
+      // preceding type-2 record inserted; if that lookup misses, the replica
+      // is dropped here in SILENCE.
+      if (!blob_info_ptr || rep_idx == 0) {
+        HLOG(kWarning,
+             "[RESTORE-ORPHAN] type-3 entry with no blob to attach to: "
+             "key='{}' rep_idx={} have_blob={} num_blocks={}",
+             composite_key, rep_idx, blob_info_ptr ? 1 : 0, num_blocks);
+      }
       if (blob_info_ptr && rep_idx > 0) {
         rep = blob_info_ptr->GetReplica(static_cast<int>(rep_idx),
                                         /*create=*/true);
@@ -8039,152 +8039,6 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
-}
-
-// =====================================================================
-// GPU metadata cache helpers
-// ---------------------------------------------------------------------
-// These helpers are the ONLY places that mutate the GPU cache. Methods
-// like PutBlob / DelBlob / GetOrCreateTag / DelTag stay free of cache-
-// management noise — they invoke the matching GpuCacheOn* helper and
-// move on. The cache lives in managed/shared USM, so calls to the
-// inline GpuCacheUpsert* / GpuCacheRemove* primitives in
-// gpu_metadata_cache.h work directly from the host. A pure-device-
-// memory variant (one-WI kernel per mutation) is a future extension.
-// =====================================================================
-
-bool Runtime::GpuCacheCreate() {
-  if (!config_.gpu_metadata_cache_.enabled_) {
-    gpu_cache_ = nullptr;
-    gpu_cache_bytes_ = 0;
-    return true;
-  }
-
-#if !(CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL)
-  HLOG(kWarning,
-       "GpuMetadataCache: enabled in config, but no GPU backend was built "
-       "in. Cache will not be allocated.");
-  gpu_cache_ = nullptr;
-  gpu_cache_bytes_ = 0;
-  return false;
-#else
-  // Cap the slot counts at what the requested capacity can fit.
-  clio::run::u32 max_tags = config_.gpu_metadata_cache_.max_tags_;
-  clio::run::u32 max_blobs = config_.gpu_metadata_cache_.max_blobs_;
-  size_t needed = GpuMetadataCacheHeader::Layout(max_tags, max_blobs);
-  size_t cap = static_cast<size_t>(config_.gpu_metadata_cache_.capacity_bytes_);
-  if (needed > cap) {
-    // Shrink slot counts proportionally so we stay within budget.
-    double scale =
-        static_cast<double>(cap - sizeof(GpuMetadataCacheHeader)) /
-        static_cast<double>(needed - sizeof(GpuMetadataCacheHeader));
-    if (scale < 0.0) scale = 0.0;
-    if (scale > 1.0) scale = 1.0;
-    max_tags = std::max<clio::run::u32>(
-        1u, static_cast<clio::run::u32>(static_cast<double>(max_tags) * scale));
-    max_blobs = std::max<clio::run::u32>(
-        1u, static_cast<clio::run::u32>(static_cast<double>(max_blobs) * scale));
-    needed = GpuMetadataCacheHeader::Layout(max_tags, max_blobs);
-    HLOG(kWarning,
-         "GpuMetadataCache: requested capacity {} bytes too small for the "
-         "configured slot counts; rescaled to max_tags={} max_blobs={} "
-         "({} bytes).",
-         cap, max_tags, max_blobs, needed);
-  }
-
-  // Managed/shared USM is host- and device-readable through the same
-  // virtual address. CUDA -> cudaMallocManaged, ROCm -> hipMallocManaged,
-  // SYCL -> sycl::malloc_shared. All three give us a pointer the CPU can
-  // call GpuCacheUpsert*/Remove* through directly.
-  void *region = ctp::GpuApi::MallocManaged<char>(needed);
-  if (!region) {
-    HLOG(kError,
-         "GpuMetadataCache: MallocManaged({} bytes) failed", needed);
-    gpu_cache_ = nullptr;
-    gpu_cache_bytes_ = 0;
-    return false;
-  }
-  std::memset(region, 0, needed);
-  gpu_cache_ = reinterpret_cast<GpuMetadataCacheHeader *>(region);
-  gpu_cache_bytes_ = needed;
-  gpu_cache_->Init(max_tags, max_blobs, needed);
-  HLOG(kInfo,
-       "GpuMetadataCache: allocated {} bytes (max_tags={}, max_blobs={}) "
-       "at {}",
-       needed, max_tags, max_blobs, static_cast<void *>(gpu_cache_));
-  return true;
-#endif
-}
-
-void Runtime::GpuCacheDestroy() {
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-  if (gpu_cache_ != nullptr) {
-    ctp::GpuApi::Free(reinterpret_cast<char *>(gpu_cache_));
-    gpu_cache_ = nullptr;
-    gpu_cache_bytes_ = 0;
-  }
-#else
-  gpu_cache_ = nullptr;
-  gpu_cache_bytes_ = 0;
-#endif
-}
-
-void Runtime::GpuCacheOnPutBlob(const TagId &tag_id,
-                                const std::string &blob_name,
-                                const BlobInfo &blob_info) {
-  if (gpu_cache_ == nullptr) return;
-  std::string bdev_type = GetBdevTypeForBlob(blob_info);
-  clio::run::u32 sc = gpu_cache::BdevTypeToStorageClass(bdev_type.c_str());
-  clio::run::u64 size = blob_info.GetTotalSize();
-  float score = blob_info.score_;
-  if (gpu_cache::IsGpuVisible(sc)) {
-    GpuCacheUpsertBlob(gpu_cache_, tag_id.major_, tag_id.minor_,
-                       blob_name.c_str(), size, score, sc);
-  } else {
-    GpuCacheRemoveBlob(gpu_cache_, tag_id.major_, tag_id.minor_,
-                       blob_name.c_str());
-  }
-}
-
-std::string Runtime::GetBdevTypeForBlob(const BlobInfo &blob_info) {
-  // Empty-blob (no blocks placed yet) -> nothing the GPU can reach.
-  if (blob_info.blocks_.empty()) return std::string();
-
-  // Resolve the bdev_type from the TargetInfo recorded at RegisterTarget
-  // time. This is the source of truth for any target — both YAML-composed
-  // ones AND those registered programmatically by tests / external code.
-  const auto &first_block = blob_info.blocks_[0];
-  clio::run::ScopedCoRwReadLock lock(target_lock_);
-  TargetInfo *target_info =
-      registered_targets_.find(first_block.bdev_client_.pool_id_);
-  if (!target_info) return std::string();
-  switch (target_info->bdev_type_) {
-    case clio::run::bdev::BdevType::kRam:    return std::string("ram");
-    case clio::run::bdev::BdevType::kHbm:    return std::string("hbm");
-    case clio::run::bdev::BdevType::kPinned: return std::string("pinned");
-    case clio::run::bdev::BdevType::kFile:   return std::string("file");
-    case clio::run::bdev::BdevType::kNoop:   return std::string("noop");
-    default:                                return std::string();
-  }
-}
-
-void Runtime::GpuCacheOnDelBlob(const TagId &tag_id,
-                                const std::string &blob_name) {
-  if (gpu_cache_ == nullptr) return;
-  GpuCacheRemoveBlob(gpu_cache_, tag_id.major_, tag_id.minor_,
-                     blob_name.c_str());
-}
-
-void Runtime::GpuCacheOnGetOrCreateTag(const TagId &tag_id,
-                                       const std::string &tag_name) {
-  if (gpu_cache_ == nullptr) return;
-  GpuCacheUpsertTag(gpu_cache_, tag_id.major_, tag_id.minor_,
-                    tag_name.c_str());
-}
-
-void Runtime::GpuCacheOnDelTag(const TagId &tag_id) {
-  if (gpu_cache_ == nullptr) return;
-  GpuCacheRemoveTag(gpu_cache_, tag_id.major_, tag_id.minor_);
 }
 
 }  // namespace clio::cte::core
