@@ -690,6 +690,25 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     fa.fsync_on_flush = 1;
   }
 
+  /* A read-only open has nothing to gain from the cache tier, so do not attach
+     one. The tier is write-populated and not yet served on reads:
+     H5FD__clio_do_read goes to the authoritative descriptor unconditionally,
+     and H5FD__clio_do_write -- the only writer -- cannot run on a file HDF5
+     opened without H5F_ACC_RDWR. The handle would therefore be opened, never
+     used, and closed.
+     It is not free: the attach waits on a CFS Open task here and close() waits
+     on a Close, so a read-only open/close cycle pays two blocking round trips --
+     and the open one is serviced by Runtime::Open, which for an open without
+     O_CREAT awaits a TagQuery and then a GetTagSize inside the runtime. A
+     workload that opens and closes files in a loop spends its entire time there:
+     netCDF-C's nc_test4/tst_files4 does 32768 read-only open/close cycles, i.e.
+     ~66k client round trips for a tier no byte is ever read from.
+     Decided before the H5FD__clio_cache_available() probe below so a read-only
+     open also skips the runtime attach and its retry timeout. */
+  if (fa.cache_enabled && !(H5F_ACC_RDWR & flags)) {
+    fa.cache_enabled = 0;
+  }
+
   // Attach to the CLIO runtime ONLY when this file wants the cache tier: the
   // native file is authoritative, so the native-only configuration is a
   // complete driver on its own and must not require CLIO to be running.
