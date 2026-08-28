@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -2471,6 +2472,76 @@ void IpcManager::ClearClientPool() {
   client_pool_.clear();
 }
 
+// CLIO_NET_QPROF=1: how long a task sits on a net_queue_ priority lane between
+// EnqueueNetTask and the net worker popping it. This is queue+wakeup latency
+// only -- serialization and the wire are measured separately by CLIO_NET_TRACE.
+// Exact when at most one task per priority is outstanding (the synchronous
+// request/response pattern the collective benchmark drives); under concurrency
+// it reads as "age of the most recent push", which still bounds the wait.
+namespace netqprof {
+static std::atomic<uint64_t> push_ns[kNetQueueNumPriorities];
+static std::atomic<uint64_t> wait_sum_ns[kNetQueueNumPriorities];
+static std::atomic<uint64_t> wait_max_ns[kNetQueueNumPriorities];
+static std::atomic<uint64_t> wait_n[kNetQueueNumPriorities];
+static std::atomic<uint64_t> dump_n{0};
+inline bool On() {
+  static bool on = [] {
+    const char *e = std::getenv("CLIO_NET_QPROF");
+    return e != nullptr && *e != '\0' && *e != '0';
+  }();
+  return on;
+}
+inline uint64_t NowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+// Server-side residency: RecvIn (a peer's task lands here) -> the moment its
+// response is handed to the send queue. Everything the receiving node spends on
+// somebody else's task: lane push, worker wakeup, execute, EndTask. Keyed by
+// the originating node + its task id so concurrent inbound tasks don't collide.
+static std::mutex life_mu;
+static std::unordered_map<uint64_t, uint64_t> life_start;
+static std::atomic<uint64_t> life_sum_ns{0};
+static std::atomic<uint64_t> life_max_ns{0};
+static std::atomic<uint64_t> life_n{0};
+inline uint64_t LifeKey(u32 node_id, u32 unique, size_t net_key) {
+  return (static_cast<uint64_t>(node_id) << 56) ^
+         (static_cast<uint64_t>(unique) << 24) ^
+         static_cast<uint64_t>(net_key);
+}
+inline void Dump() {
+  uint64_t c = dump_n.fetch_add(1) + 1;
+  if (c % 256 != 0) return;
+  {
+    uint64_t ln = life_n.load();
+    if (ln > 0) {
+      HLOG(kInfo, "[NETQPROF] server_residency n={} mean={}us max={}us", ln,
+           life_sum_ns.load() / 1000 / ln, life_max_ns.load() / 1000);
+    }
+  }
+  static const char *names[kNetQueueNumPriorities] = {
+      "sendin_lat", "sendin_io", "sendout_lat",
+      "sendout_io", "cli_tcp",   "cli_ipc"};
+  for (u32 i = 0; i < kNetQueueNumPriorities; ++i) {
+    uint64_t n = wait_n[i].load();
+    if (n == 0) continue;
+    HLOG(kInfo, "[NETQPROF] {} n={} mean_wait={}us max_wait={}us", names[i], n,
+         wait_sum_ns[i].load() / 1000 / n, wait_max_ns[i].load() / 1000);
+  }
+}
+}  // namespace netqprof
+
+void IpcManager::NetProfMarkRecvIn(const clio::run::shared_ptr<Task> &task) {
+  if (!netqprof::On() || task.IsNull()) return;
+  uint64_t key = netqprof::LifeKey(task->task_id_.node_id_,
+                                   task->task_id_.unique_,
+                                   task->task_id_.net_key_);
+  std::lock_guard<std::mutex> lk(netqprof::life_mu);
+  netqprof::life_start[key] = netqprof::NowNs();
+}
+
 void IpcManager::EnqueueNetTask(Future<Task> future,
                                 NetQueuePriority priority) {
   if (net_queue_.IsNull()) {
@@ -2482,6 +2553,36 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
   bool was_empty = lane.Empty();
+  if (netqprof::On()) {
+    netqprof::push_ns[priority_idx].store(netqprof::NowNs(),
+                                          std::memory_order_relaxed);
+    if (priority == NetQueuePriority::kSendOutLatency ||
+        priority == NetQueuePriority::kSendOutIO) {
+      auto t = future.GetTaskPtr();
+      if (!t.IsNull()) {
+        uint64_t key = netqprof::LifeKey(t->task_id_.node_id_,
+                                         t->task_id_.unique_,
+                                         t->task_id_.net_key_);
+        uint64_t started = 0;
+        {
+          std::lock_guard<std::mutex> lk(netqprof::life_mu);
+          auto it = netqprof::life_start.find(key);
+          if (it != netqprof::life_start.end()) {
+            started = it->second;
+            netqprof::life_start.erase(it);
+          }
+        }
+        if (started != 0) {
+          uint64_t d = netqprof::NowNs() - started;
+          netqprof::life_sum_ns += d;
+          netqprof::life_n++;
+          uint64_t cur = netqprof::life_max_ns.load();
+          while (d > cur &&
+                 !netqprof::life_max_ns.compare_exchange_weak(cur, d)) {}
+        }
+      }
+    }
+  }
   lane.Push(future);
 
   // Pick the worker that drains this priority's queue. Cross-node Send
@@ -2537,6 +2638,19 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
   auto &lane = net_queue_->GetLane(0, priority_idx);
 
   if (lane.Pop(future)) {
+    if (netqprof::On()) {
+      uint64_t pushed =
+          netqprof::push_ns[priority_idx].load(std::memory_order_relaxed);
+      if (pushed != 0) {
+        uint64_t w = netqprof::NowNs() - pushed;
+        netqprof::wait_sum_ns[priority_idx] += w;
+        netqprof::wait_n[priority_idx]++;
+        uint64_t cur = netqprof::wait_max_ns[priority_idx].load();
+        while (w > cur &&
+               !netqprof::wait_max_ns[priority_idx].compare_exchange_weak(cur, w)) {}
+        netqprof::Dump();
+      }
+    }
     return true;
   }
 
@@ -4044,19 +4158,35 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     return RouteResult::Dne;
   }
 
-  // Check if task has already been routed - if so, return ExecHere
-  if (task_ptr->IsRouted()) {
-    return RouteResult::ExecHere;
-  }
-
   // Collective (ManyToOne / AllToOne) routing is handled before the normal
   // resolve path: forward to the neighborhood leader, or park into the batch
   // manager if we are the leader. Both modes share this routing; they differ
   // only in the BatchManager flush condition (time window vs. all-containers
   // barrier). (The aggregate task the leader later runs is a plain Local task
   // and does not re-enter this branch.)
+  //
+  // This MUST come before the IsRouted() early-return below. A member submitted
+  // on a non-leader node is forwarded here over the network, and RecvIn marks
+  // EVERY net-received task routed before handing it to a worker. With the
+  // early-return first, such a member never reached the BatchManager: it ran
+  // standalone on the leader and returned its own un-combined result, while the
+  // leader-local member sat in a group whose count could never reach the pool's
+  // container count. So a collective whose members did not all originate on the
+  // leader node silently did not happen -- an AllReduce returned each caller's
+  // own value with rc=0, and any leader-local member hung forever. Collectives
+  // only worked when every member was submitted on the leader, which is exactly
+  // the case the single-client alltoone test covers.
+  //
+  // Re-entry is bounded: on the leader this parks the task (it is never routed
+  // again), and the aggregate it later builds carries PoolQuery::Local(), so it
+  // does not match IsCollectiveMode().
   if (task_ptr->pool_query_.IsCollectiveMode()) {
     return RouteManyToOne(future);
+  }
+
+  // Check if task has already been routed - if so, return ExecHere
+  if (task_ptr->IsRouted()) {
+    return RouteResult::ExecHere;
   }
 
   // Only call ScheduleTask for Dynamic pool queries.
