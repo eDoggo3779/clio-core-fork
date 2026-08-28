@@ -757,44 +757,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   // If this is a restart, restore metadata from the persistent log
   if (is_restart_) {
-    // TEMPORARY DIAGNOSTIC (macOS cte_replication_persist_integration).
-    // Everything upstream is eliminated by measurement: the snapshot is
-    // written completely (50/50 blobs, replicas=1, identical order every
-    // run), the type-3 serializer and its reader agree field-for-field, and
-    // [FLUSH-SKIP]/[RESTORE-DROP]/[RESTORE-ORPHAN] never fire. Yet exactly
-    // one blob -- a DIFFERENT one each run -- answers rc=1 for replica 1
-    // afterwards. Since ResolveReplicaSel only reports absent when the blob
-    // carries no non-cache slot, dump each blob's replica vector at BOTH
-    // restore stages: whichever stage first shows an empty replicas_ owns
-    // the bug, and the flags tell a cache slot from a disk one.
-    auto _diag_census = [this](const char *when) {
-      size_t blobs = 0, no_rep = 0;
-      tag_blob_name_to_info_.for_each(
-          [&](const std::string &key,
-              const std::shared_ptr<BlobInfo> &blob_info_sp) {
-            if (!blob_info_sp) return;
-            ++blobs;
-            if (blob_info_sp->replicas_.empty()) {
-              ++no_rep;
-              HLOG(kWarning, "[CENSUS-{}] blob='{}' NO REPLICAS blocks={}",
-                   when, key, blob_info_sp->blocks_.size());
-              return;
-            }
-            for (size_t i = 0; i < blob_info_sp->replicas_.size(); ++i) {
-              const Replica &r = blob_info_sp->replicas_[i];
-              HLOG(kWarning,
-                   "[CENSUS-{}] blob='{}' rep#{} flags={} blocks={} size={}",
-                   when, key, i + 1, r.flags_, r.blocks_.size(),
-                   static_cast<unsigned long long>(r.total_size_cache_));
-            }
-          });
-      HLOG(kWarning, "[CENSUS-{}] blobs={} without_replicas={}", when, blobs,
-           no_rep);
-    };
     RestoreMetadataFromLog();
-    _diag_census("SNAP");
     ReplayTransactionLogs();
-    _diag_census("WAL");
     // Both paths populate the tag table directly (bypassing GetOrAssignTagId's
     // per-insert indexing), so rebuild the regex search index once from the
     // final tag set (#598).
@@ -5192,7 +5156,6 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     });
 
     // Write BlobInfo entries (entry_type 2; see below)
-    unsigned long long _diag_t3_written = 0;
     // Serialize each blob while HOLDING its write token.
     //
     // Draining the tokens before the scan was not enough: a PutBlobImpl that
@@ -5298,31 +5261,9 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       // records being truncated are the only other place these layouts live.
       // Empty replicas are skipped; they hold nothing to restore and are
       // recreated lazily by the next replica write.
-      // TEMPORARY DIAGNOSTIC (macOS cte_replication_persist_integration).
-      // [FLUSH-SKIP] fired ZERO times while the test still reported
-      // "blob N replica lost", so the serializer never skipped a replica --
-      // the staging-window theory is dead. The next question is whether the
-      // replica is in replicas_ at snapshot time at all. Log the count and
-      // each replica's shape for every blob written.
-      HLOG(kWarning, "[FLUSH-BLOB] key='{}' replicas={} primary_blocks={}",
-           key, blob_info.replicas_.size(), blob_info.blocks_.size());
       for (size_t rep_i = 0; rep_i < blob_info.replicas_.size(); ++rep_i) {
         const Replica &rep = blob_info.replicas_[rep_i];
         if (rep.blocks_.empty()) {
-          // Say so. This skip is the suspected mechanism behind
-          // "blob N replica lost! size=0 rc=1" after a reboot: a replica whose
-          // blocks_ are on loan to a staging BlobInfo looks empty here and is
-          // omitted from the snapshot entirely. Logging the blob, the replica
-          // index, its cached size and the write-token owner distinguishes
-          // "genuinely empty" (size 0, no owner) from "mid-staging" (owner set,
-          // or a nonzero size cache) without needing a macOS runner in hand.
-          ctp::ipc::atomic_ref<clio::run::u64> _own(blob_info.write_owner_);
-          HLOG(kWarning,
-               "[FLUSH-SKIP] blob='{}' replica#{} blocks=0 size_cache={} "
-               "write_owner={}",
-               key, rep_i + 1,
-               static_cast<unsigned long long>(rep.total_size_cache_),
-               static_cast<unsigned long long>(_own.load()));
           continue;
         }
         uint8_t rep_entry_type = 3;
@@ -5366,15 +5307,10 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
           ofs.write(reinterpret_cast<const char *>(&size), sizeof(size));
         }
         task->entries_flushed_++;
-        ++_diag_t3_written;
       }
     }
 
     ofs.close();
-    // TEMPORARY: pairs with [RESTORE-T3] so a write/read count mismatch is
-    // visible without a macOS runner in hand.
-    HLOG(kWarning, "[FLUSH-T3] wrote {} type-3 replica entries",
-         _diag_t3_written);
 
     // WAL: sync and compact transaction logs after snapshot
     if (!blob_txn_logs_.empty()) {
@@ -5643,7 +5579,6 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
 }
 
 void Runtime::RestoreMetadataFromLog() {
-  unsigned long long _diag_t3_read = 0;
   const std::string &log_path = config_.performance_.metadata_log_path_;
   if (log_path.empty()) {
     HLOG(kInfo, "RestoreMetadataFromLog: No metadata log path configured");
@@ -5802,7 +5737,6 @@ void Runtime::RestoreMetadataFromLog() {
       blobs_restored++;
 
     } else if (entry_type == 3) {
-      ++_diag_t3_read;
       // Replica layout (issue #886), attached to the blob whose type-2 record
       // FlushMetadata wrote just before it. Same volatile-block filter as the
       // primary restore.
@@ -5835,20 +5769,6 @@ void Runtime::RestoreMetadataFromLog() {
       std::shared_ptr<BlobInfo> blob_info_ptr =
           tag_blob_name_to_info_.get(composite_key);
       Replica *rep = nullptr;
-      // TEMPORARY DIAGNOSTIC (macOS cte_replication_persist_integration).
-      // Everything upstream is now eliminated by measurement: the census
-      // showed 150/150 blobs with replicas=1 at snapshot time, [FLUSH-SKIP]
-      // never fired, and [RESTORE-DROP] never fired -- so the replica is
-      // written to the log and is not discarded as volatile. What is left is
-      // reading it back. A type-3 entry attaches to the BlobInfo its
-      // preceding type-2 record inserted; if that lookup misses, the replica
-      // is dropped here in SILENCE.
-      if (!blob_info_ptr || rep_idx == 0) {
-        HLOG(kWarning,
-             "[RESTORE-ORPHAN] type-3 entry with no blob to attach to: "
-             "key='{}' rep_idx={} have_blob={} num_blocks={}",
-             composite_key, rep_idx, blob_info_ptr ? 1 : 0, num_blocks);
-      }
       if (blob_info_ptr && rep_idx > 0) {
         rep = blob_info_ptr->GetReplica(static_cast<int>(rep_idx),
                                         /*create=*/true);
@@ -5887,17 +5807,6 @@ void Runtime::RestoreMetadataFromLog() {
           }
         }
         if (is_volatile) {
-          // TEMPORARY DIAGNOSTIC (macOS cte_replication_persist_integration).
-          // The census proved every blob had replicas=1 at snapshot time and
-          // none was skipped, so the replica IS in the log and the loss is on
-          // THIS side. This is the only place a restored replica block is
-          // discarded. If the lost blob appears here, its replica was placed
-          // on a VOLATILE target rather than the disk tier the test asked for
-          // -- a placement bug, with restore correctly reacting to it.
-          HLOG(kWarning,
-               "[RESTORE-DROP] volatile replica key='{}' rep_idx={} "
-               "bdev=({}.{})",
-               composite_key, rep_idx, bdev_major, bdev_minor);
           continue;  // Volatile data is lost on restart
         }
 
@@ -5915,7 +5824,6 @@ void Runtime::RestoreMetadataFromLog() {
   }
 
   ifs.close();
-  HLOG(kWarning, "[RESTORE-T3] read {} type-3 replica entries", _diag_t3_read);
 
   // Update next_tag_id_minor_ to be past any restored tag IDs
   clio::run::u32 current_minor = next_tag_id_minor_.load();

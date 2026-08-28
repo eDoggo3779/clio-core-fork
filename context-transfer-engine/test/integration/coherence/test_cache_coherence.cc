@@ -112,10 +112,6 @@ bool Barrier(const clio::cte::core::TagId &tag_id) {
                        std::to_string(Rank());
     auto put = Chain()->AsyncPutBlob(tag_id, mine, 0, 1, &one);
     put.Wait();
-    fprintf(stderr, "[BARRIER-PUT] rank=%d epoch=%d name='%s' tag=(%u.%u) rc=%u%c",
-            Rank(), epoch, mine.c_str(), (unsigned)tag_id.major_,
-            (unsigned)tag_id.minor_, (unsigned)put->GetReturnCode(), 10);
-    fflush(stderr);
     if (put->GetReturnCode() != 0) {
       return false;
     }
