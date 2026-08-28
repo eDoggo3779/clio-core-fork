@@ -55,17 +55,38 @@
 
 #include "clio_runtime/runtime_probe.h"
 
+using clio::run::LiveRuntimePid;
 using clio::run::ProbeRuntime;
+using clio::run::RemoveRuntimePidRecord;
 using clio::run::RuntimePresence;
 using clio::run::RuntimeStartLock;
 using clio::run::TcpPortIsFree;
 using clio::run::u32;
+using clio::run::WriteRuntimePidRecord;
 
 namespace {
 
 // A port range no clio runtime uses, well above the defaults (9413 / 8080) and
 // the ports the sibling unit tests pin (10500).
 constexpr u32 kProbeBasePort = 24913;
+
+/**
+ * RAII pid record, standing in for a runtime that published itself on a port.
+ * The record is how a same-node peer discovers a runtime it should attach to
+ * rather than start a second one alongside.
+ */
+class PidRecord {
+ public:
+  PidRecord(u32 port, int pid) : port_(port) {
+    WriteRuntimePidRecord(port, pid);
+  }
+  ~PidRecord() { RemoveRuntimePidRecord(port_); }
+  PidRecord(const PidRecord &) = delete;
+  PidRecord &operator=(const PidRecord &) = delete;
+
+ private:
+  u32 port_;
+};
 
 #ifndef _WIN32
 /** A listening TCP socket standing in for "some other program on this port". */
@@ -183,6 +204,52 @@ TEST_CASE("RuntimeProbe - a port the runtime does not bind is ignored",
   ForeignListener squatter(base + 2);
   REQUIRE(squatter.bound());
   REQUIRE(ProbeRuntime(base, nullptr) == RuntimePresence::kNone);
+}
+#endif
+
+TEST_CASE("RuntimeProbe - a live runtime is found, so peers attach to it",
+          "[probe][1015]") {
+  // THE decision this issue turns on: a peer that finds a runtime already
+  // serving this port must report kRuntime, so CLIO_INIT attaches instead of
+  // running ServerInit a second time (which reaps the live runtime's segments).
+  // The multi-node proof is the docker/MPI suite; this pins the branch cheaply.
+  const u32 port = kProbeBasePort + 200;
+  const int self = static_cast<int>(ctp::SystemInfo::GetPid());
+  PidRecord record(port, self);
+
+  REQUIRE(LiveRuntimePid(port) == self);
+  int found = -1;
+  REQUIRE(ProbeRuntime(port, &found) == RuntimePresence::kRuntime);
+  REQUIRE(found == self);
+}
+
+TEST_CASE("RuntimeProbe - a dead runtime's leftover record is not attached to",
+          "[probe][1015]") {
+  // A record outlives a runtime that died without its teardown. Attaching to
+  // that corpse would hang the client on a response nothing can send, so a
+  // record whose pid is gone must read as "no runtime" and let us start one.
+  const u32 port = kProbeBasePort + 210;
+  // A pid far above any plausible pid_max: reliably absent, and unlike a
+  // recently-reaped pid it cannot be recycled under us mid-test.
+  PidRecord record(port, 0x7FFFFFFF);
+
+  REQUIRE(LiveRuntimePid(port) == -1);
+  REQUIRE(ProbeRuntime(port, nullptr) == RuntimePresence::kNone);
+}
+
+#ifndef _WIN32
+TEST_CASE("RuntimeProbe - a live runtime outranks its own busy ports",
+          "[probe][1015]") {
+  // Precedence matters: a running runtime's ports ARE busy, so testing ports
+  // first would classify every healthy runtime as a foreign squatter and refuse
+  // to attach. The runtime lookup has to win.
+  const u32 port = kProbeBasePort + 220;
+  PidRecord record(port, static_cast<int>(ctp::SystemInfo::GetPid()));
+  ForeignListener occupied(port);
+  REQUIRE(occupied.bound());
+  REQUIRE_FALSE(TcpPortIsFree(port));
+
+  REQUIRE(ProbeRuntime(port, nullptr) == RuntimePresence::kRuntime);
 }
 #endif
 
