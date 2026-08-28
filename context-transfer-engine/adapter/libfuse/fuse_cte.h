@@ -538,6 +538,11 @@ int cte_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                      cte_off_t offset, struct fuse_file_info *fi,
                      enum fuse_readdir_flags flags);
 int cte_fuse_link(const char *from, const char *to);
+
+/** Mark that a real FUSE mount is serving requests. Must be called before
+ *  fuse_main()/fuse_session_loop(); until it is, kernel-cache invalidation is
+ *  skipped because fuse_get_context() is undefined outside a request. */
+void cte_fuse_mark_session_live();
 #endif  // !_WIN32
 #endif  // CLIO_CTE_FUSE_ENABLED
 
