@@ -1230,6 +1230,13 @@ class IpcManager {
    * @param priority Network queue priority (see NetQueuePriority for
    *                 the latency-vs-IO lane split).
    */
+  /**
+   * CLIO_NET_QPROF: mark the arrival of a peer's task on this node, so the
+   * server-side residency (arrival -> response enqueued) can be attributed.
+   * A no-op unless profiling is enabled.
+   */
+  void NetProfMarkRecvIn(const clio::run::shared_ptr<Task> &task);
+
   void EnqueueNetTask(Future<Task> future, NetQueuePriority priority);
 
   /**
