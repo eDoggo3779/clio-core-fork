@@ -139,6 +139,21 @@ struct clio_dataset_t {
      object-open / wrap paths), so we never key a blob by an empty/ambiguous
      name. */
   bool cacheable;
+  /* Memo of ONE fact this handle established: the tier holds nothing for this
+     dataset. chunk_0 is the hit-test key, so its absence is the whole state.
+     Set by a successful invalidation or by a hit test that came back empty;
+     cleared the instant anything is staged.
+
+     It exists because netCDF-4 -- and any application that writes through a
+     hyperslab -- never takes the whole-dataset path. Every nc_put_vara lands in
+     the partial branch of clio_dataset_write, which invalidates; every
+     nc_get_vara lands in clio_serve_selection, which hit-tests. Both are
+     BLOCKING runtime round trips, and both were re-issued per transfer forever,
+     asking a question already answered: after the first invalidation there is
+     nothing left to delete and nothing left to find. On the netCDF-C suite that
+     is one round trip per element-space transfer -- tens of thousands per test
+     -- for a tier that cannot be used by such a workload at all. */
+  bool image_known_absent = false;
   /* Pending async writes flushed on close */
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
@@ -542,6 +557,11 @@ static bool clio_cache_env_enabled() {
    uncacheable for the rest of the session, which is the fail-closed choice. */
 static void clio_invalidate_dataset(clio_dataset_t *dset) {
   if (!dset || !dset->file || !dset->cacheable) return;
+  /* Nothing staged, nothing to invalidate -- and we know that without asking,
+     because this handle is what emptied it. Skipping the round trip here is the
+     difference between one blocking RPC per hyperslab write and one per
+     dataset. See image_known_absent. */
+  if (dset->image_known_absent) return;
   /* Tell the telemetry the staged bytes are gone BEFORE dropping them.
      Everything staged for this dataset is about to stop being servable, so
      leaving it counted would inflate the admission denominator with data that
@@ -572,7 +592,11 @@ static void clio_invalidate_dataset(clio_dataset_t *dset) {
             "the cache for this dataset (native file is authoritative)\n",
             dset->dataset_path.c_str(), rc);
     dset->cacheable = false;
+    return;
   }
+  /* The hit-test key is gone and this handle is the one that removed it, so the
+     next invalidation and the next hit test both already have their answer. */
+  dset->image_known_absent = true;
 }
 
 /* ========================================================================
@@ -1893,6 +1917,11 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       dataset->pending_puts.push_back(std::move(future));
       dataset->pending_buffers.push_back(std::move(buffer));
       staged_bytes += this_size;
+      /* A put is in flight for chunk_0, so "the tier holds nothing" has stopped
+         being true. Cleared on submission rather than on completion: the memo
+         may only ever skip work whose answer is certain, and from here on it
+         is not. */
+      if (i == 0) dataset->image_known_absent = false;
     }
 
     /* Write to the native VOL -- the authoritative store. Its status is this
@@ -1948,11 +1977,21 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
 /* True when the dataset's linear chunk cache is populated (a fully-staged cache
    always has a non-empty chunk_0, the hit-test key). */
 static bool clio_cache_populated(clio_dataset_t *dataset) {
+  /* Answered from the memo when this handle already knows the tier is empty for
+     this dataset -- the case for every read of a dataset written through a
+     hyperslab, which is every netCDF-4 read. Without this, a serve-only
+     selection read pays a blocking round trip to be told "miss" on every single
+     H5Dread for the whole life of the file. See image_known_absent. */
+  if (dataset->image_known_absent) return false;
   auto *cte_client = get_cte_client();
   auto sz = cte_client->AsyncGetBlobSize(dataset->file->tag_id,
                                          dataset->dataset_path + "/chunk_0");
   sz.Wait();
-  return sz->size_ > 0;
+  if (sz->size_ > 0) return true;
+  /* A miss is knowledge too, and it is the same fact the invalidate path
+     records: chunk_0 is not there. */
+  dataset->image_known_absent = true;
+  return false;
 }
 
 /* Reassemble the full linear dataset image from its CTE chunk blobs into dst
@@ -2261,21 +2300,17 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     size_t num_chunks = (total_size + chunk_size - 1) / chunk_size;
     char *dst = static_cast<char *>(buf[d]);
 
-    /* Hit test: a fully-populated cache always has a non-empty chunk_0. */
-    clio::run::u64 cached = 0;
-    {
-      auto sz = cte_client->AsyncGetBlobSize(
-          dataset->file->tag_id, dataset->dataset_path + "/chunk_0");
-      sz.Wait();
-      cached = sz->size_;
-    }
+    /* Hit test: a fully-populated cache always has a non-empty chunk_0. Routed
+       through clio_cache_populated so the whole-read path shares the selection
+       path's memo of an empty tier rather than re-asking the runtime. */
+    const bool cached = clio_cache_populated(dataset);
 
     /* What the trace should say this read was served by. A hit that fails to
        reassemble falls back to native below and must not be recorded as a
        cache serve. */
-    bool served_cache = (cached != 0);
+    bool served_cache = cached;
 
-    if (cached == 0) {
+    if (!cached) {
       /* MISS — native read is the source of truth, then stage into the tier. */
       herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                                    dataset->obj.under_vol_id,
@@ -2333,6 +2368,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
         } else {
           read_staged_bytes += this_size;
           clio_tier_mark_accepting();
+          /* chunk_0 landed: the tier is no longer known-empty for this
+             dataset. See the write path's matching line. */
+          if (i == 0) dataset->image_known_absent = false;
         }
       }
       /* Report before any invalidation below, so the discard has something to
