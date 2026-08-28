@@ -178,3 +178,4 @@ demologs/
 # next person one `git add -A` away from committing it.
 .hdf5-serial/
 .hdf5-install/
+run_tests.lf.sh
