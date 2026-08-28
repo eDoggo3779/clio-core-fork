@@ -757,8 +757,44 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   // If this is a restart, restore metadata from the persistent log
   if (is_restart_) {
+    // TEMPORARY DIAGNOSTIC (macOS cte_replication_persist_integration).
+    // Everything upstream is eliminated by measurement: the snapshot is
+    // written completely (50/50 blobs, replicas=1, identical order every
+    // run), the type-3 serializer and its reader agree field-for-field, and
+    // [FLUSH-SKIP]/[RESTORE-DROP]/[RESTORE-ORPHAN] never fire. Yet exactly
+    // one blob -- a DIFFERENT one each run -- answers rc=1 for replica 1
+    // afterwards. Since ResolveReplicaSel only reports absent when the blob
+    // carries no non-cache slot, dump each blob's replica vector at BOTH
+    // restore stages: whichever stage first shows an empty replicas_ owns
+    // the bug, and the flags tell a cache slot from a disk one.
+    auto _diag_census = [this](const char *when) {
+      size_t blobs = 0, no_rep = 0;
+      tag_blob_name_to_info_.for_each(
+          [&](const std::string &key,
+              const std::shared_ptr<BlobInfo> &blob_info_sp) {
+            if (!blob_info_sp) return;
+            ++blobs;
+            if (blob_info_sp->replicas_.empty()) {
+              ++no_rep;
+              HLOG(kWarning, "[CENSUS-{}] blob='{}' NO REPLICAS blocks={}",
+                   when, key, blob_info_sp->blocks_.size());
+              return;
+            }
+            for (size_t i = 0; i < blob_info_sp->replicas_.size(); ++i) {
+              const Replica &r = blob_info_sp->replicas_[i];
+              HLOG(kWarning,
+                   "[CENSUS-{}] blob='{}' rep#{} flags={} blocks={} size={}",
+                   when, key, i + 1, r.flags_, r.blocks_.size(),
+                   static_cast<unsigned long long>(r.total_size_cache_));
+            }
+          });
+      HLOG(kWarning, "[CENSUS-{}] blobs={} without_replicas={}", when, blobs,
+           no_rep);
+    };
     RestoreMetadataFromLog();
+    _diag_census("SNAP");
     ReplayTransactionLogs();
+    _diag_census("WAL");
     // Both paths populate the tag table directly (bypassing GetOrAssignTagId's
     // per-insert indexing), so rebuild the regex search index once from the
     // final tag set (#598).
