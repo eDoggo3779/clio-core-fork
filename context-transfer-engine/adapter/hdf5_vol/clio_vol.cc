@@ -103,6 +103,23 @@ struct clio_file_t {
      is always a correct (if unaccelerated) mode -- the native file is
      authoritative regardless. */
   bool cache_enabled = true;
+  /* Lazy tag binding.
+     The CTE tag and its coherence stamp are needed by exactly one thing: code
+     that touches the tier. Resolving them in clio_make_file charged the cost to
+     H5Fopen instead -- a GetOrCreateTag plus the stamp's GetBlobSize and
+     GetBlob, all blocking, and a DelTag/GetOrCreateTag pair when the stamp does
+     not match, with a stamp PutBlob at close to answer. A file the application
+     opens and closes without a single cacheable transfer paid all of it for
+     nothing, and netCDF-4 metadata-only opens are exactly that shape:
+     nc_test4/tst_files4 opens and closes one file 32768 times, reading only
+     attributes and dataspaces.
+     tag_bound is the gate; tag_bind_failed stops a failed bind being retried
+     per transfer. opened_truncated remembers what clio_make_file knew about the
+     native open, because the bind has to make the same "any pre-existing tag is
+     stale" decision later. See clio_file_bind_tag. */
+  bool tag_bound = false;
+  bool tag_bind_failed = false;
+  bool opened_truncated = false;
   /* Safe mode: cacheable datasets currently open in this file. H5Fflush and
      H5Fclose drain their pending CTE puts so no async write outlives a
      successful flush/close (the native file is already written synchronously and
@@ -485,11 +502,21 @@ static clio::cte::core::Client *get_cte_client() {
   return attached ? CLIO_CTE_CLIENT : nullptr;
 }
 
-/* Is the CTE cache path usable for this file at all? One check for the two
-   independent reasons it may not be: the user turned it off, or the runtime is
-   not there. */
+/* Bind this file's CTE tag and verify its coherence stamp, at most once, on the
+   first access that actually needs the tier. Defined further down, next to the
+   stamp helpers it uses. */
+static bool clio_file_bind_tag(clio_file_t *file);
+
+/* Is the CTE cache path usable for this file at all? One check for the three
+   independent reasons it may not be: the user turned it off, the runtime is not
+   there, or this file has no tag and could not be given one.
+
+   This is also where the tag gets bound: it is the single door every tier
+   access goes through, so a caller cannot reach a blob with an unbound tag and
+   cannot forget to bind one. */
 static bool clio_cache_usable(clio_file_t *file) {
-  return file && file->cache_enabled && get_cte_client() != nullptr;
+  return file && file->cache_enabled && get_cte_client() != nullptr &&
+         clio_file_bind_tag(file);
 }
 
 /* ------------------------------------------------------------------ admission
@@ -557,6 +584,11 @@ static bool clio_cache_env_enabled() {
    uncacheable for the rest of the session, which is the fail-closed choice. */
 static void clio_invalidate_dataset(clio_dataset_t *dset) {
   if (!dset || !dset->file || !dset->cacheable) return;
+  /* No tag was ever bound for this file, so nothing can be staged under one.
+     Deliberately does NOT bind one: invalidation is reached from the
+     native-only branch of every partial write, and binding there would put the
+     open-time tag cost back on the first hyperslab write of every file. */
+  if (!dset->file->tag_bound) return;
   /* Nothing staged, nothing to invalidate -- and we know that without asking,
      because this handle is what emptied it. Skipping the round trip here is the
      difference between one blocking RPC per hyperslab write and one per
@@ -1136,6 +1168,7 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   file->file_name = name;
   file->chunk_size = chunk_size;
   file->cache_enabled = cache_enabled;
+  file->opened_truncated = truncated;
   file->trace = clio::trace::open_file(name);
 
   /* Refuse rather than degrade when the caller asked for that. Only when the
@@ -1165,7 +1198,45 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
     return file;
   }
 
-  const std::string tag_name = std::string("hdf5:") + name;
+  /* The tag is bound lazily, on the first access that needs the tier -- see
+     clio_file_bind_tag. The exception is CLIO_REQUIRE_RUNTIME, whose whole
+     contract is that a file which cannot use the tier fails to OPEN rather than
+     degrading quietly. A lazy bind can only report a tag failure by degrading
+     the transfer, which is the outcome that flag forbids, so that configuration
+     keeps the eager bind and the refusal that goes with it. */
+  if (clio::adapter::RequireRuntime() && !clio_file_bind_tag(file)) {
+    if (degrade_or_fail("tag create failed")) { refuse(); return nullptr; }
+    return file;
+  }
+  return file;
+}
+
+/* Bind the file's CTE tag and settle whether the tier may answer for it.
+ *
+ * Runs at most once per open. Everything here used to happen in clio_make_file,
+ * i.e. inside H5Fopen/H5Fcreate; it is four to six blocking round trips
+ * (GetOrCreateTag, the stamp's GetBlobSize and GetBlob, and a DelTag plus a
+ * second GetOrCreateTag when the stamp does not match), and nothing needs it
+ * until something actually reaches for a blob. A file opened only for its
+ * metadata never reaches for one.
+ *
+ * Returns false when the file has no usable tag; the caller then treats the
+ * transfer as uncacheable, which is the same answer it gets when the runtime
+ * was never there. */
+static bool clio_file_bind_tag(clio_file_t *file) {
+  if (file->tag_bound) return true;
+  /* One failure is enough: retrying per transfer would pay the round trips
+     again for a tag that is not coming. */
+  if (file->tag_bind_failed) return false;
+
+  auto *cte_client = get_cte_client();
+  if (!cte_client) {
+    file->tag_bind_failed = true;
+    return false;
+  }
+
+  const std::string tag_name = std::string("hdf5:") + file->file_name;
+  const bool truncated = file->opened_truncated;
   if (truncated) {
     auto del = cte_client->AsyncDelTag(tag_name);
     del.Wait();  /* absent tag is a harmless no-op */
@@ -1173,8 +1244,8 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
   tag_task.Wait();
   if (tag_task->GetReturnCode() != 0) {
-    if (degrade_or_fail("tag create failed")) { refuse(); return nullptr; }
-    return file;
+    file->tag_bind_failed = true;
+    return false;
   }
   file->tag_id = tag_task->tag_id_;
 
@@ -1189,7 +1260,8 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
      be stale. */
   const clio::trace::Stamp verdict =
       truncated ? clio::trace::Stamp::kAbsent
-                : clio_stamp_matches(cte_client, file->tag_id, name);
+                : clio_stamp_matches(cte_client, file->tag_id,
+                                     file->file_name.c_str());
   if (!truncated) clio::trace::record_stamp(file->trace, verdict);
   if (!truncated && verdict != clio::trace::Stamp::kMatched) {
     auto del = cte_client->AsyncDelTag(tag_name);
@@ -1197,12 +1269,13 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
     auto again = cte_client->AsyncGetOrCreateTag(tag_name);
     again.Wait();
     if (again->GetReturnCode() != 0) {
-      if (degrade_or_fail("tag re-create failed")) { refuse(); return nullptr; }
-      return file;
+      file->tag_bind_failed = true;
+      return false;
     }
     file->tag_id = again->tag_id_;
   }
-  return file;
+  file->tag_bound = true;
+  return true;
 }
 
 static void *clio_file_create(const char *name, unsigned flags,
@@ -1360,7 +1433,14 @@ static herr_t clio_file_close(void *obj, hid_t dxpl_id, void **req) {
      close -- if the native close failed we do not know what the file is, and
      leaving the stamp stale makes the next open fail closed, which is the
      answer we want. */
-  if (ret >= 0 && file->cache_enabled) {
+  /* file->tag_bound, not file->cache_enabled: with the tag bound lazily, a file
+     that never reached the tier has no tag to stamp -- and needs none. The
+     stamp only ever licenses a tag's contents to be trusted, and a stamp
+     written now would be describing an empty tag. If such a file WAS modified,
+     the stamp left by whichever open last wrote one no longer matches it, so
+     the next open drops the tag and fails closed. That is the same answer the
+     eager path produced, reached without a round trip per close. */
+  if (ret >= 0 && file->cache_enabled && file->tag_bound) {
     if (auto *cte_client = get_cte_client()) {
       clio_write_stamp(cte_client, file->tag_id, file->file_name.c_str(),
                        file->trace);
