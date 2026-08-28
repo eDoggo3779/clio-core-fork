@@ -5275,6 +5275,14 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       // records being truncated are the only other place these layouts live.
       // Empty replicas are skipped; they hold nothing to restore and are
       // recreated lazily by the next replica write.
+      // TEMPORARY DIAGNOSTIC (macOS cte_replication_persist_integration).
+      // [FLUSH-SKIP] fired ZERO times while the test still reported
+      // "blob N replica lost", so the serializer never skipped a replica --
+      // the staging-window theory is dead. The next question is whether the
+      // replica is in replicas_ at snapshot time at all. Log the count and
+      // each replica's shape for every blob written.
+      HLOG(kWarning, "[FLUSH-BLOB] key='{}' replicas={} primary_blocks={}",
+           key, blob_info.replicas_.size(), blob_info.blocks_.size());
       for (size_t rep_i = 0; rep_i < blob_info.replicas_.size(); ++rep_i) {
         const Replica &rep = blob_info.replicas_[rep_i];
         if (rep.blocks_.empty()) {
