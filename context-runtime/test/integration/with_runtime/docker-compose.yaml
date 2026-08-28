@@ -19,7 +19,7 @@ services:
     hostname: iowarp-wr-node1
     networks:
       wr-cluster:
-        ipv4_address: 172.31.7.10
+        ipv4_address: 172.31.8.10
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     tmpfs:
@@ -49,7 +49,7 @@ services:
     hostname: iowarp-wr-node2
     networks:
       wr-cluster:
-        ipv4_address: 172.31.7.11
+        ipv4_address: 172.31.8.11
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     tmpfs:
@@ -77,4 +77,4 @@ networks:
         # Unique to this stack. A step killed by `timeout-minutes` never reaches
         # its own teardown, so its network survives into the next step; sharing a
         # subnet would then let one stack's leak block an unrelated one.
-        - subnet: 172.31.7.0/24
+        - subnet: 172.31.8.0/24
