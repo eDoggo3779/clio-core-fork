@@ -5141,60 +5141,11 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     namespace fs = std::filesystem;
     fs::create_directories(fs::path(log_path).parent_path());
 
-    // Drain in-flight blob writes before snapshotting (macOS
-    // cte_replication_persist_integration, "blob N replica lost").
-    //
-    // A replica write LENDS the replica's layout to a staging BlobInfo:
-    //
-    //     staging.blocks_ = std::move(rep->blocks_);
-    //     rep->blocks_.clear();
-    //     rep->total_size_cache_ = 0;
-    //     ... CLIO_CO_AWAIT(ExtendBlob/ModifyExistingData) ...   <- suspends
-    //     rep->blocks_ = std::move(staging.blocks_);             <- republished
-    //
-    // so for the whole awaited window the LIVE replica has blocks_ empty. The
-    // serializer below skips exactly that ("Empty replicas are skipped"), so a
-    // snapshot landing in the window omits the replica entirely and the reboot
-    // reports size=0 rc=1 for it. One blob per run, index varying (22, 18, 17)
-    // -- 50 blobs give 50 chances to land in a narrow window.
-    //
-    // The read path already understands this state: the zeroed
-    // total_size_cache_ is what "the GetBlob replica torn-layout guard reads as
-    // mid-mutation". The snapshot writer had no equivalent guard and read the
-    // same state as "empty, nothing to persist".
-    //
-    // write_owner_ is non-zero for the entire staging window (it is held across
-    // those co_awaits), so it is exactly the signal to wait on. Bounded, so a
-    // stuck holder degrades to a loud failure instead of hanging the flush.
-    // Once drained, the exclusive for_each below keeps new writers out: a
-    // PutBlob must resolve its BlobInfo through the map, and the map is held in
-    // write mode for the scan.
-    {
-      constexpr int kMaxDrainPolls = 20000;  // ~200ms at the 10us poll default
-      int polls = 0;
-      bool busy = true;
-      while (busy && polls < kMaxDrainPolls) {
-        busy = false;
-        tag_blob_name_to_info_.for_each(
-            [&](const std::string &, const std::shared_ptr<BlobInfo> &b) {
-              if (busy || b == nullptr) return;
-              ctp::ipc::atomic_ref<clio::run::u64> own(b->write_owner_);
-              if (own.load() != 0) busy = true;
-            },
-            ctp::priv::ForEachLock::kShared);
-        if (!busy) break;
-        ++polls;
-        CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
-      }
-      if (busy) {
-        HLOG(kError,
-             "FlushMetadata: blob writes still in flight after {} polls; "
-             "refusing to snapshot a replica mid-staging (would silently drop "
-             "its layout)", polls);
-        task->return_code_ = 2;
-        CLIO_CO_RETURN;
-      }
-    }
+    // Cap on the per-blob write-token acquire below. At the 10us poll default
+    // this is ~2s per blob: long enough to outlast any real write, short
+    // enough that a stuck holder degrades to a loud warning instead of hanging
+    // the flush forever.
+    constexpr clio::run::u64 kFlushTokenMaxSpins = 200000;
 
     std::ofstream ofs(log_path, std::ios::binary | std::ios::trunc);
     if (!ofs.is_open()) {
@@ -5219,8 +5170,42 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     });
 
     // Write BlobInfo entries (entry_type 2; see below)
-    tag_blob_name_to_info_.for_each([&](const std::string &key,
-                                        const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
+    // Serialize each blob while HOLDING its write token.
+    //
+    // Draining the tokens before the scan was not enough: a PutBlobImpl that
+    // has already resolved its BlobInfo and is PARKED waiting for the token
+    // holds nothing, so the drain sees write_owner_ == 0, proceeds, and that
+    // task then takes the token and empties the replica mid-scan. Observing
+    // that the token is free is not the same as owning it.
+    //
+    // Collect the blobs under a shared scan (shared_ptr keeps each alive),
+    // then leave the map lock before awaiting anything -- holding a map lock
+    // across a co_await is what deadlocks the single worker.
+    std::vector<std::pair<std::string, std::shared_ptr<BlobInfo>>> blob_snap;
+    tag_blob_name_to_info_.for_each(
+        [&](const std::string &k, const std::shared_ptr<BlobInfo> &v) {
+          if (v != nullptr) blob_snap.emplace_back(k, v);
+        },
+        ctp::priv::ForEachLock::kShared);
+
+    for (auto &kv : blob_snap) {
+      const std::string &key = kv.first;
+      BlobInfo &blob_info = *kv.second;
+      // Same acquire pattern PutBlobImpl uses; reentrant and lost-wakeup-proof.
+      clio::run::u64 flush_tok = reinterpret_cast<clio::run::u64>(&kv);
+      clio::run::u64 spins = 0;
+      while (!blob_info.TryLockWrite(flush_tok)) {
+        if (++spins > kFlushTokenMaxSpins) { break; }
+        CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+      }
+      const bool have_tok = (spins <= kFlushTokenMaxSpins);
+      BlobWriteLockGuard flush_guard(&blob_info, have_tok ? flush_tok : 0);
+      if (!have_tok) {
+        HLOG(kError,
+             "FlushMetadata: could not take the write token for blob '{}' "
+             "after {} spins; its layout may be captured mid-staging", key,
+             spins);
+      }
       // Entry type 2 == blob record carrying transform_flags_ (issue #818);
       // type 3 additionally carries droppable_. A NEW type each time rather
       // than an extra field on the previous one, because this log has no
@@ -5337,7 +5322,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
         }
         task->entries_flushed_++;
       }
-    });
+    }
 
     ofs.close();
 
