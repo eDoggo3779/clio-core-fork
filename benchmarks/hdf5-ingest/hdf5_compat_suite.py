@@ -1562,6 +1562,27 @@ def _run_instant_reopen_check():
     return {"vol/instant_reopen": checks}
 
 
+def _dset_entry(summary, name):
+    """Look up a dataset in a telemetry summary by HDF5 name.
+
+    The summary keys a dataset by whatever name HDF5 handed the VOL callback,
+    and that is not stable across platforms: Linux records "m" while macOS
+    records "/m" for the very same root dataset. HDF5 treats the two as the
+    same object, so a check that hardcodes one spelling fails on the other --
+    which is exactly what made vol/telemetry and vol/bbox_fetch fail on every
+    macOS adapters run ("has datasets=['/m'], missing what the check asked for
+    (KeyError: 'm')") while Linux stayed green.
+
+    Accept either spelling rather than asserting a convention HDF5 does not
+    guarantee.
+    """
+    dsets = summary["datasets"]
+    for candidate in (name, "/" + name.lstrip("/"), name.lstrip("/")):
+        if candidate in dsets:
+            return dsets[candidate]
+    raise KeyError(name)
+
+
 def _summary_failure_detail(path, exc):
     """Say what the summary actually contained when a lookup into it failed.
 
@@ -1623,7 +1644,7 @@ def _run_bbox_fetch_check():
     detail = ""
     if summaries:
         try:
-            d = json.load(open(summaries[0]))["datasets"]["m"]
+            d = _dset_entry(json.load(open(summaries[0])), "m")
             served = d["read_served"]["cache"]
             fetched = d["bytes_fetched_from_tier"]
             whole_image_cost = served * image_bytes
@@ -1664,7 +1685,7 @@ def _run_trace_check():
     if summaries:
         try:
             s = json.load(open(summaries[0]))
-            d = s["datasets"]["m"]
+            d = _dset_entry(s, "m")
             hr = d["cache_hit_rate"]
             lay = d["layout"]
             fields_ok = (d["reads"] > 0 and d["writes"] > 0 and 0.0 <= hr <= 1.0
@@ -1700,7 +1721,7 @@ def _run_trace_check():
             s = json.load(open(summaries[0]))
             recs = [json.loads(l) for l in open(jsonls[0]) if l.strip()]
             writes = [r for r in recs if r.get("op") == "write"]
-            ws = s["datasets"]["m"]["write_staged"]
+            ws = _dset_entry(s, "m")["write_staged"]
             write_ok = (
                 bool(writes)
                 and all(r["served"] != "cache" for r in writes)

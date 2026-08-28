@@ -131,24 +131,14 @@ struct CreateParams {
   // CTE configuration object (not serialized, loaded from pool_config)
   Config config_;
 
-  // OUT: Raw pointer (uintptr_t cast) to GpuMetadataCacheHeader allocated by
-  // the server during Create. Zero when the GPU metadata cache is disabled
-  // or no GPU backend is built in. The pointer is a managed/shared USM
-  // address valid for both host and device access in the SAME process; it
-  // is NOT a cross-process IPC handle (cross-process sharing requires
-  // Level-Zero IPC on SYCL or cudaIpc on CUDA — see
-  // gpu_metadata_cache.h header for the eventual extension).
-  clio::run::u64 gpu_cache_ptr_ = 0;
-
   // OUT: byte offset of the CTE shared-memory metadata cache root within the
   // runtime's metadata allocator (issue #783). 0 means caching is disabled --
   // no metadata segment, or the cache could not be built -- and the client
   // must simply use the RPC path.
   //
-  // UNLIKE gpu_cache_ptr_ above, this is genuinely cross-process valid: it is
-  // an OFFSET into a segment both processes map, not a raw address. That is
-  // the whole reason the cache can be read by another process at all; a
-  // pointer here would resolve to garbage in the client.
+  // This is an OFFSET into a segment both processes map, not a raw address.
+  // That is the whole reason the cache can be read by another process at
+  // all; a pointer here would resolve to garbage in the client.
   clio::run::u64 shm_cache_root_off_ = 0;
 
   // Required: chimod library name for module manager
@@ -160,14 +150,12 @@ struct CreateParams {
   // Copy constructor (required for task creation)
   CreateParams(const CreateParams &other)
       : config_(other.config_),
-        gpu_cache_ptr_(other.gpu_cache_ptr_),
         shm_cache_root_off_(other.shm_cache_root_off_) {}
 
   // Constructor with pool_id and CreateParams (required for admin
   // task creation)
   CreateParams(const clio::run::PoolId &pool_id, const CreateParams &other)
       : config_(other.config_),
-        gpu_cache_ptr_(other.gpu_cache_ptr_),
         shm_cache_root_off_(other.shm_cache_root_off_) {
     // pool_id is used by the admin task framework, but we don't need to store
     // it
@@ -179,23 +167,17 @@ struct CreateParams {
   template <class Archive>
   void serialize(Archive &ar) {
     // Most of Config is loaded server-side from pool_config.config_ via
-    // LoadConfig (compose mode). The GPU metadata cache settings are
-    // serialized explicitly so callers can opt in directly via
-    // CreateParams (no compose YAML required) — the server reads them
-    // from CreateParams::config_.gpu_metadata_cache_.
+    // LoadConfig (compose mode); only the settings a caller may want to
+    // pass directly via CreateParams (no compose YAML required) are on
+    // the wire.
     //
-    // gpu_cache_ptr_ flows back on the OUT path: the server writes the
-    // managed-USM cache pointer into chimod_params_ at the end of
-    // Create, and the client's GetParams() returns it.
-    ar(config_.gpu_metadata_cache_.enabled_,
-       config_.gpu_metadata_cache_.capacity_bytes_,
-       config_.gpu_metadata_cache_.max_blobs_,
-       config_.gpu_metadata_cache_.max_tags_,
-       config_.performance_.stat_targets_period_ms_,
+    // shm_cache_root_off_ flows back on the OUT path: the server writes
+    // it into chimod_params_ at the end of Create, and the client's
+    // GetParams() returns it.
+    ar(config_.performance_.stat_targets_period_ms_,
        config_.organizer_.name_,
        config_.organizer_.organizer_tasks_,
        config_.organizer_.period_ms_,
-       gpu_cache_ptr_,
        shm_cache_root_off_);
   }
 
@@ -1699,6 +1681,24 @@ struct Context {
     // the origin's view of the content backwards.
     if (replica.version_ > version_) {
       version_ = replica.version_;
+    }
+    // origin_node_ is INOUT, not IN. The caller sets it to "I hold a local
+    // copy at node N, please register it"; the OWNER answers by either leaving
+    // it (registration accepted) or CLEARING it to kNoOriginNode (refused --
+    // the blob pre-existed beyond this put, so the speculative copy is only a
+    // prefix). The cache chimod reads that answer back:
+    //
+    //   if (wrote_local && (rc != 0 || out_ctx.origin_node_ == kNoOriginNode))
+    //       -> DelBlob the speculative local copy
+    //
+    // Treating it as pure IN kept the caller's value and silently swallowed
+    // the refusal, so the cache kept a copy the owner told it to drop and
+    // served STALE bytes on the next round -- the coherence suite read
+    // 'w1r0' where it expected 'w1r1'. A refusal from any replica must win;
+    // when nobody refuses the caller's value survives untouched, which is what
+    // the removed whole-task Copy() did for a single-replica gather.
+    if (replica.origin_node_ == kNoOriginNode) {
+      origin_node_ = kNoOriginNode;
     }
     // PSNR is a quality bound, not a total: keep the WORST (lowest) figure any
     // replica reported. 0 means "lossless / not measured", hence the guard.
@@ -4006,6 +4006,24 @@ struct GetBlobSizeTask : public clio::run::Task {
     // destroys this ORIGIN's identity and re-assigns IN shm members across
     // allocator segments. See Task::AggregateOut for the full contract.
     auto replica = other_base.template Cast<GetBlobSizeTask>();
+    // TEMPORARY DIAGNOSTIC (cluster coherence bug #2). Does this aggregation
+    // even run for the 4-node barrier, and does the base's sticky-error rule
+    // poison the result?
+    //
+    // Task::AggregateOut takes ANY non-zero replica rc. GetBlobSize is an
+    // owner-shard query: the owner answers rc=0/size=1, non-owners legitimately
+    // answer rc=1/size=0. size_ merges with MAX (correct), but rc would come
+    // back 1 -- and Barrier() requires `rc == 0 && size == 1`, so it could
+    // never be satisfied. Before fb735bdb the whole-task Copy() overwrote rc
+    // with the LAST replica's, which often landed on 0.
+    //
+    // If this line never appears, there is no N->1 gather here and that whole
+    // story is wrong.
+    HLOG(kWarning,
+         "[AGG-GBS] origin rc={} size={} <- replica rc={} size={}",
+         GetReturnCode(), static_cast<unsigned long long>(size_),
+         replica->GetReturnCode(),
+         static_cast<unsigned long long>(replica->size_));
     // The blob lives on one shard; non-owners answer 0, so max yields the
     // owner's size for one replica and for many.
     if (replica->size_ > size_) {

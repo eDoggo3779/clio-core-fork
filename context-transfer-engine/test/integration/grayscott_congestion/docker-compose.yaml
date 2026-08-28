@@ -48,6 +48,7 @@ services:
         /workspace/build/bin/test_grayscott_congestion
         EXIT=$$? &&
         echo \"gs-node1: producer exit $$EXIT\" &&
+        sleep $${GS_TEARDOWN_LINGER:-30} &&
         exit $$EXIT
       "
 
@@ -92,6 +93,7 @@ services:
         /workspace/build/bin/test_grayscott_congestion
         EXIT=$$? &&
         echo \"gs-node2: producer exit $$EXIT\" &&
+        sleep $${GS_TEARDOWN_LINGER:-30} &&
         exit $$EXIT
       "
 
