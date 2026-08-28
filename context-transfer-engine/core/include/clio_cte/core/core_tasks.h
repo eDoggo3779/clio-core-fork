@@ -4006,6 +4006,24 @@ struct GetBlobSizeTask : public clio::run::Task {
     // destroys this ORIGIN's identity and re-assigns IN shm members across
     // allocator segments. See Task::AggregateOut for the full contract.
     auto replica = other_base.template Cast<GetBlobSizeTask>();
+    // TEMPORARY DIAGNOSTIC (cluster coherence bug #2). Does this aggregation
+    // even run for the 4-node barrier, and does the base's sticky-error rule
+    // poison the result?
+    //
+    // Task::AggregateOut takes ANY non-zero replica rc. GetBlobSize is an
+    // owner-shard query: the owner answers rc=0/size=1, non-owners legitimately
+    // answer rc=1/size=0. size_ merges with MAX (correct), but rc would come
+    // back 1 -- and Barrier() requires `rc == 0 && size == 1`, so it could
+    // never be satisfied. Before fb735bdb the whole-task Copy() overwrote rc
+    // with the LAST replica's, which often landed on 0.
+    //
+    // If this line never appears, there is no N->1 gather here and that whole
+    // story is wrong.
+    HLOG(kWarning,
+         "[AGG-GBS] origin rc={} size={} <- replica rc={} size={}",
+         GetReturnCode(), static_cast<unsigned long long>(size_),
+         replica->GetReturnCode(),
+         static_cast<unsigned long long>(replica->size_));
     // The blob lives on one shard; non-owners answer 0, so max yields the
     // owner's size for one replica and for many.
     if (replica->size_ > size_) {
