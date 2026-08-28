@@ -1700,6 +1700,24 @@ struct Context {
     if (replica.version_ > version_) {
       version_ = replica.version_;
     }
+    // origin_node_ is INOUT, not IN. The caller sets it to "I hold a local
+    // copy at node N, please register it"; the OWNER answers by either leaving
+    // it (registration accepted) or CLEARING it to kNoOriginNode (refused --
+    // the blob pre-existed beyond this put, so the speculative copy is only a
+    // prefix). The cache chimod reads that answer back:
+    //
+    //   if (wrote_local && (rc != 0 || out_ctx.origin_node_ == kNoOriginNode))
+    //       -> DelBlob the speculative local copy
+    //
+    // Treating it as pure IN kept the caller's value and silently swallowed
+    // the refusal, so the cache kept a copy the owner told it to drop and
+    // served STALE bytes on the next round -- the coherence suite read
+    // 'w1r0' where it expected 'w1r1'. A refusal from any replica must win;
+    // when nobody refuses the caller's value survives untouched, which is what
+    // the removed whole-task Copy() did for a single-replica gather.
+    if (replica.origin_node_ == kNoOriginNode) {
+      origin_node_ = kNoOriginNode;
+    }
     // PSNR is a quality bound, not a total: keep the WORST (lowest) figure any
     // replica reported. 0 means "lossless / not measured", hence the guard.
     if (replica.actual_psnr_db_ > 0.0 &&
