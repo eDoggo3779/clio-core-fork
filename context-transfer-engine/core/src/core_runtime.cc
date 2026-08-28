@@ -5278,6 +5278,20 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       for (size_t rep_i = 0; rep_i < blob_info.replicas_.size(); ++rep_i) {
         const Replica &rep = blob_info.replicas_[rep_i];
         if (rep.blocks_.empty()) {
+          // Say so. This skip is the suspected mechanism behind
+          // "blob N replica lost! size=0 rc=1" after a reboot: a replica whose
+          // blocks_ are on loan to a staging BlobInfo looks empty here and is
+          // omitted from the snapshot entirely. Logging the blob, the replica
+          // index, its cached size and the write-token owner distinguishes
+          // "genuinely empty" (size 0, no owner) from "mid-staging" (owner set,
+          // or a nonzero size cache) without needing a macOS runner in hand.
+          ctp::ipc::atomic_ref<clio::run::u64> _own(blob_info.write_owner_);
+          HLOG(kWarning,
+               "[FLUSH-SKIP] blob='{}' replica#{} blocks=0 size_cache={} "
+               "write_owner={}",
+               key, rep_i + 1,
+               static_cast<unsigned long long>(rep.total_size_cache_),
+               static_cast<unsigned long long>(_own.load()));
           continue;
         }
         uint8_t rep_entry_type = 3;
