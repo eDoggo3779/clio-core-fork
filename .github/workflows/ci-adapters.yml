@@ -199,8 +199,18 @@ jobs:
           # 0x55.. / 0xaa.. instead of random garbage, which distinguishes
           # "freed object" from "wrong address computed" -- the two candidates
           # for a wild mutex pointer.
-          export MallocScribble=1 MallocPreScribble=1 MallocGuardEdges=1
-          lldb --batch                -o run                -o 'thread backtrace all'                -o 'register read x0 lr pc sp fp'                -o 'image lookup --address $lr'                -o 'image list'                -o quit                -- "$exe" 2>&1 | tail -200
+          # -o commands after `run` are ABANDONED once the target crashes in
+          # --batch mode, which is why the first two attempts printed only the
+          # stop line. -k / --one-line-on-crash is the hook that actually fires
+          # on the crash.
+          #
+          # Scribble stays on, but note it has already told us something: the
+          # fault address differs every run (0x61de.., 0xb731..) and matches
+          # NEITHER 0x55.. nor 0xaa.., so this is not a freed-heap read. That
+          # points at an uninitialised/wild pointer or memory libmalloc never
+          # owned (e.g. shared-memory backed), not a classic use-after-free.
+          export MallocScribble=1 MallocPreScribble=1
+          lldb --batch                -k 'thread backtrace all'                -k 'register read x0 lr pc sp fp'                -k 'image lookup --address $lr'                -k 'memory read --size 8 --format x --count 4 $sp'                -k quit                -o run                -o quit                -- "$exe" 2>&1 | tail -200
       # Real mount attempt via the FSKit backend (kext-free; macFUSE 5.1+,
       # macOS 15.4+, mountpoint must live under /Volumes). NON-BLOCKING: FSKit
       # extension approval semantics on runner images are unproven — promote
