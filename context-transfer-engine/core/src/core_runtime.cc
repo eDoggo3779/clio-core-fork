@@ -5156,6 +5156,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     });
 
     // Write BlobInfo entries (entry_type 2; see below)
+    unsigned long long _diag_t3_written = 0;
     // Serialize each blob while HOLDING its write token.
     //
     // Draining the tokens before the scan was not enough: a PutBlobImpl that
@@ -5329,10 +5330,15 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
           ofs.write(reinterpret_cast<const char *>(&size), sizeof(size));
         }
         task->entries_flushed_++;
+        ++_diag_t3_written;
       }
     }
 
     ofs.close();
+    // TEMPORARY: pairs with [RESTORE-T3] so a write/read count mismatch is
+    // visible without a macOS runner in hand.
+    HLOG(kWarning, "[FLUSH-T3] wrote {} type-3 replica entries",
+         _diag_t3_written);
 
     // WAL: sync and compact transaction logs after snapshot
     if (!blob_txn_logs_.empty()) {
@@ -5601,6 +5607,7 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
 }
 
 void Runtime::RestoreMetadataFromLog() {
+  unsigned long long _diag_t3_read = 0;
   const std::string &log_path = config_.performance_.metadata_log_path_;
   if (log_path.empty()) {
     HLOG(kInfo, "RestoreMetadataFromLog: No metadata log path configured");
@@ -5759,6 +5766,7 @@ void Runtime::RestoreMetadataFromLog() {
       blobs_restored++;
 
     } else if (entry_type == 3) {
+      ++_diag_t3_read;
       // Replica layout (issue #886), attached to the blob whose type-2 record
       // FlushMetadata wrote just before it. Same volatile-block filter as the
       // primary restore.
@@ -5871,6 +5879,7 @@ void Runtime::RestoreMetadataFromLog() {
   }
 
   ifs.close();
+  HLOG(kWarning, "[RESTORE-T3] read {} type-3 replica entries", _diag_t3_read);
 
   // Update next_tag_id_minor_ to be past any restored tag IDs
   clio::run::u32 current_minor = next_tag_id_minor_.load();
