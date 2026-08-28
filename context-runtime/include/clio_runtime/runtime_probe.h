@@ -96,6 +96,13 @@ inline std::string MainSegmentPath(u32 port) {
  * whose target is /proc/<pid>/fd/<n> (the memfd the runtime created), and
  * otherwise from the pid record the runtime writes alongside its segments
  * (see clio_runtime/runtime_pid_record.h). POSIX-only; returns -1 on Windows.
+ *
+ * The Windows short-circuit is deliberate and load-bearing for `clio_run stop`:
+ * its kill escalation is POSIX-only, and SendStopTask treats a discovered pid
+ * as "I can wait for this process to exit" — which WaitForRuntimeExit cannot do
+ * on Windows. Handing it a real pid there turns a stop that used to succeed
+ * into a failure. Callers that only need "is a runtime alive on this port"
+ * should use LiveRuntimePid, which adds a portable record lookup on top.
  * @param port the runtime port (segment names are port-keyed)
  * @return the owning pid (may be dead), or -1 if the runtime left no trace
  */

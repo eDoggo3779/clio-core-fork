@@ -129,7 +129,17 @@ int LiveRuntimePid(u32 port) {
   // executable name proves nothing. The residual pid-recycling window is
   // bounded by the record's lifetime — the runtime removes it on teardown, and
   // ClearUserIpcs reaps it on the next start if the runtime died without one.
-  const int pid = DiscoverRuntimePid(port);
+  int pid = DiscoverRuntimePid(port);
+  if (pid <= 0) {
+    // DiscoverRuntimePid is POSIX-only by design (see its note: the stop CLI
+    // depends on it staying blind on Windows). Attaching does not need any of
+    // that — it only needs to know whether someone is serving this port — and
+    // the pid record is plain text written on every platform, with a real
+    // Windows IsProcessAlive behind it. Without this fallback every Windows
+    // process concluded "no runtime here" and started its own, which is the
+    // exact failure #1015 is about.
+    pid = ReadRuntimePidRecord(port);
+  }
   if (pid > 0 && PidIsRunning(pid)) {
     return pid;
   }
