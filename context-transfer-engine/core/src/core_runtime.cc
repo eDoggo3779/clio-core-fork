@@ -6173,10 +6173,13 @@ void Runtime::ReplayTransactionLogs() {
         blobs_replayed++;
 
       } else if (type == TxnType::kSetBlobTransform) {
-        // issue #818. Replayed AFTER kCreateNewBlob for the same blob (records
-        // are applied in log order, and the mark is always logged later in the
-        // put than the create), so this reinstates the bit on top of the
-        // default-constructed BlobInfo that kCreateNewBlob inserts.
+        // issue #818. This reinstates the transform bit on top of the
+        // default-constructed BlobInfo that kCreateNewBlob inserts. NOTE: the
+        // mark is logged later in the put than the create, but "later in time"
+        // does not mean "later in replay" -- records are applied in log order
+        // only WITHIN a shard, and the WAL is sharded per worker. Losing this
+        // bit fails OPEN into direct reads of codec bytes, so the record must
+        // survive either replay order.
         auto txn = TransactionLog::DeserializeSetBlobTransform(payload);
         TagId tag_id{txn.tag_major_, txn.tag_minor_};
         std::string composite_key = std::to_string(tag_id.major_) + "." +
@@ -6184,6 +6187,19 @@ void Runtime::ReplayTransactionLogs() {
                                     txn.blob_name_;
         std::shared_ptr<BlobInfo> blob_info_ptr =
             tag_blob_name_to_info_.get(composite_key);
+        // Same per-worker-shard hazard as kExtendReplica: this record and the
+        // blob's kCreateNewBlob are logged by different workers and therefore
+        // may live in different WAL shards, which replay walks in index order.
+        // Dropping it when the blob is not there yet loses the transform mark
+        // permanently. Create the blob instead; the kCreateNewBlob replayed
+        // afterwards carries the field forward.
+        if (!blob_info_ptr) {
+          BlobInfo fresh;
+          fresh.blob_name_ = txn.blob_name_;
+          tag_blob_name_to_info_.insert_or_assign(
+              composite_key, std::make_shared<BlobInfo>(fresh));
+          blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+        }
         if (blob_info_ptr) {
           blob_info_ptr->transform_flags_ |= txn.transform_flags_;
           MirrorBlobToShm(composite_key, *blob_info_ptr);
@@ -6198,6 +6214,19 @@ void Runtime::ReplayTransactionLogs() {
                                     txn.blob_name_;
         std::shared_ptr<BlobInfo> blob_info_ptr =
             tag_blob_name_to_info_.get(composite_key);
+        // Same per-worker-shard hazard as kExtendReplica: this record and the
+        // blob's kCreateNewBlob are logged by different workers and therefore
+        // may live in different WAL shards, which replay walks in index order.
+        // Dropping it when the blob is not there yet loses droppability, which is write-once
+        // permanently. Create the blob instead; the kCreateNewBlob replayed
+        // afterwards carries the field forward.
+        if (!blob_info_ptr) {
+          BlobInfo fresh;
+          fresh.blob_name_ = txn.blob_name_;
+          tag_blob_name_to_info_.insert_or_assign(
+              composite_key, std::make_shared<BlobInfo>(fresh));
+          blob_info_ptr = tag_blob_name_to_info_.get(composite_key);
+        }
         if (blob_info_ptr) {
           blob_info_ptr->droppable_ = txn.droppable_;
           MirrorBlobToShm(composite_key, *blob_info_ptr);
