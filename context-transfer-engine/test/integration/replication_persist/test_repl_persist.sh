@@ -13,13 +13,39 @@ echo "=== CTE Replication Persistence Test ==="
 echo "BIN_DIR: $BIN_DIR"
 echo "COMPOSE_CONFIG: $COMPOSE_CONFIG"
 
+# Stop the runtime and WAIT FOR IT TO ACTUALLY EXIT.
+#
+# The old version slept 2s and then SIGKILLed, but the runtime asks for a
+# 5000 ms grace period ("RequestStop: graceful stop requested (grace period:
+# 5000 ms); main loop will run the full teardown") -- so the harness killed it
+# 3s BEFORE its own teardown budget expired. Teardown is where cached blobs'
+# disk replicas are flushed, so a SIGKILL mid-flush loses however many had not
+# landed yet, and phase 2 then reports "blob N replica lost" with N varying by
+# run.
+#
+# On Linux that never bit because the metadata segment is memfd-backed and
+# teardown beats the 2s. On macOS the same log says "Metadata segment:
+# file-backed on this platform (no memfd)" -- real disk I/O -- so it does not,
+# and cte_replication_persist_integration failed on EVERY macos-14/macos-15
+# boost run.
+#
+# Poll for exit up to STOP_TIMEOUT_S (comfortably above the grace period)
+# before escalating; SIGKILL stays as a true last resort so a genuinely wedged
+# runtime still cannot hang the suite.
+STOP_TIMEOUT_S=${STOP_TIMEOUT_S:-30}
 stop_runtime() {
     if [ -n "$RUNTIME_PID" ] && kill -0 $RUNTIME_PID 2>/dev/null; then
         $BIN_DIR/clio_run runtime stop 2>/dev/null || true
-        sleep 2
-        if kill -0 $RUNTIME_PID 2>/dev/null; then
-            kill -9 $RUNTIME_PID 2>/dev/null || true
-        fi
+        waited=0
+        while kill -0 $RUNTIME_PID 2>/dev/null; do
+            if [ "$waited" -ge "$STOP_TIMEOUT_S" ]; then
+                echo "WARNING: runtime did not exit within ${STOP_TIMEOUT_S}s; sending SIGKILL" >&2
+                kill -9 $RUNTIME_PID 2>/dev/null || true
+                break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
         wait $RUNTIME_PID 2>/dev/null || true
     fi
     RUNTIME_PID=""
