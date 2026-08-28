@@ -4029,16 +4029,6 @@ struct GetBlobSizeTask : public clio::run::Task {
     if (replica->size_ > size_) {
       size_ = replica->size_;
     }
-    // SUCCESS must win for an owner-shard query. Task::AggregateOut only
-    // propagates FAILURE (`if (replica rc != 0) SetReturnCode(...)`), so a
-    // successful owner can never clear the rc=1 ("blob not found") that the
-    // non-owning shards legitimately report. Before the whole-task Copy() was
-    // removed, the replica's rc=0 was copied across and success propagated by
-    // accident; without it a 4-container fan-out always aggregates to rc=1,
-    // and Barrier() -- which needs `rc == 0 && size == 1` -- can never pass.
-    if (replica->GetReturnCode() == 0) {
-      SetReturnCode(0);
-    }
   }
 };
 
