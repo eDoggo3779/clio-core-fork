@@ -178,6 +178,23 @@ jobs:
           ctest --test-dir build-adapters --output-on-failure \
             --timeout 180 --repeat until-pass:2 \
             -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama|flaky"
+      # fuse_ops has crashed with a bare `***Exception: SegFault` on every
+      # macOS adapters run since at least 2026-08-21, always inside the
+      # "hard link" case. ctest reports the signal and throws the stack away,
+      # so there has never been anything to diagnose from. Re-run just that
+      # binary under lldb on failure to capture one.
+      #
+      # if: failure() so it costs nothing on a green run, and it cannot change
+      # the gate -- the ctest step above has already decided the job.
+      - name: Backtrace fuse_ops on crash (diagnostic only)
+        if: failure()
+        continue-on-error: true
+        run: |
+          exe=$(find build-adapters -name 'test_fuse_ops*' -type f -perm -u+x | head -1)
+          echo "fuse_ops binary: ${exe:-<not found>}"
+          if [ -z "$exe" ]; then exit 0; fi
+          # lldb ships with the Xcode CLT present on every macOS runner image.
+          lldb --batch -o run -o 'bt all' -o quit -- "$exe" 2>&1 | tail -150
       # Real mount attempt via the FSKit backend (kext-free; macFUSE 5.1+,
       # macOS 15.4+, mountpoint must live under /Volumes). NON-BLOCKING: FSKit
       # extension approval semantics on runner images are unproven — promote
