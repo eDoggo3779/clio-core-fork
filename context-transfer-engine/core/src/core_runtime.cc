@@ -5252,11 +5252,24 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       }
       task->entries_flushed_++;
 
-      // Entry type 3 == one replica's layout (issue #886), written right
-      // after its blob's type-2 record so restore can attach it to the
+      // Entry type 4 == one replica's layout (issue #886), written right
+      // after its blob's record so restore can attach it to the
       // just-inserted BlobInfo. A NEW type for the same no-version-header
       // reason as type 2: an old reader stops loudly instead of parsing
-      // replica blocks as the next entry. The snapshot MUST carry replicas —
+      // replica blocks as the next entry.
+      //
+      // It MUST NOT be 3, which is what it was until this fix: 3 is already
+      // the tag of the BLOB record written just above (droppable_ layout), and
+      // the reader's blob branch accepts 1|2|3. Every replica record was
+      // therefore parsed as a blob record, which desynchronised the whole
+      // stream: the reader went on to interpret string bytes as binary fields
+      // and produced garbage bdev pool ids (observed: 1936876912 == "pers",
+      // 1650422899 == "st_b"). Those ids matched no registered target, so the
+      // volatile-block filter -- which keeps a block when the target is
+      // unknown -- failed OPEN and the DRAM primary survived a reboot, which
+      // is exactly what cte_replication_persist_integration asserts against.
+      // The replica branch in the reader was dead code for the same reason.
+      // The snapshot MUST carry replicas —
       // FlushMetadata may truncate the WAL below, and the kExtendReplica
       // records being truncated are the only other place these layouts live.
       // Empty replicas are skipped; they hold nothing to restore and are
@@ -5266,7 +5279,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
         if (rep.blocks_.empty()) {
           continue;
         }
-        uint8_t rep_entry_type = 3;
+        uint8_t rep_entry_type = 4;
         uint32_t rep_idx = static_cast<uint32_t>(rep_i + 1);
         uint32_t rep_name_len = static_cast<uint32_t>(rep.name_.size());
         float rep_score = rep.score_;
@@ -5736,10 +5749,14 @@ void Runtime::RestoreMetadataFromLog() {
       MirrorBlobToShm(composite_key, blob_info);
       blobs_restored++;
 
-    } else if (entry_type == 3) {
-      // Replica layout (issue #886), attached to the blob whose type-2 record
+    } else if (entry_type == 4) {
+      // Replica layout (issue #886), attached to the blob whose record
       // FlushMetadata wrote just before it. Same volatile-block filter as the
       // primary restore.
+      //
+      // Tag 4, not 3: the blob branch above accepts 1|2|3, so while replicas
+      // were written as 3 this branch was unreachable and every replica record
+      // was misparsed as a blob (see the writer for the full consequence).
       uint32_t key_len;
       ifs.read(reinterpret_cast<char *>(&key_len), sizeof(key_len));
       std::string composite_key(key_len, '\0');
