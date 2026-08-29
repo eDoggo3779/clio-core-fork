@@ -85,16 +85,14 @@ enum class RuntimeMode {
  *   (CLIO_WITH_RUNTIME is honored as a legacy alias via env::GetCompat.)
  *   If not set, uses default_with_runtime parameter
  *
- * In kClient mode, "with runtime" means ATTACH-OR-START (issue #1015): the
- * configured port is probed first, and
- *   - a live clio runtime already there  -> this process attaches to it as a
- *     plain client and returns success (it does NOT become a second runtime),
- *   - nothing there                      -> the runtime comes up in-process,
- *   - the port held by some other program -> initialization FAILS, because a
- *     foreign listener is not a runtime this process can talk to.
- * The probe runs under a node-wide, port-scoped start lock, so N processes
- * launched at once (e.g. mpirun -np 4) elect exactly one runtime host between
- * them. See clio_runtime/runtime_probe.h.
+ * In kClient mode, "with runtime" means TRY-TO-BE-THE-RUNTIME-ELSE-ATTACH
+ * (issue #1015): this process attempts ServerInit, and if the port is already
+ * bound it falls back to ClientInit and attaches to whoever owns it. ZMQ's bind
+ * is the arbiter, so N processes launched at once (e.g. mpirun -np 4) elect
+ * exactly one runtime host between them with no extra coordination.
+ *
+ * A port held by some other program falls out of the same path: ServerInit
+ * cannot bind and ClientInit finds nobody answering, so initialization fails.
  *
  * kServer/kRuntime mode is unchanged: `clio_run runtime start` is an explicit
  * "be the runtime" and still fails when one is already running.

@@ -410,15 +410,10 @@ bool RuntimeManager::ServerInit() {
   // set up the gpu2cpu_queue + gpu2cpu_copy_backend at server-init
   // time.
 
-  // Start local server last - after all other initialization is complete
-  // This ensures clients can connect only when runtime is fully ready
-  if (!ipc_manager->StartLocalServer()) {
-    HLOG(kError,
-         "Failed to start local server - runtime initialization failed");
-    is_runtime_mode_ = false;
-    runtime_is_initializing_ = false;
-    return false;
-  }
+  // NOTE: the local server port is no longer claimed here. It is bound at the
+  // very top of IpcManager::ServerInit (issue #1015), because that bind is the
+  // atomic claim deciding which of several racing processes becomes this node's
+  // runtime -- a decision that cannot wait until initialization is complete.
 
   is_runtime_initialized_ = true;
   is_initialized_ = true;

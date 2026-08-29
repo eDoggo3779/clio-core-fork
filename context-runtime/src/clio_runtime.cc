@@ -36,13 +36,10 @@
  */
 
 #include "clio_runtime/clio_runtime.h"
-#include "clio_runtime/config_manager.h"
 #include "clio_runtime/container.h"
-#include "clio_runtime/runtime_probe.h"
 #include "clio_runtime/work_orchestrator.h"
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 
 namespace clio::run {
 
@@ -80,68 +77,35 @@ bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
     init_runtime = with_runtime;
   }
 
-  // "Clio as a cache" (issue #1015): a client that asks for a runtime is asking
-  // for one to EXIST, not to be the one running it. Probe first, and only bring
-  // a runtime up in this process if the port is genuinely unoccupied.
-  std::unique_ptr<RuntimeStartLock> start_lock;
-  if (init_runtime) {
-    // The port lives in the config, which both ServerInit and ClientInit
-    // initialize anyway; Init() is idempotent, so reading it here is free.
-    auto *config_manager = CLIO_CONFIG_MANAGER;
-    if (!config_manager->Init()) {
-      return false;
-    }
-    const u32 port = config_manager->GetPort();
-
-    // Hold the node-wide start lock across probe+start, in EVERY mode that
-    // brings a runtime up. N processes starting together (mpirun -np 4) would
-    // otherwise all probe "free" in the same instant; the winner keeps the lock
-    // until its runtime is serving, so the losers re-probe against a live
-    // runtime and take the attach path. Server mode takes the lock too — not to
-    // change its semantics, but because ServerInit publishes its pid record
-    // some way in, and a client probing inside that window would otherwise see
-    // an empty port and start a second runtime behind the daemon's back.
-    start_lock = std::make_unique<RuntimeStartLock>(port);
-
-    // Server/runtime mode is deliberately NOT given the attach path:
-    // `clio_run runtime start` is an explicit "be the runtime" and must still
-    // fail loudly when one is already there, rather than silently becoming a
-    // client with no daemon.
-    if (mode == RuntimeMode::kClient) {
-      int existing_pid = -1;
-      switch (ProbeRuntime(port, &existing_pid)) {
-        case RuntimePresence::kRuntime:
-          HLOG(kInfo,
-               "CLIO_WITH_RUNTIME=1: runtime already running on port {} "
-               "(pid {}); attaching to it as a client",
-               port, existing_pid);
-          init_runtime = false;
-          start_lock.reset();
-          break;
-        case RuntimePresence::kForeign:
-          HLOG(kError,
-               "CLIO_WITH_RUNTIME=1: port {} (or {}/{}) is held by another "
-               "program and no clio runtime owns it — refusing to start",
-               port, port + 1, port + 3);
-          return false;
-        case RuntimePresence::kNone:
-          HLOG(kInfo,
-               "CLIO_WITH_RUNTIME=1: no runtime on port {}; starting one in "
-               "this process",
-               port);
-          break;
-      }
-    }
-  }
-
-  // Initialize runtime first if needed
+  // "Clio as a cache" (issue #1015): asking for a runtime means asking for one
+  // to EXIST, not to be the process running it. Try to become the runtime; if
+  // something already owns the port, fall back to being its client.
+  //
+  // ZMQ is the arbiter here, not a lock of our own: binding the local server
+  // port is a kernel-level atomic claim, so of N processes racing to start
+  // (mpirun -np 4) exactly one can win it. The losers see ServerInit fail and
+  // continue to ClientInit, which attaches them to the winner.
+  //
+  // The foreign-program case falls out of the same path: if the port is held by
+  // something that is not a clio runtime, ServerInit fails to bind AND ClientInit
+  // finds nobody answering, so initialization fails — which is what we want, and
+  // is why this must not swallow a ClientInit failure.
   if (init_runtime) {
     if (!runtime_manager->ServerInit()) {
-      return false;
+      if (mode != RuntimeMode::kClient) {
+        // `clio_run runtime start` is an explicit "be the runtime" and must
+        // still fail loudly rather than silently become a client with no daemon.
+        return false;
+      }
+      HLOG(kInfo,
+           "CLIO_WITH_RUNTIME=1: could not start a runtime (port already "
+           "bound); attaching to the existing one as a client");
     }
   }
 
-  // Initialize client components
+  // Initialize client components. In the fall-back case above this is also the
+  // check that something real is listening: a foreign program on the port
+  // leaves nothing to attach to, and this fails.
   if (init_client) {
     if (!runtime_manager->ClientInit()) {
       return false;
