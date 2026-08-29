@@ -103,6 +103,23 @@ struct clio_file_t {
      is always a correct (if unaccelerated) mode -- the native file is
      authoritative regardless. */
   bool cache_enabled = true;
+  /* Lazy tag binding.
+     The CTE tag and its coherence stamp are needed by exactly one thing: code
+     that touches the tier. Resolving them in clio_make_file charged the cost to
+     H5Fopen instead -- a GetOrCreateTag plus the stamp's GetBlobSize and
+     GetBlob, all blocking, and a DelTag/GetOrCreateTag pair when the stamp does
+     not match, with a stamp PutBlob at close to answer. A file the application
+     opens and closes without a single cacheable transfer paid all of it for
+     nothing, and netCDF-4 metadata-only opens are exactly that shape:
+     nc_test4/tst_files4 opens and closes one file 32768 times, reading only
+     attributes and dataspaces.
+     tag_bound is the gate; tag_bind_failed stops a failed bind being retried
+     per transfer. opened_truncated remembers what clio_make_file knew about the
+     native open, because the bind has to make the same "any pre-existing tag is
+     stale" decision later. See clio_file_bind_tag. */
+  bool tag_bound = false;
+  bool tag_bind_failed = false;
+  bool opened_truncated = false;
   /* Safe mode: cacheable datasets currently open in this file. H5Fflush and
      H5Fclose drain their pending CTE puts so no async write outlives a
      successful flush/close (the native file is already written synchronously and
@@ -139,6 +156,21 @@ struct clio_dataset_t {
      object-open / wrap paths), so we never key a blob by an empty/ambiguous
      name. */
   bool cacheable;
+  /* Memo of ONE fact this handle established: the tier holds nothing for this
+     dataset. chunk_0 is the hit-test key, so its absence is the whole state.
+     Set by a successful invalidation or by a hit test that came back empty;
+     cleared the instant anything is staged.
+
+     It exists because netCDF-4 -- and any application that writes through a
+     hyperslab -- never takes the whole-dataset path. Every nc_put_vara lands in
+     the partial branch of clio_dataset_write, which invalidates; every
+     nc_get_vara lands in clio_serve_selection, which hit-tests. Both are
+     BLOCKING runtime round trips, and both were re-issued per transfer forever,
+     asking a question already answered: after the first invalidation there is
+     nothing left to delete and nothing left to find. On the netCDF-C suite that
+     is one round trip per element-space transfer -- tens of thousands per test
+     -- for a tier that cannot be used by such a workload at all. */
+  bool image_known_absent = false;
   /* Pending async writes flushed on close */
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
@@ -470,11 +502,21 @@ static clio::cte::core::Client *get_cte_client() {
   return attached ? CLIO_CTE_CLIENT : nullptr;
 }
 
-/* Is the CTE cache path usable for this file at all? One check for the two
-   independent reasons it may not be: the user turned it off, or the runtime is
-   not there. */
+/* Bind this file's CTE tag and verify its coherence stamp, at most once, on the
+   first access that actually needs the tier. Defined further down, next to the
+   stamp helpers it uses. */
+static bool clio_file_bind_tag(clio_file_t *file);
+
+/* Is the CTE cache path usable for this file at all? One check for the three
+   independent reasons it may not be: the user turned it off, the runtime is not
+   there, or this file has no tag and could not be given one.
+
+   This is also where the tag gets bound: it is the single door every tier
+   access goes through, so a caller cannot reach a blob with an unbound tag and
+   cannot forget to bind one. */
 static bool clio_cache_usable(clio_file_t *file) {
-  return file && file->cache_enabled && get_cte_client() != nullptr;
+  return file && file->cache_enabled && get_cte_client() != nullptr &&
+         clio_file_bind_tag(file);
 }
 
 /* ------------------------------------------------------------------ admission
@@ -542,6 +584,16 @@ static bool clio_cache_env_enabled() {
    uncacheable for the rest of the session, which is the fail-closed choice. */
 static void clio_invalidate_dataset(clio_dataset_t *dset) {
   if (!dset || !dset->file || !dset->cacheable) return;
+  /* No tag was ever bound for this file, so nothing can be staged under one.
+     Deliberately does NOT bind one: invalidation is reached from the
+     native-only branch of every partial write, and binding there would put the
+     open-time tag cost back on the first hyperslab write of every file. */
+  if (!dset->file->tag_bound) return;
+  /* Nothing staged, nothing to invalidate -- and we know that without asking,
+     because this handle is what emptied it. Skipping the round trip here is the
+     difference between one blocking RPC per hyperslab write and one per
+     dataset. See image_known_absent. */
+  if (dset->image_known_absent) return;
   /* Tell the telemetry the staged bytes are gone BEFORE dropping them.
      Everything staged for this dataset is about to stop being servable, so
      leaving it counted would inflate the admission denominator with data that
@@ -572,7 +624,11 @@ static void clio_invalidate_dataset(clio_dataset_t *dset) {
             "the cache for this dataset (native file is authoritative)\n",
             dset->dataset_path.c_str(), rc);
     dset->cacheable = false;
+    return;
   }
+  /* The hit-test key is gone and this handle is the one that removed it, so the
+     next invalidation and the next hit test both already have their answer. */
+  dset->image_known_absent = true;
 }
 
 /* ========================================================================
@@ -1112,6 +1168,7 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   file->file_name = name;
   file->chunk_size = chunk_size;
   file->cache_enabled = cache_enabled;
+  file->opened_truncated = truncated;
   file->trace = clio::trace::open_file(name);
 
   /* Refuse rather than degrade when the caller asked for that. Only when the
@@ -1141,7 +1198,45 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
     return file;
   }
 
-  const std::string tag_name = std::string("hdf5:") + name;
+  /* The tag is bound lazily, on the first access that needs the tier -- see
+     clio_file_bind_tag. The exception is CLIO_REQUIRE_RUNTIME, whose whole
+     contract is that a file which cannot use the tier fails to OPEN rather than
+     degrading quietly. A lazy bind can only report a tag failure by degrading
+     the transfer, which is the outcome that flag forbids, so that configuration
+     keeps the eager bind and the refusal that goes with it. */
+  if (clio::adapter::RequireRuntime() && !clio_file_bind_tag(file)) {
+    if (degrade_or_fail("tag create failed")) { refuse(); return nullptr; }
+    return file;
+  }
+  return file;
+}
+
+/* Bind the file's CTE tag and settle whether the tier may answer for it.
+ *
+ * Runs at most once per open. Everything here used to happen in clio_make_file,
+ * i.e. inside H5Fopen/H5Fcreate; it is four to six blocking round trips
+ * (GetOrCreateTag, the stamp's GetBlobSize and GetBlob, and a DelTag plus a
+ * second GetOrCreateTag when the stamp does not match), and nothing needs it
+ * until something actually reaches for a blob. A file opened only for its
+ * metadata never reaches for one.
+ *
+ * Returns false when the file has no usable tag; the caller then treats the
+ * transfer as uncacheable, which is the same answer it gets when the runtime
+ * was never there. */
+static bool clio_file_bind_tag(clio_file_t *file) {
+  if (file->tag_bound) return true;
+  /* One failure is enough: retrying per transfer would pay the round trips
+     again for a tag that is not coming. */
+  if (file->tag_bind_failed) return false;
+
+  auto *cte_client = get_cte_client();
+  if (!cte_client) {
+    file->tag_bind_failed = true;
+    return false;
+  }
+
+  const std::string tag_name = std::string("hdf5:") + file->file_name;
+  const bool truncated = file->opened_truncated;
   if (truncated) {
     auto del = cte_client->AsyncDelTag(tag_name);
     del.Wait();  /* absent tag is a harmless no-op */
@@ -1149,8 +1244,8 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
   tag_task.Wait();
   if (tag_task->GetReturnCode() != 0) {
-    if (degrade_or_fail("tag create failed")) { refuse(); return nullptr; }
-    return file;
+    file->tag_bind_failed = true;
+    return false;
   }
   file->tag_id = tag_task->tag_id_;
 
@@ -1165,7 +1260,8 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
      be stale. */
   const clio::trace::Stamp verdict =
       truncated ? clio::trace::Stamp::kAbsent
-                : clio_stamp_matches(cte_client, file->tag_id, name);
+                : clio_stamp_matches(cte_client, file->tag_id,
+                                     file->file_name.c_str());
   if (!truncated) clio::trace::record_stamp(file->trace, verdict);
   if (!truncated && verdict != clio::trace::Stamp::kMatched) {
     auto del = cte_client->AsyncDelTag(tag_name);
@@ -1173,12 +1269,13 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
     auto again = cte_client->AsyncGetOrCreateTag(tag_name);
     again.Wait();
     if (again->GetReturnCode() != 0) {
-      if (degrade_or_fail("tag re-create failed")) { refuse(); return nullptr; }
-      return file;
+      file->tag_bind_failed = true;
+      return false;
     }
     file->tag_id = again->tag_id_;
   }
-  return file;
+  file->tag_bound = true;
+  return true;
 }
 
 static void *clio_file_create(const char *name, unsigned flags,
@@ -1336,7 +1433,14 @@ static herr_t clio_file_close(void *obj, hid_t dxpl_id, void **req) {
      close -- if the native close failed we do not know what the file is, and
      leaving the stamp stale makes the next open fail closed, which is the
      answer we want. */
-  if (ret >= 0 && file->cache_enabled) {
+  /* file->tag_bound, not file->cache_enabled: with the tag bound lazily, a file
+     that never reached the tier has no tag to stamp -- and needs none. The
+     stamp only ever licenses a tag's contents to be trusted, and a stamp
+     written now would be describing an empty tag. If such a file WAS modified,
+     the stamp left by whichever open last wrote one no longer matches it, so
+     the next open drops the tag and fails closed. That is the same answer the
+     eager path produced, reached without a round trip per close. */
+  if (ret >= 0 && file->cache_enabled && file->tag_bound) {
     if (auto *cte_client = get_cte_client()) {
       clio_write_stamp(cte_client, file->tag_id, file->file_name.c_str(),
                        file->trace);
@@ -1893,6 +1997,11 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       dataset->pending_puts.push_back(std::move(future));
       dataset->pending_buffers.push_back(std::move(buffer));
       staged_bytes += this_size;
+      /* A put is in flight for chunk_0, so "the tier holds nothing" has stopped
+         being true. Cleared on submission rather than on completion: the memo
+         may only ever skip work whose answer is certain, and from here on it
+         is not. */
+      if (i == 0) dataset->image_known_absent = false;
     }
 
     /* Write to the native VOL -- the authoritative store. Its status is this
@@ -1948,11 +2057,21 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
 /* True when the dataset's linear chunk cache is populated (a fully-staged cache
    always has a non-empty chunk_0, the hit-test key). */
 static bool clio_cache_populated(clio_dataset_t *dataset) {
+  /* Answered from the memo when this handle already knows the tier is empty for
+     this dataset -- the case for every read of a dataset written through a
+     hyperslab, which is every netCDF-4 read. Without this, a serve-only
+     selection read pays a blocking round trip to be told "miss" on every single
+     H5Dread for the whole life of the file. See image_known_absent. */
+  if (dataset->image_known_absent) return false;
   auto *cte_client = get_cte_client();
   auto sz = cte_client->AsyncGetBlobSize(dataset->file->tag_id,
                                          dataset->dataset_path + "/chunk_0");
   sz.Wait();
-  return sz->size_ > 0;
+  if (sz->size_ > 0) return true;
+  /* A miss is knowledge too, and it is the same fact the invalidate path
+     records: chunk_0 is not there. */
+  dataset->image_known_absent = true;
+  return false;
 }
 
 /* Reassemble the full linear dataset image from its CTE chunk blobs into dst
@@ -2261,21 +2380,17 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     size_t num_chunks = (total_size + chunk_size - 1) / chunk_size;
     char *dst = static_cast<char *>(buf[d]);
 
-    /* Hit test: a fully-populated cache always has a non-empty chunk_0. */
-    clio::run::u64 cached = 0;
-    {
-      auto sz = cte_client->AsyncGetBlobSize(
-          dataset->file->tag_id, dataset->dataset_path + "/chunk_0");
-      sz.Wait();
-      cached = sz->size_;
-    }
+    /* Hit test: a fully-populated cache always has a non-empty chunk_0. Routed
+       through clio_cache_populated so the whole-read path shares the selection
+       path's memo of an empty tier rather than re-asking the runtime. */
+    const bool cached = clio_cache_populated(dataset);
 
     /* What the trace should say this read was served by. A hit that fails to
        reassemble falls back to native below and must not be recorded as a
        cache serve. */
-    bool served_cache = (cached != 0);
+    bool served_cache = cached;
 
-    if (cached == 0) {
+    if (!cached) {
       /* MISS — native read is the source of truth, then stage into the tier. */
       herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                                    dataset->obj.under_vol_id,
@@ -2333,6 +2448,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
         } else {
           read_staged_bytes += this_size;
           clio_tier_mark_accepting();
+          /* chunk_0 landed: the tier is no longer known-empty for this
+             dataset. See the write path's matching line. */
+          if (i == 0) dataset->image_known_absent = false;
         }
       }
       /* Report before any invalidation below, so the discard has something to
