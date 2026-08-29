@@ -3094,6 +3094,32 @@ size_t IpcManager::ClearUserIpcs() {
   std::string memfd_dir = ctp::SystemInfo::GetMemfdDir();
   int current_pid = ctp::SystemInfo::GetPid();
 
+  // Never garbage-collect while another runtime is alive on our port.
+  //
+  // The per-entry "keep it if a live pid owns it" test below reads the entry's
+  // /proc/<pid>/fd symlink -- which only Linux has. On macOS and BSD the
+  // segments are plain files naming no owner, so that test silently keeps
+  // nothing and this sweep deletes a LIVE runtime's main segment, queue
+  // segment and IPC socket out from under it (issue #1015: a second starter
+  // racing for the port did exactly that, and only the pid record survived
+  // because it is the one entry with a contents-based owner check).
+  //
+  // The pid record is enough to know better: if it names a living process that
+  // is not us, that runtime owns this port's artifacts and none of them are
+  // stale. Skip the sweep entirely and let the caller find out it lost the
+  // port.
+  if (ConfigManager *config = CLIO_CONFIG_MANAGER) {
+    const int owner = ReadRuntimePidRecord(config->GetPort());
+    if (owner > 0 && owner != current_pid &&
+        ctp::SystemInfo::IsProcessAlive(owner)) {
+      HLOG(kInfo,
+           "ClearUserIpcs: runtime pid {} is alive on port {} - skipping the "
+           "sweep so its segments survive",
+           owner, config->GetPort());
+      return 0;
+    }
+  }
+
   for (const auto &name : ctp::SystemInfo::ListDirectory(memfd_dir)) {
     std::string full_path = memfd_dir + "/" + name;
 
