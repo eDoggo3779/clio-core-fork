@@ -1,22 +1,21 @@
-from jarvis_cd.core.pkg import Application
 from jarvis_cd.shell import Exec, LocalExecInfo
 import os
-import re
 import sys
 
 # The repo root is on sys.path when jarvis imports this module, so the shared
-# parser resolves as a namespace-package import.
+# base and parser resolve as namespace-package imports.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from jarvis_clio_core.bench_parse import parse_bench_output, parse_time_v  # noqa: E402
+from jarvis_clio_core.bench_base import S3BenchBase  # noqa: E402
+from jarvis_clio_core.bench_parse import parse_time_v  # noqa: E402
 
 
-class S3RawPutBench(Application):
+class S3RawPutBench(S3BenchBase):
     """
     Raw S3 PUT wire-speed floor.
 
     Drives scripts/s3_raw_put.py, which uploads N pre-staged files with K
     concurrent `cae_s3_tool put` processes and reports in the same format as
-    clio_s3_write_bench and zarr_s3_write_bench.
+    clio_s3_bench and zarr_s3_bench.
 
     This is the row that makes the other two interpretable. Without a floor,
     a poor CLIO number cannot be attributed: it may be CLIO's block layer, or
@@ -24,15 +23,35 @@ class S3RawPutBench(Application):
     as a bound, not a competitor -- it does no chunking, no metadata, and no
     compression, so nothing in the comparison should beat it.
 
-    NOTE for later: the READ benchmark has no equivalent floor, which is the
-    same interpretability gap in the other direction. See S3_WRITE_BENCH.md.
+    WHY THIS ONE HAS NO `mode`. It is write-only by construction: there is no
+    raw-GET counterpart, which is the same interpretability gap in the other
+    direction. `MODES` is narrowed to ('write',) so the shared helpers still
+    name the right label without offering a direction that does not exist.
+    See S3_WRITE_BENCH.md.
     """
+
+    #: Write-only. Narrowing this (rather than adding a `mode` option) is what
+    #: keeps _mode() usable here without implying a read path exists.
+    MODES = ('write',)
 
     def _init(self):
         """Initialize instance state."""
         self.script_path = None
         self.output_path = None
         self.rss_path = None
+
+    def _mode(self):
+        """
+        Always 'write'.
+
+        Overridden rather than backed by a config option: the package exposes
+        no direction to choose, so reading one out of config would invite a
+        pipeline to set a value that cannot be honoured.
+
+        Returns:
+            str: 'write'.
+        """
+        return 'write'
 
     def _configure_menu(self):
         """
@@ -61,21 +80,23 @@ class S3RawPutBench(Application):
                 'msg': 'Number of objects to upload',
                 'type': int,
                 'default': 64,
-                'help': 'Match the CLIO row"s num_blobs.'
+                'help': "Match the CLIO row's num_objects."
             },
             {
                 'name': 'object_size',
                 'msg': 'Bytes per object',
-                'type': int,
-                'default': 4194304,
-                'help': 'Match the CLIO row"s blob_size.'
+                'type': str,
+                'default': '4m',
+                'help': "Suffixes k/m/g, same spelling as clio_s3.object_size "
+                        '-- the underlying script takes a byte count, which '
+                        'this package computes. Match the CLIO row.'
             },
             {
                 'name': 'concurrency',
                 'msg': 'Concurrent cae_s3_tool processes (K)',
                 'type': int,
                 'default': 8,
-                'help': 'One process per in-flight PUT. Match the CLIO row"s '
+                'help': "One process per in-flight PUT. Match the CLIO row's "
                         'concurrency.'
             },
             {
@@ -99,7 +120,7 @@ class S3RawPutBench(Application):
                 'msg': 'AWS region',
                 'type': str,
                 'default': 'us-east-1',
-                'help': 'Must match the bucket"s real region.'
+                'help': "Must match the bucket's real region."
             },
             {
                 'name': 'aws_profile',
@@ -110,6 +131,23 @@ class S3RawPutBench(Application):
             },
         ]
 
+    def _paths(self):
+        """
+        Resolve the script and output paths from framework attributes.
+
+        Called from ``start()`` and ``_get_stat()`` rather than assigned once
+        in ``_configure``: the sweep runner reloads a fresh instance and calls
+        each without ``_configure`` in between.
+
+        Returns:
+            tuple: (script_path, output_path, rss_path).
+        """
+        return (
+            os.path.join(self.pkg_dir, 'scripts', 's3_raw_put.py'),
+            os.path.join(self.shared_dir, 's3_raw_put_output.txt'),
+            os.path.join(self.shared_dir, 's3_raw_put_time.txt'),
+        )
+
     def _configure(self, **kwargs):
         """Validate configuration and export the AWS environment."""
         if not self.config['bucket']:
@@ -118,50 +156,44 @@ class S3RawPutBench(Application):
             raise ValueError('s3_raw_put_bench: num_objects must be > 0')
         if int(self.config['concurrency']) <= 0:
             raise ValueError('s3_raw_put_bench: concurrency must be > 0')
+        object_size = self._parse_size(self.config['object_size'])
 
-        self.script_path = os.path.join(self.pkg_dir, 'scripts',
-                                        's3_raw_put.py')
+        self.script_path, self.output_path, self.rss_path = self._paths()
         if not os.path.exists(self.script_path):
-            raise ValueError(
-                f's3_raw_put.py not found at {self.script_path}')
+            raise ValueError(f's3_raw_put.py not found at {self.script_path}')
 
-        self.output_path = os.path.join(self.shared_dir,
-                                        's3_raw_put_output.txt')
-        self.rss_path = os.path.join(self.shared_dir, 's3_raw_put_time.txt')
-
-        self.setenv('AWS_DEFAULT_REGION', self.config['aws_region'])
-        if self.config['aws_profile']:
-            self.setenv('AWS_PROFILE', self.config['aws_profile'])
+        self._apply_aws_env()
         self.setenv('CAE_S3_TOOL', self.config['s3_tool'])
-        # Real AWS: an endpoint override flips cae_s3_tool to path-style
-        # addressing against a nonexistent host, so it must stay unset.
-        for key in ('S3_ENDPOINT', 'AWS_ENDPOINT_URL'):
-            for env in (self.env, self.mod_env):
-                if isinstance(env, dict):
-                    env.pop(key, None)
         os.makedirs(self.config['tmpdir'], exist_ok=True)
 
         self.log(f"Raw S3 PUT floor: {self.config['num_objects']} objects of "
-                 f"{self.config['object_size']} B, "
-                 f"K={self.config['concurrency']}")
+                 f"{object_size} B, K={self.config['concurrency']}")
 
-    def _time_prefix(self):
+    def _build_cmd(self):
         """
-        Build the GNU time(1) prefix used to capture peak RSS.
-
-        Degrades to no prefix when /usr/bin/time is absent: peak RSS is a
-        secondary metric, and hard-requiring the binary would turn a missing
-        package into a total failure of every sweep row rather than one blank
-        column. The shell builtin `time` cannot substitute -- no -v, no -o.
+        Assemble the s3_raw_put.py command line.
 
         Returns:
-            str: Command prefix, possibly empty.
+            str: The command, without any output redirection.
         """
-        if os.path.exists('/usr/bin/time'):
-            return f'/usr/bin/time -v -o {self.rss_path} '
-        self.log('WARNING: /usr/bin/time not found; peak RSS will not be '
-                 'recorded (throughput columns are unaffected)')
-        return ''
+        # _paths() rather than the attributes: they are None until start()
+        # (or _configure) assigns them, and a None here becomes "sequence item
+        # N: expected str instance" inside the join below.
+        script_path, _, rss_path = self._paths()
+        cmd = self._time_prefix(rss_path) + [
+            'python3', script_path,
+            '--bucket', str(self.config['bucket']),
+            '--key-prefix', str(self.config['key_prefix']),
+            '--num-objects', str(self.config['num_objects']),
+            # The script takes a byte count; the package takes the same k/m/g
+            # spelling every other package in the sweep uses.
+            '--object-size', str(self._parse_size(self.config['object_size'])),
+            '--concurrency', str(self.config['concurrency']),
+            '--s3-tool', str(self.config['s3_tool']),
+            '--tmpdir', str(self.config['tmpdir']),
+            '--label', 'Rawput',
+        ]
+        return ' '.join(cmd)
 
     def start(self):
         """Run the raw-PUT floor, capturing stdout+stderr for _get_stat."""
@@ -169,95 +201,22 @@ class S3RawPutBench(Application):
         # re-running _configure(), so the paths set there are still None here.
         # Resolve them from framework attributes rather than trusting
         # _configure -- otherwise the command becomes "python None ...".
-        self.script_path = os.path.join(self.pkg_dir, 'scripts',
-                                        's3_raw_put.py')
-        self.output_path = os.path.join(self.shared_dir,
-                                        's3_raw_put_output.txt')
-        self.rss_path = os.path.join(self.shared_dir, 's3_raw_put_time.txt')
+        self.script_path, self.output_path, self.rss_path = self._paths()
+        self._remove_stale(self.output_path, self.rss_path)
 
-        # Stale output from a previous combination is the blank-column failure
-        # mode -- a crash here would otherwise be scored with old numbers.
-        for path in (self.output_path, self.rss_path):
-            if os.path.exists(path):
-                os.remove(path)
-
-        cmd = (
-            f'{self._time_prefix()}python3 {self.script_path}'
-            f" --bucket {self.config['bucket']}"
-            f" --key-prefix {self.config['key_prefix']}"
-            f" --num-objects {self.config['num_objects']}"
-            f" --object-size {self.config['object_size']}"
-            f" --concurrency {self.config['concurrency']}"
-            f" --s3-tool {self.config['s3_tool']}"
-            f" --tmpdir {self.config['tmpdir']}"
-            ' --label Rawput'
-        )
-
+        cmd = self._build_cmd()
         self.log(f'Executing: {cmd}')
         result = Exec(cmd, LocalExecInfo(
             env=self.mod_env,
             pipe_stdout=self.output_path,
             pipe_stderr=self.output_path)).run()
 
-        exit_codes = getattr(result, 'exit_code', {}) or {}
-        nonzero = {h: c for h, c in exit_codes.items() if c != 0}
-        if nonzero:
-            # The script exits non-zero when any PUT failed: a partial upload
-            # timed fewer bytes than it reports, so the row must fail rather
-            # than publish a flattering number.
-            self._log_output_tail()
-            raise RuntimeError(
-                f's3_raw_put.py exited with non-zero code(s): {nonzero}')
-        self._check_output_freshness()
+        # The script exits non-zero when any PUT failed: a partial upload
+        # timed fewer bytes than it reports, so the row must fail rather than
+        # publish a flattering number.
+        self._check_exit_codes(result, 's3_raw_put.py', self.output_path)
+        self._check_output_freshness(self.output_path, 's3_raw_put.py')
         self.log(f'Raw PUT floor completed. Output: {self.output_path}')
-
-    def _log_output_tail(self, n_lines=100):
-        """
-        Emit the tail of the benchmark output into the Jarvis log.
-
-        Args:
-            n_lines (int): How many trailing lines to log.
-        """
-        if not self.output_path or not os.path.exists(self.output_path):
-            self.log(f'(no output file at {self.output_path})')
-            return
-        try:
-            with open(self.output_path, 'r') as f:
-                lines = f.readlines()
-        except Exception as e:
-            self.log(f'failed to read {self.output_path}: {e}')
-            return
-        tail = lines[-n_lines:] if len(lines) > n_lines else lines
-        self.log(f'--- s3_raw_put_output.txt tail ({len(tail)} lines) ---')
-        for line in tail:
-            self.log(line.rstrip())
-        self.log('--- end tail ---')
-
-    def _check_output_freshness(self):
-        """
-        Raise unless the output carries the results banner.
-
-        A crash partway through the upload leaves a file with the startup
-        banner but no results, which is the silent failure that produces a
-        green row with a blank throughput column.
-        """
-        if not os.path.exists(self.output_path):
-            raise RuntimeError(
-                f's3_raw_put.py produced no output at {self.output_path}')
-        with open(self.output_path, 'r') as f:
-            content = f.read()
-        if not content.strip():
-            raise RuntimeError(
-                f's3_raw_put.py output is empty: {self.output_path}')
-        if not re.search(r'=== \w+ Benchmark Results ===', content):
-            self._log_output_tail()
-            raise RuntimeError(
-                's3_raw_put.py output lacks the results banner: '
-                f'{self.output_path}')
-
-    def stop(self):
-        """Nothing to stop: the benchmark runs to completion."""
-        return True
 
     def clean(self):
         """
@@ -266,12 +225,8 @@ class S3RawPutBench(Application):
         The uploaded S3 objects are NOT purged here: the bucket prefix is the
         pipeline's to manage (post_cmds).
         """
-        for path in (self.output_path, self.rss_path):
-            try:
-                if path and os.path.exists(path):
-                    os.remove(path)
-            except Exception as e:
-                self.log(f'clean: could not remove {path}: {e}')
+        _, output_path, rss_path = self._paths()
+        self._remove_quietly((output_path, rss_path))
         try:
             Exec(f"rm -rf {self.config['tmpdir']}/s3_raw_put_*",
                  LocalExecInfo()).run()
@@ -289,20 +244,7 @@ class S3RawPutBench(Application):
         Args:
             stat_dict (dict): Collected statistics, modified in place.
         """
-        output_path = os.path.join(self.shared_dir, 's3_raw_put_output.txt')
-        rss_path = os.path.join(self.shared_dir, 's3_raw_put_time.txt')
-        if not os.path.exists(output_path):
-            self.log(f'No output file found at {output_path}')
-            return
-        try:
-            with open(output_path, 'r') as f:
-                output = f.read()
-        except Exception as e:
-            self.log(f'Could not read {output_path}: {e}')
-            return
-        found = parse_bench_output(output, self.pkg_id, stat_dict)
+        _, output_path, rss_path = self._paths()
+        found = self._scrape(output_path, stat_dict)
         parse_time_v(rss_path, self.pkg_id, 'rawput', stat_dict)
-        if found == 0:
-            self.log(f'Warning: no metrics extracted from {output_path} '
-                     f'({len(output)} bytes). A green row with a blank '
-                     f'throughput column is a FAILURE.')
+        self._warn_if_empty(found, output_path)

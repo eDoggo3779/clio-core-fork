@@ -1,7 +1,8 @@
-"""Shared results parser for the S3 read benchmark packages.
+"""Shared results parser for the S3 benchmark packages.
 
-Both drivers -- the C++ ``clio_s3_read_bench`` and the Python
-``zarr_s3_read.py`` -- emit the same two block types:
+Every driver in the sweep -- the C++ ``clio_s3_read_bench`` /
+``clio_s3_write_bench`` and the Python ``zarr_s3_read.py`` /
+``zarr_s3_write.py`` / ``s3_raw_put.py`` -- emits the same two block types:
 
     === <Label> Benchmark Results ===     (clio_bench::PrintResults wording)
     ...

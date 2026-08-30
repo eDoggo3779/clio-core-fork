@@ -19,6 +19,7 @@ binaries from a spack view, no SIF, no apptainer.
 | | CLIO | Zarr |
 |---|---|---|
 | Driver | `clio_s3_read_bench` (C++) | `zarr_s3_read.py` (zarr-python + s3fs) |
+| Jarvis package | `clio_s3_bench` (`mode: read`) | `zarr_s3_bench` (`mode: read`) |
 | Path | `ParseOmni` → `S3FileAssimilator` → fork+exec `cae_s3_tool get` → CTE `PutBlob` | `zarr.open` over `FsspecStore` → `arr[:]` |
 | Reads | N flat objects, whole-object GETs | N chunks of a Zarr v3 store |
 | Ends up | bytes in a distributed CTE tag | a NumPy array in process memory |

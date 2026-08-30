@@ -4,10 +4,11 @@
 #
 # Compares two ways of reading array data out of real Amazon S3:
 #
-#   1. CLIO  -> clio_s3_read_bench: CAE assimilator pulls flat objects
-#               (ParseOmni -> fork+exec cae_s3_tool get -> CTE PutBlob)
-#   2. Zarr   -> zarr_s3_read_bench: zarr-python + s3fs reads a Zarr v3 store,
-#               run twice per row (uncompressed and zstd)
+#   1. CLIO  -> clio_s3_bench (mode: read): CAE assimilator pulls flat objects
+#               (ParseOmni -> fork+exec cae_s3_tool get -> CTE PutBlob),
+#               driving the clio_s3_read_bench binary
+#   2. Zarr   -> zarr_s3_bench (mode: read): zarr-python + s3fs reads a Zarr v3
+#               store, run twice per row (uncompressed and zstd)
 #
 #   Grid: bytes-per-request {512 KiB, 4 MiB, 32 MiB, 256 MiB}
 #         x concurrency {1, 8, 32}
@@ -157,8 +158,9 @@ config:
       neighborhood: 1
       pool_query: "local"
 
-    - pkg_type: jarvis_clio_core.clio_s3_read_bench
+    - pkg_type: jarvis_clio_core.clio_s3_bench
       pkg_name: clio_s3
+      mode: read
       bucket: "${S3_BENCH_BUCKET}"
       key_prefix: "clio-s3-read-bench/raw/33554432"   # SWEPT
       object_size: "32m"                              # SWEPT
@@ -175,8 +177,9 @@ config:
       aws_profile: "${S3_BENCH_PROFILE}"
       verify: false
 
-    - pkg_type: jarvis_clio_core.zarr_s3_read_bench
+    - pkg_type: jarvis_clio_core.zarr_s3_bench
       pkg_name: zarr_s3
+      mode: read
       bucket: "${S3_BENCH_BUCKET}"
       store_prefix: "clio-s3-read-bench"
       chunk_edge: 256                                 # SWEPT

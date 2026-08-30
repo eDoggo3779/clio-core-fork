@@ -29,12 +29,12 @@ Five figures are emitted:
                     every stack is pinned to the link, absolute MB/s says
                     nothing and only the ratio distinguishes them. A dashed line
                     marks parity with the floor.
-  * agg_ops_per_sec - blobs/objects completed per second. This is where a
+  * agg_ops_per_sec - objects completed per second. This is where a
                     per-operation ceiling shows up: a stack whose MB/s rises
-                    with blob size but whose ops/s is flat is paying a fixed
+                    with object size but whose ops/s is flat is paying a fixed
                     per-object cost, not a bandwidth cost.
   * max_rss_mb    - client process peak memory. CLIO streams through a K-slot
-                    SHM window and grows as K x blob_size; Zarr materializes the
+                    SHM window and grows as K x object_size; Zarr materializes the
                     whole array in-process and grows with the dataset. rawput is
                     flat because the bytes live in a temp file, not in RAM --
                     its cost is on disk instead (temp_file_bytes).
@@ -49,7 +49,7 @@ CAVEATS THE PLOTS ENCODE, so nobody has to rediscover them:
   2. Any cell where requested K exceeds the object count is hatched in every
      figure: effective_concurrency caps at the object count there, so the cell
      silently duplicates a lower-K result. (Does not occur in the 36-row sweep,
-     where num_blobs=256 > 64, but a smaller smoke can trip it.)
+     where num_objects=256 > 64, but a smaller smoke can trip it.)
 
 Usage:
     python plot_s3_write_bench.py <results.csv> [output_dir]
@@ -69,9 +69,9 @@ import matplotlib.patches        # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
 # Sweep variable columns the runner records for every row.
-SIZE_COL = "clio_s3.blob_size"
+SIZE_COL = "clio_s3.object_size"
 CONC_COL = "clio_s3.concurrency"
-NUM_OBJ_COL = "clio_s3.num_blobs"
+NUM_OBJ_COL = "clio_s3.num_objects"
 
 # Observed Ares -> S3 uplink ceiling. Every stack that manages to pipeline its
 # per-object work lands on 10.8-11.1 MB/s regardless of size or concurrency, and
@@ -112,7 +112,7 @@ METRICS = [
 
 
 def size_to_bytes(value):
-    """Parse a blob-size string ('1m', '4m', '512k') into bytes."""
+    """Parse an object-size string ('1m', '4m', '512k') into bytes."""
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKmMgG]?)\s*", str(value))
     if not m:
         return float("inf")
@@ -170,7 +170,7 @@ def load_success(csv_path):
 def capped_concurrencies(sub, conc_vals):
     """Concurrency levels where requested K exceeds the object count.
 
-    At those cells effective_concurrency == num_blobs < K, so the run is not
+    At those cells effective_concurrency == num_objects < K, so the run is not
     actually exercising K-way concurrency -- it duplicates a lower-K cell.
     """
     capped = set()

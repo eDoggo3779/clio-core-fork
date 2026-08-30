@@ -3,7 +3,7 @@
 
 The wire-speed FLOOR for the CLIO-vs-Zarr S3 write benchmark. Counterpart
 drivers: ``context-transfer-engine/benchmark/clio_s3_write_bench.cc`` (CLIO)
-and ``jarvis_clio_core/zarr_s3_write_bench/scripts/zarr_s3_write.py`` (Zarr).
+and ``jarvis_clio_core/zarr_s3_bench/scripts/zarr_s3_write.py`` (Zarr).
 
 This is what separates "S3 is slow" from "CLIO is slow". Without it a poor
 CLIO row is uninterpretable: there is no way to tell whether the bottleneck is
@@ -53,7 +53,7 @@ def parse_args(argv):
                    help="keys are <prefix>/raw_%%06d.bin")
     p.add_argument("--num-objects", type=int, required=True)
     p.add_argument("--object-size", type=int, required=True,
-                   help="bytes per object; match the CLIO row's blob_size")
+                   help="bytes per object; match the CLIO row's object_size")
     p.add_argument("--concurrency", type=int, default=8,
                    help="concurrent cae_s3_tool processes (K)")
     p.add_argument("--label", default="Rawput",

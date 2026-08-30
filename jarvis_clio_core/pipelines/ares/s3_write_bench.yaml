@@ -224,7 +224,9 @@ scheduler:
         echo "  with rc=11. Pull the branch in $CLIO_REPO." >&2
         exit 1; }
       for shadow in "$HOME/.ppi-jarvis/builtin/clio_runtime" \
-                    "$HOME/.ppi-jarvis/builtin/clio_s3_write_bench"; do
+                    "$HOME/.ppi-jarvis/builtin/clio_s3_bench" \
+                    "$HOME/.ppi-jarvis/builtin/zarr_s3_bench" \
+                    "$HOME/.ppi-jarvis/builtin/s3_raw_put_bench"; do
         if [ -e "$shadow" ]; then
           echo "ERROR: $shadow shadows the checkout; jarvis will load the stale copy. Remove it." >&2
           exit 1
@@ -412,10 +414,11 @@ config:
       neighborhood: 1
       pool_query: "local"
 
-    - pkg_type: jarvis_clio_core.clio_s3_write_bench
+    - pkg_type: jarvis_clio_core.clio_s3_bench
       pkg_name: clio_s3
-      blob_size: "4m"                                 # SWEPT
-      num_blobs: 64                                   # SWEPT
+      mode: write
+      object_size: "4m"                               # SWEPT
+      num_objects: 64                                 # SWEPT
       concurrency: 8                                  # SWEPT
       worker_threads: 16                              # SWEPT (reported only)
       # Count what actually landed in the bucket, instead of deriving it. The
@@ -428,7 +431,7 @@ config:
       # Empty this prefix before each row. Every row of the sweep shares it,
       # so without the purge objects_measured counts earlier rows' leftovers
       # too: the 2026-08-26 grid had every 4 MiB row report 448 objects
-      # against num_blobs 256, the excess being exactly 192 x 1 MiB orphans
+      # against num_objects 256, the excess being exactly 192 x 1 MiB orphans
       # the 1 MiB rows' teardown never deleted. Throughput was unaffected
       # (those columns come from logical_bytes/wall_time_us), but the guard
       # degraded from an equality to a lower bound. Only this prefix is
@@ -446,12 +449,16 @@ config:
       # Turn it off for the full grid, where the egress stops being trivial.
       verify: true
 
-    - pkg_type: jarvis_clio_core.zarr_s3_write_bench
+    - pkg_type: jarvis_clio_core.zarr_s3_bench
       pkg_name: zarr_s3
+      mode: write
       bucket: "${S3_BENCH_BUCKET}"
       store_prefix: "clio-s3-write-bench"
-      total_bytes: 268435456                          # SWEPT: 64 * 4 MiB
-      chunk_bytes: 4194304                            # SWEPT: == blob_size
+      # One zarr chunk is one S3 object, so this is the same unit and the same
+      # spelling as clio_s3 above; the package computes the script's
+      # --total-bytes (num_objects * object_size) and --chunk-bytes from it.
+      num_objects: 64                                 # SWEPT: == clio_s3
+      object_size: "4m"                               # SWEPT: == clio_s3
       variants: ["none", "zstd"]
       # Source entropy is an explicit input: at 0.0 zstd cannot compress and
       # slightly EXPANDS the data, at 1.0 it compresses to nothing. Neither
@@ -466,8 +473,8 @@ config:
       pkg_name: raw_put
       bucket: "${S3_BENCH_BUCKET}"
       key_prefix: "clio-s3-write-bench/rawput"
-      num_objects: 64                                 # SWEPT: == num_blobs
-      object_size: 4194304                            # SWEPT: == blob_size
+      num_objects: 64                                 # SWEPT: == clio_s3
+      object_size: "4m"                               # SWEPT: == clio_s3
       concurrency: 8                                  # SWEPT
       tmpdir: "/tmp/clio_s3_wbench"
       aws_region: "${S3_BENCH_REGION}"
@@ -475,11 +482,16 @@ config:
 
 vars:
   # One granularity only: 4 MiB unit, 64 of them, 256 MiB per stack.
-  clio_s3.blob_size:      ["4m"]
-  clio_s3.num_blobs:      [64]
-  zarr_s3.chunk_bytes:    [4194304]
-  zarr_s3.total_bytes:    [268435456]
-  raw_put.object_size:    [4194304]
+  # All three stacks take the same two names in the same spelling, so the
+  # zipped values are literally identical -- which is the point. This used to
+  # be six variables in three vocabularies (num_blobs/blob_size,
+  # total_bytes/chunk_bytes, num_objects/<byte count>) whose equality was
+  # maintained by hand and by comment.
+  clio_s3.object_size:    ["4m"]
+  clio_s3.num_objects:    [64]
+  zarr_s3.object_size:    ["4m"]
+  zarr_s3.num_objects:    [64]
+  raw_put.object_size:    ["4m"]
   raw_put.num_objects:    [64]
 
   # The whole point of the smoke test: K=1 vs K=32.
@@ -490,8 +502,9 @@ vars:
   clio_s3.worker_threads:    [4, 48]
 
 loop:
-  - [clio_s3.blob_size, clio_s3.num_blobs, zarr_s3.chunk_bytes,
-     zarr_s3.total_bytes, raw_put.object_size, raw_put.num_objects]
+  - [clio_s3.object_size, clio_s3.num_objects,
+     zarr_s3.object_size, zarr_s3.num_objects,
+     raw_put.object_size, raw_put.num_objects]
   - [clio_s3.concurrency, zarr_s3.async_concurrency, raw_put.concurrency,
      runtime.num_threads, clio_s3.worker_threads]
 

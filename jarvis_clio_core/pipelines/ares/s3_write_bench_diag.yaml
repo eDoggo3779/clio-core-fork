@@ -45,10 +45,10 @@
 # So this grid holds K FIXED at 32 -- past the knee, on the plateau -- and
 # varies the two things the full sweep could not vary independently:
 #
-#   Axis 1  blob_size      256k / 1m / 4m, with num_blobs held at 256
+#   Axis 1  object_size    256k / 1m / 4m, with num_objects held at 256
 #   Axis 2  worker pool    runtime.num_threads 16 vs 48, at fixed K=32
 #
-# READ AXIS 1 AS objects/s, NOT MB/s. num_blobs is held at 256 for all three
+# READ AXIS 1 AS objects/s, NOT MB/s. num_objects is held at 256 for all three
 # sizes precisely so the object COUNT is constant and obj/s is comparable
 # across the axis. (Note this inverts the full sweep header reasoning, which
 # held blob count constant to keep the K=64 window meaningful. Same knob,
@@ -285,7 +285,9 @@ scheduler:
         echo "  with rc=11. Pull the branch in $CLIO_REPO." >&2
         exit 1; }
       for shadow in "$HOME/.ppi-jarvis/builtin/clio_runtime" \
-                    "$HOME/.ppi-jarvis/builtin/clio_s3_write_bench"; do
+                    "$HOME/.ppi-jarvis/builtin/clio_s3_bench" \
+                    "$HOME/.ppi-jarvis/builtin/zarr_s3_bench" \
+                    "$HOME/.ppi-jarvis/builtin/s3_raw_put_bench"; do
         if [ -e "$shadow" ]; then
           echo "ERROR: $shadow shadows the checkout; jarvis will load the stale copy. Remove it." >&2
           exit 1
@@ -419,7 +421,7 @@ scheduler:
 
       def cell(size, thr, col):
           v = [num(r, col) for r in rows
-               if r.get("clio_s3.blob_size") == size
+               if r.get("clio_s3.object_size") == size
                and r.get("runtime.num_threads") == thr]
           v = [x for x in v if x is not None]
           return statistics.mean(v) if v else float("nan")
@@ -597,10 +599,11 @@ config:
       neighborhood: 1
       pool_query: "local"
 
-    - pkg_type: jarvis_clio_core.clio_s3_write_bench
+    - pkg_type: jarvis_clio_core.clio_s3_bench
       pkg_name: clio_s3
-      blob_size: "4m"                                 # SWEPT
-      num_blobs: 256                                  # SWEPT
+      mode: write
+      object_size: "4m"                               # SWEPT
+      num_objects: 256                                # SWEPT
       # PINNED, not swept. K=32 sits past the knee the full sweep found, on
       # the plateau -- which is where the defect lives and where varying the
       # worker pool is a clean test. Changing this changes what axis 2 means.
@@ -616,7 +619,7 @@ config:
       # Empty this prefix before each row. Every row of the sweep shares it,
       # so without the purge objects_measured counts earlier rows' leftovers
       # too: the 2026-08-26 grid had every 4 MiB row report 448 objects
-      # against num_blobs 256, the excess being exactly 192 x 1 MiB orphans
+      # against num_objects 256, the excess being exactly 192 x 1 MiB orphans
       # the 1 MiB rows' teardown never deleted. Throughput was unaffected
       # (those columns come from logical_bytes/wall_time_us), but the guard
       # degraded from an equality to a lower bound. Only this prefix is
@@ -641,8 +644,8 @@ config:
       pkg_name: raw_put
       bucket: "${S3_BENCH_BUCKET}"
       key_prefix: "clio-s3-write-bench/rawput"
-      num_objects: 256                                # SWEPT: == num_blobs
-      object_size: 4194304                            # SWEPT: == blob_size
+      num_objects: 256                                # SWEPT: == clio_s3
+      object_size: "4m"                               # SWEPT: == clio_s3
       concurrency: 32                                 # PINNED: == clio_s3 K
       tmpdir: "/tmp/clio_s3_wbench"
       aws_region: "${S3_BENCH_REGION}"
@@ -652,7 +655,7 @@ vars:
   # ---------------------------------------------------------------------
   # Axis 1: BLOB SIZE (3 points), with the object COUNT held constant.
   #
-  # num_blobs stays 256 at every size so that obj/s is directly comparable
+  # num_objects stays 256 at every size so that obj/s is directly comparable
   # down the axis -- that is the measurement this grid exists to make. The
   # consequence is that total bytes vary 16x (64 MiB / 256 MiB / 1 GiB) and
   # the 4m rows take correspondingly longer. That is the right trade here:
@@ -663,10 +666,15 @@ vars:
   # there is no per-object ceiling it predicts ~10 MB/s. Nothing about link
   # weather can move a number 7x, so this single row decides it.
   # ---------------------------------------------------------------------
-  clio_s3.blob_size:    ["256k",  "1m",   "4m"]
-  clio_s3.num_blobs:    [256,     256,    256]
-  raw_put.object_size:  [262144,  1048576, 4194304]
-  raw_put.num_objects:  [256,     256,    256]
+  #
+  # Both stacks take the same two names in the same spelling, so the zipped
+  # values are literally identical -- which is the point. This used to be
+  # four variables in two vocabularies (num_blobs/blob_size vs
+  # num_objects/<byte count>) whose equality was maintained by hand.
+  clio_s3.object_size:  ["256k", "1m", "4m"]
+  clio_s3.num_objects:  [256,    256,  256]
+  raw_put.object_size:  ["256k", "1m", "4m"]
+  raw_put.num_objects:  [256,    256,  256]
 
   # ---------------------------------------------------------------------
   # Axis 2: RUNTIME WORKER POOL (2 points), UN-ZIPPED from concurrency.
@@ -690,7 +698,7 @@ vars:
   clio_s3.worker_threads: [16, 48]
 
 loop:
-  - [clio_s3.blob_size, clio_s3.num_blobs,
+  - [clio_s3.object_size, clio_s3.num_objects,
      raw_put.object_size, raw_put.num_objects]
   - [runtime.num_threads, clio_s3.worker_threads]
 

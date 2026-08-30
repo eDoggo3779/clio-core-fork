@@ -20,6 +20,7 @@ binaries from a spack view, no SIF, no apptainer.
 | | CLIO | Zarr | Raw floor |
 |---|---|---|---|
 | Driver | `clio_s3_write_bench` (C++) | `zarr_s3_write.py` (zarr-python + s3fs) | `s3_raw_put.py` |
+| Jarvis package | `clio_s3_bench` (`mode: write`) | `zarr_s3_bench` (`mode: write`) | `s3_raw_put_bench` |
 | Path | `AsyncPutBlob` → CTE → `kS3` bdev `WriteBlocks` → signed PUT from the runtime daemon | `zarr.create_array` over `FsspecStore` → `arr[:] = data` | K concurrent `cae_s3_tool put` |
 | Writes | N blobs, split into `block_<offset>` objects | N chunks of a Zarr v3 store | N flat objects |
 | Starts from | bytes in a CLIO shared-memory buffer | a NumPy array in process memory | pre-staged local files |
@@ -58,7 +59,7 @@ results.csv row carries the caveats:
   fewer bytes, while CLIO's bdev sends every byte uncompressed. A zstd row that
   looks faster may simply have transferred less.
 - `objects_written`, `put_count` — request-rate vs bandwidth regime. Note CLIO's
-  count is derived from block geometry (`blob_size / block_size`), not from the
+  count is derived from block geometry (`object_size / block_size`), not from the
   blob count.
 - `compression`, `decode_step` — for writes, `decode_step` is really the
   *encode* pass. It is kept under the read-side name so one parser key serves
@@ -110,7 +111,7 @@ The smoke pipeline does exactly this: `K=1` with 4 workers vs `K=32` with 48.
 | zarr (zstd) | 7.14 | 3.71 | **19.90** | 10.34 | 96.2% |
 | CLIO → S3 bdev | 6.08 | 6.03 | 12.17 | 10.11 | 94.0% |
 
-All MB/s. Both rows `status: success`, `objects_measured` = 64 = `num_blobs`,
+All MB/s. Both rows `status: success`, `objects_measured` = 64 = `num_objects`,
 `bytes_measured` = 268435456 exactly, `put_count` = `objects_measured` (no
 allocator fragmentation), `--verify` clean on both.
 
@@ -185,7 +186,7 @@ bytes exceed wire bytes. Quoting that as a throughput win over CLIO is the
 single easiest misread of this sweep; compare `wire_bw_mbps`.
 
 **Client memory is a clear CLIO win, by ~6×.** At 4 MiB / K=64: CLIO 266 MB,
-zarr 1664 MB, zstd 1724 MB. CLIO's K-slot SHM window grows as K × blob_size and
+zarr 1664 MB, zstd 1724 MB. CLIO's K-slot SHM window grows as K × object_size and
 nothing else; zarr materializes the whole 1 GiB array in-process. rawput is flat
 at 21 MB only because its bytes live in a temp file — `temp_file_bytes` reaches
 256 MiB at K=64, so it moved the cost to disk rather than avoiding it.
@@ -317,7 +318,7 @@ Output: `${HOME}/s3_write_bench_full_results/results.csv`, 36 rows —
 Every gate and credential path is carried over from the smoke verbatim, so a
 green smoke is a strong predictor of a green sweep. Two deliberate differences:
 `verify` is **off** (the smoke settled byte-fidelity; `objects_measured` is the
-per-row guard and costs no egress), and `num_blobs` is 256 rather than 64 so
+per-row guard and costs no egress), and `num_objects` is 256 rather than 64 so
 that K=64 has several windows of work behind it instead of one.
 
 The grid is built around what the smoke found — see the header comment in
@@ -352,7 +353,7 @@ right for finding the knee, but it means "CLIO stops improving past K=32" and
 those 36 rows separates them. Pinning K and moving only the pool separates them
 in one step.
 
-**`objects/s`, not MB/s, is the measurement.** `num_blobs` is held at 256 at
+**`objects/s`, not MB/s, is the measurement.** `num_objects` is held at 256 at
 every size so the object count is constant and obj/s is comparable down the
 axis. (This inverts the full sweep's reasoning for the same knob, which held
 blob count constant to keep the K=64 window meaningful.)
@@ -427,7 +428,7 @@ the error bars on the ratio are real.
 Bars are hatched where a cell is not measuring what it claims: K=1 in the ratio
 figure (the floor is fork+exec-bound there, not a floor), and any cell where
 requested K exceeds the object count (`effective_concurrency` caps at the object
-count, silently duplicating a lower-K cell — cannot happen at `num_blobs: 256`,
+count, silently duplicating a lower-K cell — cannot happen at `num_objects: 256`,
 but a smaller smoke can trip it).
 
 `share_y` is per-metric. MB/s, the ratio, and RSS are comparable between panels
@@ -445,18 +446,18 @@ bandwidth is a quarter the object rate.
    required columns are `clio_s3.write.agg_bw_mbps`, `zarr_s3.write.agg_bw_mbps`,
    `zarr_s3.writezstd.agg_bw_mbps`, and `raw_put.rawput.agg_bw_mbps`.
 3. **`objects_written` and `put_count` > 0** on every stack.
-4. **`clio_s3.write.objects_measured` equals `num_blobs`.** This one is a `list`
+4. **`clio_s3.write.objects_measured` equals `num_objects`.** This one is a `list`
    of the bucket prefix rather than a number the benchmark computed, so it is
    the only column a run that wrote nothing cannot fabricate. Zero means the
    row is fiction regardless of what the throughput columns say.
 
-   **More than `num_blobs` does not necessarily mean the allocator
+   **More than `num_objects` does not necessarily mean the allocator
    fragmented.** Check `put_count` first: if `put_count == objects_written ==
-   num_blobs` and only `objects_measured` is high, the allocator was fine and
+   num_objects` and only `objects_measured` is high, the allocator was fine and
    the listing picked up **stale objects from an earlier row**. That is what
    the 2026-08-26 sweep hit: all 36 rows share one key prefix
    (`clio-s3-write-bench/bdev`), and every 4 MiB row reported
-   `objects_measured: 448` against `num_blobs: 256`. The excess was exactly 192
+   `objects_measured: 448` against `num_objects: 256`. The excess was exactly 192
    objects / 201326592 bytes = 192 × 1 MiB — orphaned blocks from the 1 MiB
    rows that teardown's `FreeBlocks` never deleted, constant across all
    eighteen 4 MiB rows rather than accumulating.
@@ -483,7 +484,7 @@ bandwidth is a quarter the object rate.
      `objects_purged` is 0 everywhere but the first row means the leak is gone.
    * **If the purge fails, it says so and the row still runs.** The log line
      names it, and `objects_measured` reverts to a lower bound for that row —
-     compare it against `put_count` rather than `num_blobs`.
+     compare it against `put_count` rather than `num_objects`.
 
    To check the prefix by hand (Ares has no AWS CLI):
    `python3 scripts/s3_cli.py ls "$S3_BENCH_BUCKET" --prefix clio-s3-write-bench/bdev`
@@ -491,7 +492,7 @@ bandwidth is a quarter the object rate.
    Two qualifications, both learned the hard way on 2026-08-26:
 
    * **Not at K=1.** The floor forks one `cae_s3_tool` per object and stages
-     each through a temp file, so at concurrency 1 it pays `num_blobs`
+     each through a temp file, so at concurrency 1 it pays `num_objects`
      serialized `fork+exec` calls in the critical path and came back *slower*
      than CLIO (4.72 vs 6.03 MB/s). Its own fairness columns show why —
      `subprocess_spawns: 64`, `temp_file_bytes: 4194304`. At K ≥ 8 that
@@ -640,7 +641,7 @@ normally becomes exactly one S3 object: `AllocateFromTarget` hands the whole
 request to the allocator, `WriteBlocks` issues one `PutObject` per returned
 block, and an unfragmented request gets a single block. More objects than blobs
 means the allocator fragmented and split the request. (An earlier version of this
-benchmark derived `PUT count` as `ceil(blob_size / block_size)` from a
+benchmark derived `PUT count` as `ceil(object_size / block_size)` from a
 `--block-size` flag that configured nothing, which overstated it 4× at the smoke
 test's 4 MiB blobs. The flag is gone.)
 
