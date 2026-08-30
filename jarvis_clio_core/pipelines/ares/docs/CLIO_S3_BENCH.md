@@ -394,10 +394,12 @@ Writes a 1024³ uint16 array (2 GiB) as 8 Zarr v3 stores (chunk edges
 64/128/256/512 × none/zstd) plus 4 flat-object sets at matching sizes, and a
 `manifest.json`. **Only the four uncompressed stores are read** now that zstd
 is out of the grid; the zstd stores are staged anyway, so re-enabling the
-variant needs no re-staging. Pass `--only-granularity` / `--only` to trim the
-upload if that storage is unwelcome. Idempotent — the manifest is written last, so a re-run skips
-completed work and redoes only partial uploads. Useful flags: `--dry-run`,
-`--only zarr|raw`, `--only-granularity 256`, `--force`.
+variant needs no re-staging; pass `--only-granularity` / `--only` to trim the
+upload if that storage is unwelcome.
+
+Idempotent — the manifest is written last, so a re-run skips completed work and
+redoes only partial uploads. Useful flags: `--dry-run`, `--only zarr|raw`,
+`--only-granularity 256`, `--force`.
 
 Sanity-check it end-to-end against a local S3-compatible store first if you
 like — both the staging script and the Zarr reader accept `--endpoint-url` (or
@@ -465,46 +467,6 @@ free on the write side is `verify`: it re-reads every blob, which is GET egress
 Object keys are deterministic (`block_<offset>`, `raw_%06d.bin`, zarr chunk
 paths), so re-runs overwrite rather than accumulate. Storage does not grow
 without bound even if a purge is skipped.
-
----
-
-## Plotting the results
-
-```bash
-python3 jarvis_clio_core/scripts/plot_s3_write_bench.py \
-    ~/s3_write_bench_full_results/results.csv [output_dir]
-```
-
-Needs `pandas` + `matplotlib` (the zarr venv has both). Prints the wire-MB/s
-table above, then writes five PNGs:
-
-| file | what it answers |
-|---|---|
-| `s3_write_wire_bw.png` | the cross-stack comparison — bytes actually on the wire |
-| `s3_write_agg_bw.png` | logical MB/s; the gap against the wire figure *is* compression |
-| `s3_write_ratio.png` | **the headline** — each stack ÷ the raw-PUT floor of the same row |
-| `s3_write_ops.png` | objects/s, where a per-object ceiling shows up as a flat bar |
-| `s3_write_max_rss.png` | client peak memory (log scale) |
-
-One subplot per blob size, x-axis concurrency, one bar per stack, error bars =
-repeat stddev. Stacks absent from the CSV are dropped at load, so the script
-renders three bars per cluster on a current sweep and four on an archived one
-that still carries `zarr_s3.writezstd` — no flag, no edit.
-
-**Read `s3_write_ratio.png` first.** When four stacks are all pinned to the same
-link, absolute MB/s says nothing about any of them; only the ratio to the floor
-separates "CLIO is slow" from "S3 is slow". Ratios are computed **per row**, not
-from column means, so numerator and denominator saw the same link weather and
-the error bars on the ratio are real.
-
-Bars are hatched where a cell is not measuring what it claims: K=1 in the ratio
-figure (the floor is fork+exec-bound there, not a floor), and any cell where
-requested K exceeds the object count (`effective_concurrency` caps at the object
-count, silently duplicating a lower-K cell).
-
-`share_y` is per-metric. MB/s, the ratio, and RSS are comparable between panels
-and share an axis; objects/s does **not**, because a 4 MiB object at the same
-bandwidth is a quarter the object rate.
 
 ---
 
