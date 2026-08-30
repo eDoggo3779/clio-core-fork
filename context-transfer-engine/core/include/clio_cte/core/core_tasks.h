@@ -131,24 +131,14 @@ struct CreateParams {
   // CTE configuration object (not serialized, loaded from pool_config)
   Config config_;
 
-  // OUT: Raw pointer (uintptr_t cast) to GpuMetadataCacheHeader allocated by
-  // the server during Create. Zero when the GPU metadata cache is disabled
-  // or no GPU backend is built in. The pointer is a managed/shared USM
-  // address valid for both host and device access in the SAME process; it
-  // is NOT a cross-process IPC handle (cross-process sharing requires
-  // Level-Zero IPC on SYCL or cudaIpc on CUDA — see
-  // gpu_metadata_cache.h header for the eventual extension).
-  clio::run::u64 gpu_cache_ptr_ = 0;
-
   // OUT: byte offset of the CTE shared-memory metadata cache root within the
   // runtime's metadata allocator (issue #783). 0 means caching is disabled --
   // no metadata segment, or the cache could not be built -- and the client
   // must simply use the RPC path.
   //
-  // UNLIKE gpu_cache_ptr_ above, this is genuinely cross-process valid: it is
-  // an OFFSET into a segment both processes map, not a raw address. That is
-  // the whole reason the cache can be read by another process at all; a
-  // pointer here would resolve to garbage in the client.
+  // This is an OFFSET into a segment both processes map, not a raw address.
+  // That is the whole reason the cache can be read by another process at
+  // all; a pointer here would resolve to garbage in the client.
   clio::run::u64 shm_cache_root_off_ = 0;
 
   // Required: chimod library name for module manager
@@ -160,14 +150,12 @@ struct CreateParams {
   // Copy constructor (required for task creation)
   CreateParams(const CreateParams &other)
       : config_(other.config_),
-        gpu_cache_ptr_(other.gpu_cache_ptr_),
         shm_cache_root_off_(other.shm_cache_root_off_) {}
 
   // Constructor with pool_id and CreateParams (required for admin
   // task creation)
   CreateParams(const clio::run::PoolId &pool_id, const CreateParams &other)
       : config_(other.config_),
-        gpu_cache_ptr_(other.gpu_cache_ptr_),
         shm_cache_root_off_(other.shm_cache_root_off_) {
     // pool_id is used by the admin task framework, but we don't need to store
     // it
@@ -179,23 +167,17 @@ struct CreateParams {
   template <class Archive>
   void serialize(Archive &ar) {
     // Most of Config is loaded server-side from pool_config.config_ via
-    // LoadConfig (compose mode). The GPU metadata cache settings are
-    // serialized explicitly so callers can opt in directly via
-    // CreateParams (no compose YAML required) — the server reads them
-    // from CreateParams::config_.gpu_metadata_cache_.
+    // LoadConfig (compose mode); only the settings a caller may want to
+    // pass directly via CreateParams (no compose YAML required) are on
+    // the wire.
     //
-    // gpu_cache_ptr_ flows back on the OUT path: the server writes the
-    // managed-USM cache pointer into chimod_params_ at the end of
-    // Create, and the client's GetParams() returns it.
-    ar(config_.gpu_metadata_cache_.enabled_,
-       config_.gpu_metadata_cache_.capacity_bytes_,
-       config_.gpu_metadata_cache_.max_blobs_,
-       config_.gpu_metadata_cache_.max_tags_,
-       config_.performance_.stat_targets_period_ms_,
+    // shm_cache_root_off_ flows back on the OUT path: the server writes
+    // it into chimod_params_ at the end of Create, and the client's
+    // GetParams() returns it.
+    ar(config_.performance_.stat_targets_period_ms_,
        config_.organizer_.name_,
        config_.organizer_.organizer_tasks_,
        config_.organizer_.period_ms_,
-       gpu_cache_ptr_,
        shm_cache_root_off_);
   }
 
@@ -422,7 +404,11 @@ struct RegisterTargetTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<RegisterTargetTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -483,7 +469,11 @@ struct UnregisterTargetTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<UnregisterTargetTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -602,7 +592,11 @@ struct StatTargetsTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<StatTargetsTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -688,8 +682,22 @@ struct GetTargetInfoTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    // For target info, just copy (should be same across replicas)
-    Copy(other_base.template Cast<GetTargetInfoTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetTargetInfoTask>();
+    // Target info is PARTITIONED across nodes: only the node that owns the
+    // target has real numbers, every other replica answers zeros. Summing the
+    // counters and taking the best score therefore reproduces the owner's
+    // answer for one replica and a true collective total for many.
+    if (replica->target_score_ > target_score_) {
+      target_score_ = replica->target_score_;
+    }
+    remaining_space_ += replica->remaining_space_;
+    bytes_read_ += replica->bytes_read_;
+    bytes_written_ += replica->bytes_written_;
+    ops_read_ += replica->ops_read_;
+    ops_written_ += replica->ops_written_;
   }
 };
 
@@ -1649,6 +1657,64 @@ struct Context {
         actual_psnr_db_(0.0) {
   }
 
+  /**
+   * Merge a REPLICA's OUT state into this (origin) Context. Issue #915.
+   *
+   * Context is INOUT on every Put/Get task, so a task's AggregateOut may not
+   * simply assign it: the IN half (persistence targets, emulate_, replica_,
+   * origin_node_, the compression controls) belongs to the CALLER and has to
+   * survive the gather untouched. Only the fields the RUNTIME writes are
+   * merged here, with reductions chosen so that a single-replica gather --
+   * which is what almost every route does -- lands on exactly the replica's
+   * values, the same result the old whole-task copy produced.
+   */
+  CTP_CROSS_FUN void AggregateOut(const Context &replica) {
+    // Modeled I/O time and compression cost are per-replica WORK: they sum.
+    emulated_time_ns_ += replica.emulated_time_ns_;
+    actual_original_size_ += replica.actual_original_size_;
+    actual_compressed_size_ += replica.actual_compressed_size_;
+    actual_compress_time_ms_ += replica.actual_compress_time_ms_;
+    // transform_flags_ is a bit set describing the STORED bytes; every replica
+    // that transformed its share contributes its bits.
+    transform_flags_ |= replica.transform_flags_;
+    // Coherence version (#894): newest wins. A stale replica must never roll
+    // the origin's view of the content backwards.
+    if (replica.version_ > version_) {
+      version_ = replica.version_;
+    }
+    // origin_node_ is INOUT, not IN. The caller sets it to "I hold a local
+    // copy at node N, please register it"; the OWNER answers by either leaving
+    // it (registration accepted) or CLEARING it to kNoOriginNode (refused --
+    // the blob pre-existed beyond this put, so the speculative copy is only a
+    // prefix). The cache chimod reads that answer back:
+    //
+    //   if (wrote_local && (rc != 0 || out_ctx.origin_node_ == kNoOriginNode))
+    //       -> DelBlob the speculative local copy
+    //
+    // Treating it as pure IN kept the caller's value and silently swallowed
+    // the refusal, so the cache kept a copy the owner told it to drop and
+    // served STALE bytes on the next round -- the coherence suite read
+    // 'w1r0' where it expected 'w1r1'. A refusal from any replica must win;
+    // when nobody refuses the caller's value survives untouched, which is what
+    // the removed whole-task Copy() did for a single-replica gather.
+    if (replica.origin_node_ == kNoOriginNode) {
+      origin_node_ = kNoOriginNode;
+    }
+    // PSNR is a quality bound, not a total: keep the WORST (lowest) figure any
+    // replica reported. 0 means "lossless / not measured", hence the guard.
+    if (replica.actual_psnr_db_ > 0.0 &&
+        (actual_psnr_db_ == 0.0 || replica.actual_psnr_db_ < actual_psnr_db_)) {
+      actual_psnr_db_ = replica.actual_psnr_db_;
+    }
+    // Derive the ratio from the merged totals so it stays consistent with
+    // them. It defaults to 1.0, so a first-non-zero rule could not work.
+    if (actual_compressed_size_ > 0) {
+      actual_compression_ratio_ =
+          static_cast<double>(actual_original_size_) /
+          static_cast<double>(actual_compressed_size_);
+    }
+  }
+
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive &ar) {
     // ONE unconditional range = ONE wire format in every build (see the
@@ -1838,7 +1904,23 @@ struct GetOrCreateTagTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GetOrCreateTagTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetOrCreateTagTask>();
+    // tag_id_ is INOUT and every replica resolves the SAME tag, so the first
+    // non-null id wins. created_ is a one-shot flag (the tag is created once,
+    // by one node). tag_size_ lives on the owning shard, the only replica that
+    // answers non-zero.
+    if (tag_id_.IsNull()) {
+      tag_id_ = replica->tag_id_;
+    }
+    if (replica->created_) {
+      created_ = replica->created_;
+    }
+    if (replica->tag_size_ > tag_size_) {
+      tag_size_ = replica->tag_size_;
+    }
   }
 };
 
@@ -2090,7 +2172,16 @@ struct PutBlobTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<PutBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<PutBlobTask>();
+    // blob_name_ is INOUT only because the wire protocol echoes it; the server
+    // never modifies it, so the origin's copy is already correct. Do NOT assign
+    // it: it is the CLIENT's shm string, and taking the replica's would free
+    // the client's buffer through the runtime's allocator (the #500 class of
+    // corruption). context_ is the only field carrying real OUT state.
+    context_.AggregateOut(replica->context_);
   }
 };
 
@@ -2341,7 +2432,15 @@ struct GetBlobTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GetBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetBlobTask>();
+    // blob_data_ is never merged: the payload is bulk-transferred straight into
+    // the ORIGIN's buffer, and the replica's ShmPtr points into a foreign
+    // segment. context_ carries the OUT state (emulated time, transform flags,
+    // coherence version).
+    context_.AggregateOut(replica->context_);
   }
 };
 
@@ -2419,7 +2518,11 @@ struct ReorganizeBlobTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ReorganizeBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -2766,7 +2869,13 @@ struct PodPutBlobTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<PodPutBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<PodPutBlobTask>();
+    // blob_name_ round-trips unchanged (the server never writes it), so the
+    // origin's copy is already correct. See PutBlobTask::AggregateOut.
+    context_.AggregateOut(replica->context_);
   }
 };
 
@@ -2884,7 +2993,13 @@ struct PodGetBlobTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<PodGetBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<PodGetBlobTask>();
+    // blob_data_ is bulk-transferred into the ORIGIN's buffer; never merge the
+    // replica's pointer. See GetBlobTask::AggregateOut.
+    context_.AggregateOut(replica->context_);
   }
 };
 
@@ -2955,7 +3070,11 @@ struct PodReorganizeBlobTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<PodReorganizeBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -3020,7 +3139,11 @@ struct DelBlobTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DelBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -3079,7 +3202,11 @@ struct TruncateBlobTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<TruncateBlobTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 
@@ -3166,7 +3293,15 @@ struct DelTagTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DelTagTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<DelTagTask>();
+    // tag_id_ is INOUT (input, or the result of a name lookup). Every replica
+    // resolves the same tag, so the first non-null id wins.
+    if (tag_id_.IsNull()) {
+      tag_id_ = replica->tag_id_;
+    }
   }
 };
 
@@ -3700,7 +3835,18 @@ struct PollTelemetryLogTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<PollTelemetryLogTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<PollTelemetryLogTask>();
+    // The log is partitioned per node: concatenate the entries and keep the
+    // highest logical time any replica scanned to.
+    if (replica->last_logical_time_ > last_logical_time_) {
+      last_logical_time_ = replica->last_logical_time_;
+    }
+    for (size_t i = 0; i < replica->entries_.size(); ++i) {
+      entries_.push_back(replica->entries_[i]);
+    }
   }
 };
 
@@ -3771,7 +3917,15 @@ struct GetBlobScoreTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GetBlobScoreTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetBlobScoreTask>();
+    // The blob lives on one shard; every other replica answers 0, so max
+    // yields the owner's score for one replica and for many.
+    if (replica->score_ > score_) {
+      score_ = replica->score_;
+    }
   }
 };
 
@@ -3848,7 +4002,33 @@ struct GetBlobSizeTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GetBlobSizeTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetBlobSizeTask>();
+    // TEMPORARY DIAGNOSTIC (cluster coherence bug #2). Does this aggregation
+    // even run for the 4-node barrier, and does the base's sticky-error rule
+    // poison the result?
+    //
+    // Task::AggregateOut takes ANY non-zero replica rc. GetBlobSize is an
+    // owner-shard query: the owner answers rc=0/size=1, non-owners legitimately
+    // answer rc=1/size=0. size_ merges with MAX (correct), but rc would come
+    // back 1 -- and Barrier() requires `rc == 0 && size == 1`, so it could
+    // never be satisfied. Before fb735bdb the whole-task Copy() overwrote rc
+    // with the LAST replica's, which often landed on 0.
+    //
+    // If this line never appears, there is no N->1 gather here and that whole
+    // story is wrong.
+    HLOG(kWarning,
+         "[AGG-GBS] origin rc={} size={} <- replica rc={} size={}",
+         GetReturnCode(), static_cast<unsigned long long>(size_),
+         replica->GetReturnCode(),
+         static_cast<unsigned long long>(replica->size_));
+    // The blob lives on one shard; non-owners answer 0, so max yields the
+    // owner's size for one replica and for many.
+    if (replica->size_ > size_) {
+      size_ = replica->size_;
+    }
   }
 };
 
@@ -3950,7 +4130,20 @@ struct GetBlobInfoTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GetBlobInfoTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<GetBlobInfoTask>();
+    // Score/size live on the owning shard (non-owners answer 0), while block
+    // placement is genuinely partitioned across the nodes holding the data.
+    if (replica->score_ > score_) {
+      score_ = replica->score_;
+    }
+    if (replica->total_size_ > total_size_) {
+      total_size_ = replica->total_size_;
+    }
+    blocks_.insert(blocks_.end(), replica->blocks_.begin(),
+                   replica->blocks_.end());
   }
 };
 
@@ -4251,7 +4444,13 @@ struct FlushMetadataTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushMetadataTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<FlushMetadataTask>();
+    // Each node flushes its own metadata shard, so the collective total is the
+    // SUM (a whole-task copy clobbered it with the last replica's count).
+    entries_flushed_ += replica->entries_flushed_;
   }
 };
 
@@ -4308,7 +4507,13 @@ struct FlushDataTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushDataTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    auto replica = other_base.template Cast<FlushDataTask>();
+    // Each node flushes its own data, so the collective totals are SUMS.
+    bytes_flushed_ += replica->bytes_flushed_;
+    blobs_flushed_ += replica->blobs_flushed_;
   }
 };
 
@@ -4361,7 +4566,11 @@ struct DynamicReorganizeTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<DynamicReorganizeTask>());
+    // OUT fields ONLY -- never Copy() (issue #915): a whole-task assignment
+    // destroys this ORIGIN's identity and re-assigns IN shm members across
+    // allocator segments. See Task::AggregateOut for the full contract.
+    // This task declares no OUT fields, so the base call above (return code +
+    // completer) is the entire merge.
   }
 };
 

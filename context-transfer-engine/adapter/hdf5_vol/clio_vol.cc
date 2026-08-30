@@ -103,6 +103,23 @@ struct clio_file_t {
      is always a correct (if unaccelerated) mode -- the native file is
      authoritative regardless. */
   bool cache_enabled = true;
+  /* Lazy tag binding.
+     The CTE tag and its coherence stamp are needed by exactly one thing: code
+     that touches the tier. Resolving them in clio_make_file charged the cost to
+     H5Fopen instead -- a GetOrCreateTag plus the stamp's GetBlobSize and
+     GetBlob, all blocking, and a DelTag/GetOrCreateTag pair when the stamp does
+     not match, with a stamp PutBlob at close to answer. A file the application
+     opens and closes without a single cacheable transfer paid all of it for
+     nothing, and netCDF-4 metadata-only opens are exactly that shape:
+     nc_test4/tst_files4 opens and closes one file 32768 times, reading only
+     attributes and dataspaces.
+     tag_bound is the gate; tag_bind_failed stops a failed bind being retried
+     per transfer. opened_truncated remembers what clio_make_file knew about the
+     native open, because the bind has to make the same "any pre-existing tag is
+     stale" decision later. See clio_file_bind_tag. */
+  bool tag_bound = false;
+  bool tag_bind_failed = false;
+  bool opened_truncated = false;
   /* Safe mode: cacheable datasets currently open in this file. H5Fflush and
      H5Fclose drain their pending CTE puts so no async write outlives a
      successful flush/close (the native file is already written synchronously and
@@ -139,6 +156,21 @@ struct clio_dataset_t {
      object-open / wrap paths), so we never key a blob by an empty/ambiguous
      name. */
   bool cacheable;
+  /* Memo of ONE fact this handle established: the tier holds nothing for this
+     dataset. chunk_0 is the hit-test key, so its absence is the whole state.
+     Set by a successful invalidation or by a hit test that came back empty;
+     cleared the instant anything is staged.
+
+     It exists because netCDF-4 -- and any application that writes through a
+     hyperslab -- never takes the whole-dataset path. Every nc_put_vara lands in
+     the partial branch of clio_dataset_write, which invalidates; every
+     nc_get_vara lands in clio_serve_selection, which hit-tests. Both are
+     BLOCKING runtime round trips, and both were re-issued per transfer forever,
+     asking a question already answered: after the first invalidation there is
+     nothing left to delete and nothing left to find. On the netCDF-C suite that
+     is one round trip per element-space transfer -- tens of thousands per test
+     -- for a tier that cannot be used by such a workload at all. */
+  bool image_known_absent = false;
   /* Pending async writes flushed on close */
   std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
@@ -328,9 +360,62 @@ static void clio_tier_mark_accepting() {
   }
 }
 
+/*---------------------------------------------------------------------------
+ * Process-exit guard.
+ *
+ * HDF5 installs atexit(H5_term_library) the first time the library is
+ * initialized, and H5_term_library closes every file the application left
+ * open -- which reaches clio_file_close, and through it drain_dataset_puts and
+ * the coherence stamp, LONG AFTER main() has returned.
+ *
+ * The CLIO client, by contrast, is a set of process-global objects whose
+ * teardown runs as ordinary static destructors: the shared ZeroMQ context
+ * (whose destructor zmq_ctx_shutdown()s every socket), the IPC manager's
+ * receive threads, the deferred-write registry. Every one of those is
+ * registered LATER than HDF5's atexit handler -- the client is first
+ * constructed on the first H5Fopen, long after H5open() -- and exit handlers
+ * run last-registered-first. So by the time H5_term_library asks this
+ * connector to close a file, CLIO is already gone, and the Wait() inside
+ * clio_write_stamp blocks forever on a future no surviving receive thread can
+ * ever complete. That is an unkillable hang at exit, and it is what made the
+ * netCDF-C suite's short-lived tool processes (ncdump, ncgen, nctest, and
+ * every nc_test4 binary that leaves a file open) sit at their ctest timeout
+ * instead of exiting.
+ *
+ * The fix is to stop calling into CLIO once teardown has begun. The guard is
+ * armed from every entry point HDF5 can reach this connector through, all of
+ * which run after H5open(), so LIFO ordering guarantees it is set before
+ * H5_term_library runs. Nothing is lost by skipping the tier there: the native
+ * file is authoritative and already closed correctly by the under-VOL, and a
+ * coherence stamp that is not written simply makes the next open see kAbsent
+ * and re-read from the file -- the fail-closed direction.
+ *
+ * Not atomic on purpose: written once by the thread running exit handlers, at
+ * a point where the C runtime has already serialized teardown.
+ *---------------------------------------------------------------------------*/
+static bool clio_vol_exiting_g = false;
+
+static void clio_vol_note_exit() { clio_vol_exiting_g = true; }
+
+static void clio_vol_install_exit_guard() {
+  static bool installed = false;
+  if (!installed) {
+    installed = true;
+    std::atexit(clio_vol_note_exit);
+  }
+}
+
 static bool drain_dataset_puts(clio_dataset_t *dset) {
   bool ok = true;
   int first_rc = 0;
+  /* Exit handlers are running and the client that would retire these puts is
+     gone; waiting is waiting forever. Report success so the caller does not
+     then try to invalidate (another round trip into the same dead client) --
+     the native file is authoritative and unaffected either way. */
+  if (clio_vol_exiting_g) {
+    dset->pending_puts.clear();
+    return true;
+  }
   for (auto &future : dset->pending_puts) {
     future.Wait();
     const int rc = future->GetReturnCode();
@@ -388,6 +473,11 @@ struct clio_wrap_ctx_t {
  * ======================================================================== */
 
 static clio::cte::core::Client *get_cte_client() {
+  /* Checked before the cached answer, and here rather than at each call site:
+     this is the one door to the tier, so a caller cannot forget the guard.
+     Returning nullptr is a state every caller already handles -- it is the
+     same answer they get when the runtime was never reachable. */
+  if (clio_vol_exiting_g) return nullptr;
   /* Lazily attach this process to the running clio/CTE runtime on first
      use. When HDF5 dlopen()s the connector via HDF5_VOL_CONNECTOR there is no
      LD_PRELOAD constructor to do it (the POSIX adapter inits in
@@ -412,11 +502,21 @@ static clio::cte::core::Client *get_cte_client() {
   return attached ? CLIO_CTE_CLIENT : nullptr;
 }
 
-/* Is the CTE cache path usable for this file at all? One check for the two
-   independent reasons it may not be: the user turned it off, or the runtime is
-   not there. */
+/* Bind this file's CTE tag and verify its coherence stamp, at most once, on the
+   first access that actually needs the tier. Defined further down, next to the
+   stamp helpers it uses. */
+static bool clio_file_bind_tag(clio_file_t *file);
+
+/* Is the CTE cache path usable for this file at all? One check for the three
+   independent reasons it may not be: the user turned it off, the runtime is not
+   there, or this file has no tag and could not be given one.
+
+   This is also where the tag gets bound: it is the single door every tier
+   access goes through, so a caller cannot reach a blob with an unbound tag and
+   cannot forget to bind one. */
 static bool clio_cache_usable(clio_file_t *file) {
-  return file && file->cache_enabled && get_cte_client() != nullptr;
+  return file && file->cache_enabled && get_cte_client() != nullptr &&
+         clio_file_bind_tag(file);
 }
 
 /* ------------------------------------------------------------------ admission
@@ -484,6 +584,16 @@ static bool clio_cache_env_enabled() {
    uncacheable for the rest of the session, which is the fail-closed choice. */
 static void clio_invalidate_dataset(clio_dataset_t *dset) {
   if (!dset || !dset->file || !dset->cacheable) return;
+  /* No tag was ever bound for this file, so nothing can be staged under one.
+     Deliberately does NOT bind one: invalidation is reached from the
+     native-only branch of every partial write, and binding there would put the
+     open-time tag cost back on the first hyperslab write of every file. */
+  if (!dset->file->tag_bound) return;
+  /* Nothing staged, nothing to invalidate -- and we know that without asking,
+     because this handle is what emptied it. Skipping the round trip here is the
+     difference between one blocking RPC per hyperslab write and one per
+     dataset. See image_known_absent. */
+  if (dset->image_known_absent) return;
   /* Tell the telemetry the staged bytes are gone BEFORE dropping them.
      Everything staged for this dataset is about to stop being servable, so
      leaving it counted would inflate the admission denominator with data that
@@ -514,7 +624,11 @@ static void clio_invalidate_dataset(clio_dataset_t *dset) {
             "the cache for this dataset (native file is authoritative)\n",
             dset->dataset_path.c_str(), rc);
     dset->cacheable = false;
+    return;
   }
+  /* The hit-test key is gone and this handle is the one that removed it, so the
+     next invalidation and the next hit test both already have their answer. */
+  dset->image_known_absent = true;
 }
 
 /* ========================================================================
@@ -1054,6 +1168,7 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   file->file_name = name;
   file->chunk_size = chunk_size;
   file->cache_enabled = cache_enabled;
+  file->opened_truncated = truncated;
   file->trace = clio::trace::open_file(name);
 
   /* Refuse rather than degrade when the caller asked for that. Only when the
@@ -1083,7 +1198,45 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
     return file;
   }
 
-  const std::string tag_name = std::string("hdf5:") + name;
+  /* The tag is bound lazily, on the first access that needs the tier -- see
+     clio_file_bind_tag. The exception is CLIO_REQUIRE_RUNTIME, whose whole
+     contract is that a file which cannot use the tier fails to OPEN rather than
+     degrading quietly. A lazy bind can only report a tag failure by degrading
+     the transfer, which is the outcome that flag forbids, so that configuration
+     keeps the eager bind and the refusal that goes with it. */
+  if (clio::adapter::RequireRuntime() && !clio_file_bind_tag(file)) {
+    if (degrade_or_fail("tag create failed")) { refuse(); return nullptr; }
+    return file;
+  }
+  return file;
+}
+
+/* Bind the file's CTE tag and settle whether the tier may answer for it.
+ *
+ * Runs at most once per open. Everything here used to happen in clio_make_file,
+ * i.e. inside H5Fopen/H5Fcreate; it is four to six blocking round trips
+ * (GetOrCreateTag, the stamp's GetBlobSize and GetBlob, and a DelTag plus a
+ * second GetOrCreateTag when the stamp does not match), and nothing needs it
+ * until something actually reaches for a blob. A file opened only for its
+ * metadata never reaches for one.
+ *
+ * Returns false when the file has no usable tag; the caller then treats the
+ * transfer as uncacheable, which is the same answer it gets when the runtime
+ * was never there. */
+static bool clio_file_bind_tag(clio_file_t *file) {
+  if (file->tag_bound) return true;
+  /* One failure is enough: retrying per transfer would pay the round trips
+     again for a tag that is not coming. */
+  if (file->tag_bind_failed) return false;
+
+  auto *cte_client = get_cte_client();
+  if (!cte_client) {
+    file->tag_bind_failed = true;
+    return false;
+  }
+
+  const std::string tag_name = std::string("hdf5:") + file->file_name;
+  const bool truncated = file->opened_truncated;
   if (truncated) {
     auto del = cte_client->AsyncDelTag(tag_name);
     del.Wait();  /* absent tag is a harmless no-op */
@@ -1091,8 +1244,8 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
   auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
   tag_task.Wait();
   if (tag_task->GetReturnCode() != 0) {
-    if (degrade_or_fail("tag create failed")) { refuse(); return nullptr; }
-    return file;
+    file->tag_bind_failed = true;
+    return false;
   }
   file->tag_id = tag_task->tag_id_;
 
@@ -1107,7 +1260,8 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
      be stale. */
   const clio::trace::Stamp verdict =
       truncated ? clio::trace::Stamp::kAbsent
-                : clio_stamp_matches(cte_client, file->tag_id, name);
+                : clio_stamp_matches(cte_client, file->tag_id,
+                                     file->file_name.c_str());
   if (!truncated) clio::trace::record_stamp(file->trace, verdict);
   if (!truncated && verdict != clio::trace::Stamp::kMatched) {
     auto del = cte_client->AsyncDelTag(tag_name);
@@ -1115,17 +1269,22 @@ static clio_file_t *clio_make_file(void *under_file, const char *name,
     auto again = cte_client->AsyncGetOrCreateTag(tag_name);
     again.Wait();
     if (again->GetReturnCode() != 0) {
-      if (degrade_or_fail("tag re-create failed")) { refuse(); return nullptr; }
-      return file;
+      file->tag_bind_failed = true;
+      return false;
     }
     file->tag_id = again->tag_id_;
   }
-  return file;
+  file->tag_bound = true;
+  return true;
 }
 
 static void *clio_file_create(const char *name, unsigned flags,
                                 hid_t fcpl_id, hid_t fapl_id,
                                 hid_t dxpl_id, void **req) {
+  /* Belt and braces: whatever route selected this connector, a file open is
+     unconditionally after H5open(), so the guard is armed no later than the
+     first file that could still be open when exit handlers start running. */
+  clio_vol_install_exit_guard();
   size_t chunk_size = 0;
   bool cache_on = true;
   clio_resolve_config(fapl_id, &chunk_size, &cache_on);
@@ -1154,6 +1313,7 @@ static void *clio_file_create(const char *name, unsigned flags,
 
 static void *clio_file_open(const char *name, unsigned flags,
                               hid_t fapl_id, hid_t dxpl_id, void **req) {
+  clio_vol_install_exit_guard();
   size_t chunk_size = 0;
   bool cache_on = true;
   clio_resolve_config(fapl_id, &chunk_size, &cache_on);
@@ -1273,12 +1433,26 @@ static herr_t clio_file_close(void *obj, hid_t dxpl_id, void **req) {
      close -- if the native close failed we do not know what the file is, and
      leaving the stamp stale makes the next open fail closed, which is the
      answer we want. */
-  if (ret >= 0 && file->cache_enabled) {
+  /* file->tag_bound, not file->cache_enabled: with the tag bound lazily, a file
+     that never reached the tier has no tag to stamp -- and needs none. The
+     stamp only ever licenses a tag's contents to be trusted, and a stamp
+     written now would be describing an empty tag. If such a file WAS modified,
+     the stamp left by whichever open last wrote one no longer matches it, so
+     the next open drops the tag and fails closed. That is the same answer the
+     eager path produced, reached without a round trip per close. */
+  if (ret >= 0 && file->cache_enabled && file->tag_bound) {
     if (auto *cte_client = get_cte_client()) {
       clio_write_stamp(cte_client, file->tag_id, file->file_name.c_str(),
                        file->trace);
     }
   }
+
+  /* See clio_group_close: a failed native close leaves the file open, and
+     HDF5 will call this callback again with the same wrapper -- so stop here,
+     before anything is released or the trace is closed out. The drain above
+     is idempotent and the stamp was already skipped (it is guarded on
+     ret >= 0), so the retry does the whole job. */
+  if (ret < 0) return ret;
 
   clio::trace::close_file(file->trace);  /* writes the summary; no-op if null */
   file->trace = nullptr;
@@ -1479,6 +1653,55 @@ static bool clio_type_matches_file(clio_dataset_t *dataset, hid_t mem_type_id,
   return H5Tget_size(mem_type_id) == dataset->file_type_size;
 }
 
+/* The dataset's FULL path inside the file, e.g. "/g1/g2/var".
+ *
+ * Every CTE blob this connector writes is keyed by this string, so it has to
+ * identify the dataset uniquely within the file. The `name` argument HDF5
+ * hands to dataset_create/open does NOT: it is relative to `obj`, so a
+ * dataset opened through its parent group arrives as bare "var", and two
+ * datasets called "var" in different groups shared one key. The second one
+ * opened then read the first one's bytes -- zero-padded when it was shorter,
+ * which is exactly how it surfaced: ncdump printing `var = 1, 0, 0` for a
+ * variable holding 1, 2, 3 (ncdump/tst_netcdf4 and tst_grp_spec).
+ *
+ * Asked of the under-VOL rather than composed here, because `name` may also be
+ * absolute, may be relative to the file, and may reach us by token from
+ * H5Oopen or a reference -- one query answers all of those the way HDF5 itself
+ * would (this is what H5Iget_name does).
+ *
+ * Returns "" when the name cannot be had, which make_dataset_wrapper() treats
+ * as not cacheable: no key at all is the only safe answer, since a guessed one
+ * is how the collision above happened. */
+static std::string clio_object_full_path(void *under_obj, hid_t under_vol_id,
+                                         H5I_type_t obj_type, hid_t dxpl_id) {
+  if (!under_obj) return std::string();
+  H5VL_loc_params_t loc{};
+  loc.type = H5VL_OBJECT_BY_SELF;
+  loc.obj_type = obj_type;
+
+  size_t name_len = 0;
+  H5VL_object_get_args_t args{};
+  args.op_type = H5VL_OBJECT_GET_NAME;
+  args.args.get_name.buf_size = 0;
+  args.args.get_name.buf = nullptr;
+  args.args.get_name.name_len = &name_len;
+  if (H5VLobject_get(under_obj, &loc, under_vol_id, &args, dxpl_id,
+                     nullptr) < 0 || name_len == 0) {
+    return std::string();
+  }
+
+  std::string path(name_len + 1, '\0');
+  args.args.get_name.buf_size = name_len + 1;
+  args.args.get_name.buf = &path[0];
+  args.args.get_name.name_len = &name_len;
+  if (H5VLobject_get(under_obj, &loc, under_vol_id, &args, dxpl_id,
+                     nullptr) < 0) {
+    return std::string();
+  }
+  path.resize(name_len);
+  return path;
+}
+
 static void *clio_dataset_create(void *obj,
                                    const H5VL_loc_params_t *loc_params,
                                    const char *name, hid_t lcpl_id,
@@ -1493,8 +1716,11 @@ static void *clio_dataset_create(void *obj,
       lcpl_id, type_id, space_id, dcpl_id, dapl_id, dxpl_id, req);
   if (!under_dset) return nullptr;
 
+  const std::string path = clio_object_full_path(under_dset, o->under_vol_id,
+                                                 H5I_DATASET, dxpl_id);
   return make_dataset_wrapper(under_dset, o->under_vol_id,
-                              find_parent_file(obj), name);
+                              find_parent_file(obj),
+                              path.empty() ? nullptr : path.c_str());
 }
 
 static void *clio_dataset_open(void *obj,
@@ -1508,8 +1734,11 @@ static void *clio_dataset_open(void *obj,
       dapl_id, dxpl_id, req);
   if (!under_dset) return nullptr;
 
+  const std::string path = clio_object_full_path(under_dset, o->under_vol_id,
+                                                 H5I_DATASET, dxpl_id);
   return make_dataset_wrapper(under_dset, o->under_vol_id,
-                              find_parent_file(obj), name);
+                              find_parent_file(obj),
+                              path.empty() ? nullptr : path.c_str());
 }
 
 /* ---- Access telemetry helpers (observe-only; active only under CLIO_VOL_TRACE) */
@@ -1768,6 +1997,11 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
       dataset->pending_puts.push_back(std::move(future));
       dataset->pending_buffers.push_back(std::move(buffer));
       staged_bytes += this_size;
+      /* A put is in flight for chunk_0, so "the tier holds nothing" has stopped
+         being true. Cleared on submission rather than on completion: the memo
+         may only ever skip work whose answer is certain, and from here on it
+         is not. */
+      if (i == 0) dataset->image_known_absent = false;
     }
 
     /* Write to the native VOL -- the authoritative store. Its status is this
@@ -1823,11 +2057,21 @@ static herr_t clio_dataset_write(size_t count, void *dset[],
 /* True when the dataset's linear chunk cache is populated (a fully-staged cache
    always has a non-empty chunk_0, the hit-test key). */
 static bool clio_cache_populated(clio_dataset_t *dataset) {
+  /* Answered from the memo when this handle already knows the tier is empty for
+     this dataset -- the case for every read of a dataset written through a
+     hyperslab, which is every netCDF-4 read. Without this, a serve-only
+     selection read pays a blocking round trip to be told "miss" on every single
+     H5Dread for the whole life of the file. See image_known_absent. */
+  if (dataset->image_known_absent) return false;
   auto *cte_client = get_cte_client();
   auto sz = cte_client->AsyncGetBlobSize(dataset->file->tag_id,
                                          dataset->dataset_path + "/chunk_0");
   sz.Wait();
-  return sz->size_ > 0;
+  if (sz->size_ > 0) return true;
+  /* A miss is knowledge too, and it is the same fact the invalidate path
+     records: chunk_0 is not there. */
+  dataset->image_known_absent = true;
+  return false;
 }
 
 /* Reassemble the full linear dataset image from its CTE chunk blobs into dst
@@ -2136,21 +2380,17 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     size_t num_chunks = (total_size + chunk_size - 1) / chunk_size;
     char *dst = static_cast<char *>(buf[d]);
 
-    /* Hit test: a fully-populated cache always has a non-empty chunk_0. */
-    clio::run::u64 cached = 0;
-    {
-      auto sz = cte_client->AsyncGetBlobSize(
-          dataset->file->tag_id, dataset->dataset_path + "/chunk_0");
-      sz.Wait();
-      cached = sz->size_;
-    }
+    /* Hit test: a fully-populated cache always has a non-empty chunk_0. Routed
+       through clio_cache_populated so the whole-read path shares the selection
+       path's memo of an empty tier rather than re-asking the runtime. */
+    const bool cached = clio_cache_populated(dataset);
 
     /* What the trace should say this read was served by. A hit that fails to
        reassemble falls back to native below and must not be recorded as a
        cache serve. */
-    bool served_cache = (cached != 0);
+    bool served_cache = cached;
 
-    if (cached == 0) {
+    if (!cached) {
       /* MISS — native read is the source of truth, then stage into the tier. */
       herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
                                    dataset->obj.under_vol_id,
@@ -2208,6 +2448,9 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
         } else {
           read_staged_bytes += this_size;
           clio_tier_mark_accepting();
+          /* chunk_0 landed: the tier is no longer known-empty for this
+             dataset. See the write path's matching line. */
+          if (i == 0) dataset->image_known_absent = false;
         }
       }
       /* Report before any invalidation below, so the discard has something to
@@ -2299,9 +2542,14 @@ static herr_t clio_dataset_close(void *obj, hid_t dxpl_id, void **req) {
     clio_invalidate_dataset(dset);
   }
 
-  if (dset->file_type >= 0) H5Tclose(dset->file_type);
   herr_t ret = H5VLdataset_close(dset->obj.under_object,
                                   dset->obj.under_vol_id, dxpl_id, req);
+  /* See clio_group_close: on failure HDF5 keeps the object and will close it
+     again through this same wrapper, so nothing may be released. The drain
+     above has already run, which is correct either way -- it is idempotent
+     (pending_puts is emptied) and a retry must not re-wait on retired puts. */
+  if (ret < 0) return ret;
+  if (dset->file_type >= 0) H5Tclose(dset->file_type);
   delete dset;
   /* Last, and only after everything above has finished reading through
      dset->file (drain and invalidate both use its tag and trace). */
@@ -2365,7 +2613,15 @@ static herr_t clio_group_close(void *obj, hid_t dxpl_id, void **req) {
   auto *o = static_cast<clio_obj_t *>(obj);
   herr_t ret = H5VLgroup_close(o->under_object, o->under_vol_id,
                                 dxpl_id, req);
-  delete o;
+  /* Free the wrapper ONLY when the underlying close succeeded. A failed close
+     leaves the object open, and HDF5 hands the SAME VOL object back on the
+     caller's next attempt -- freeing it here made that retry a use-after-free.
+     H5F_CLOSE_SEMI is the everyday way to see it: H5Fclose fails while anything
+     in the file is still open, and h5_test/tst_h_files sets exactly that degree
+     and then closes twice, which aborted the process inside malloc rather than
+     reporting the failure. Mirrors H5VLpassthru, which guards every one of its
+     free_obj calls the same way. */
+  if (ret >= 0) delete o;
   return ret;
 }
 
@@ -2433,7 +2689,9 @@ static herr_t clio_attr_specific(void *obj, const H5VL_loc_params_t *lp,
 static herr_t clio_attr_close(void *attr, hid_t dxpl_id, void **req) {
   auto *o = static_cast<clio_obj_t *>(attr);
   herr_t ret = H5VLattr_close(o->under_object, o->under_vol_id, dxpl_id, req);
-  delete o;
+  /* See clio_group_close: a failed close means HDF5 will hand this same
+     wrapper back on the next attempt. */
+  if (ret >= 0) delete o;
   return ret;
 }
 
@@ -2526,14 +2784,16 @@ static void *clio_object_open(void *obj,
      the dataset_read/write/close callbacks to this wrapper and cast it to
      clio_dataset_t. h5py opens datasets through H5Oopen, so returning a bare
      clio_obj_t here would be mis-cast and corrupt the heap. Build the right
-     wrapper type. The dataset path is recovered from a by-name location when
-     available; otherwise the dataset is marked non-cacheable. */
+     wrapper type. A dataset whose path cannot be resolved is marked
+     non-cacheable. */
   if (opened_type && *opened_type == H5I_DATASET) {
-    const char *name = nullptr;
-    if (loc_params && loc_params->type == H5VL_OBJECT_BY_NAME) {
-      name = loc_params->loc_data.loc_by_name.name;
-    }
-    return make_dataset_wrapper(under, o->under_vol_id, o->parent_file, name);
+    /* The full path, asked of the under-VOL -- not loc_params' name, which is
+       relative to `obj` and absent entirely for a by-token open. See
+       clio_object_full_path() for why a relative name cannot be a cache key. */
+    const std::string path = clio_object_full_path(under, o->under_vol_id,
+                                                   H5I_DATASET, dxpl_id);
+    return make_dataset_wrapper(under, o->under_vol_id, o->parent_file,
+                                path.empty() ? nullptr : path.c_str());
   }
 
   auto *wrapped = new clio_obj_t;
@@ -2630,7 +2890,8 @@ static herr_t clio_datatype_close(void *obj, hid_t dxpl_id, void **req) {
   auto *o = static_cast<clio_obj_t *>(obj);
   herr_t ret = H5VLdatatype_close(o->under_object, o->under_vol_id, dxpl_id,
                                    req);
-  delete o;
+  /* See clio_group_close. */
+  if (ret >= 0) delete o;
   return ret;
 }
 
@@ -2638,9 +2899,30 @@ static herr_t clio_datatype_close(void *obj, hid_t dxpl_id, void **req) {
 static herr_t clio_introspect_get_conn_cls(void *obj,
                                              H5VL_get_conn_lvl_t lvl,
                                              const H5VL_class_t **conn_cls) {
-  (void)obj; (void)lvl;
-  *conn_cls = &H5VL_clio_cls;
-  return 0;
+  /* Only H5VL_GET_CONN_LVL_CURR asks about THIS connector. Every other level --
+     H5VL_GET_CONN_LVL_TERMINAL above all -- asks about the connector at the
+     bottom of the stack, and this one is a pass-through: the terminal
+     connector is the native VOL underneath, not us.
+
+     Answering "clio" for every level made H5VLobject_is_native() report false
+     for every object in a clio-backed file. HDF5's own dimension-scale code
+     branches on exactly that: H5DSwith_new_ref() sets
+     is_new_ref = (config_flag || !native), so a false answer diverted
+     H5DSattach_scale onto its new-style-reference path, which attaches a held
+     file ID to each reference it builds. One of those holds is never released
+     (the H5Treclaim after the write is sized by the OLD dataspace, one element
+     short of the buffer), so the file ID outlived H5Fclose and the next
+     H5Fcreate(H5F_ACC_TRUNC) on the same name failed with "unable to truncate
+     a file which is already open" -- h5_test/tst_h_dimscales, with nothing in
+     the error to point back here. Delegating puts a clio-backed file on the
+     same path as a native one. Mirrors H5VLpassthru. */
+  auto *o = static_cast<clio_obj_t *>(obj);
+  if (H5VL_GET_CONN_LVL_CURR == lvl || !o) {
+    *conn_cls = &H5VL_clio_cls;
+    return 0;
+  }
+  return H5VLintrospect_get_conn_cls(o->under_object, o->under_vol_id, lvl,
+                                     conn_cls);
 }
 
 static herr_t clio_introspect_get_cap_flags(const void *info,
@@ -2922,6 +3204,7 @@ const H5VL_class_t H5VL_clio_cls = {
 };
 
 hid_t H5VL_clio_register(void) {
+  clio_vol_install_exit_guard();
   return H5VLregister_connector(&H5VL_clio_cls, H5P_DEFAULT);
 }
 
@@ -2941,4 +3224,11 @@ hid_t H5VL_clio_register(void) {
  * H5VL_clio_register() + H5Pset_vol() itself.
  * ======================================================================== */
 extern "C" H5PL_type_t H5PLget_plugin_type(void) { return H5PL_TYPE_VOL; }
-extern "C" const void *H5PLget_plugin_info(void) { return &H5VL_clio_cls; }
+extern "C" const void *H5PLget_plugin_info(void) {
+  /* The plugin path does NOT go through H5VL_clio_register(): HDF5 asks for
+     the class here and registers the connector itself. This is therefore the
+     entry point that must arm the process-exit guard for every
+     HDF5_VOL_CONNECTOR=clio application. */
+  clio_vol_install_exit_guard();
+  return &H5VL_clio_cls;
+}

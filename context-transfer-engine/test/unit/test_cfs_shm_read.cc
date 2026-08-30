@@ -688,4 +688,115 @@ TEST_CASE("clio-fs writes always succeed, errors land on fsync/close",
   cfs_io->RemovePath(path);
 }
 
+// The SEQUENTIAL half of the descriptor layer: ReadFd / SeekFd / TellFd.
+//
+// The cases above drive the POSITIONAL calls (PreadFd/PwriteFd) and the
+// whole-file ones (SizeFd/SyncFd/FtruncateFd), but nothing reached these three
+// -- and per-descriptor offset state is the ONLY thing that distinguishes them
+// from their positional counterparts, so it was the one part of the layer with
+// no coverage at all. It is also the part that just stopped being POSIX-only:
+// the descriptor layer used to be `#if !defined(_WIN32)`'d out entirely, and
+// now compiles everywhere, which makes an untested offset contract a portable
+// untested offset contract.
+//
+// Every assertion below is about the offset, not the bytes: reads are checked
+// against a position-dependent pattern so a read from the WRONG offset fails
+// on content rather than merely on length.
+TEST_CASE("clio-fs descriptor layer: sequential read, seek, tell",
+          "[cfs][fd][noleak]") {
+  REQUIRE(InitRuntime());
+  auto *cfs_io = CLIO_CFS_CLIENT;
+  REQUIRE(cfs_io != nullptr);
+
+  const std::string path = "clio::/tmp/clio_cfs_seq_io.dat";
+  cfs_io->RemovePath(path);
+
+  // Byte i is a function of i, so any off-by-offset read is detectable.
+  const size_t kSize = 8192;
+  const size_t kChunk = 1024;
+  std::vector<char> src(kSize);
+  for (size_t i = 0; i < kSize; ++i) {
+    src[i] = static_cast<char>((i * 17 + 3) % 251);
+  }
+
+  int fd = cfs_io->OpenFd(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+  REQUIRE(fd >= 0);
+  REQUIRE(cfs_io->PwriteFd(fd, src.data(), kSize, 0) ==
+          static_cast<ssize_t>(kSize));
+  REQUIRE(cfs_io->SyncFd(fd) == 0);
+
+  std::vector<char> got(kChunk);
+
+  SECTION("a fresh descriptor starts at 0");
+  // PwriteFd is positional and must NOT have moved the offset.
+  REQUIRE(cfs_io->TellFd(fd) == 0);
+
+  SECTION("ReadFd advances the offset by exactly what it returned");
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data(), kChunk) == 0);
+  REQUIRE(cfs_io->TellFd(fd) == static_cast<off_t>(kChunk));
+
+  // The second read must continue where the first stopped rather than
+  // re-reading from 0 -- the defining property of a sequential read.
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data() + kChunk, kChunk) == 0);
+  REQUIRE(cfs_io->TellFd(fd) == static_cast<off_t>(2 * kChunk));
+
+  SECTION("SEEK_SET is absolute");
+  REQUIRE(cfs_io->SeekFd(fd, 4096, SEEK_SET) == 4096);
+  REQUIRE(cfs_io->TellFd(fd) == 4096);
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data() + 4096, kChunk) == 0);
+
+  SECTION("SEEK_CUR is relative to the current offset");
+  // Now at 4096+kChunk. Rewind one chunk and re-read the same bytes.
+  REQUIRE(cfs_io->SeekFd(fd, -static_cast<off_t>(kChunk), SEEK_CUR) == 4096);
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data() + 4096, kChunk) == 0);
+  // A zero-offset SEEK_CUR is the documented way to ask "where am I?", and
+  // must agree with TellFd.
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_CUR) == cfs_io->TellFd(fd));
+
+  SECTION("SEEK_END resolves against the real size, deferred writes included");
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_END) == static_cast<off_t>(kSize));
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_END) == cfs_io->SizeFd(fd));
+  // At EOF a read returns 0, not an error.
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) == 0);
+  // A negative SEEK_END lands inside the file.
+  REQUIRE(cfs_io->SeekFd(fd, -static_cast<off_t>(kChunk), SEEK_END) ==
+          static_cast<off_t>(kSize - kChunk));
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) ==
+          static_cast<ssize_t>(kChunk));
+  REQUIRE(std::memcmp(got.data(), src.data() + kSize - kChunk, kChunk) == 0);
+
+  SECTION("seeking before byte 0 fails and leaves the offset alone");
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_SET) == 0);
+  errno = 0;
+  REQUIRE(cfs_io->SeekFd(fd, -1, SEEK_SET) == -1);
+  REQUIRE(errno == EINVAL);
+  REQUIRE(cfs_io->TellFd(fd) == 0);
+
+  SECTION("an unknown whence is rejected");
+  errno = 0;
+  REQUIRE(cfs_io->SeekFd(fd, 0, 0x7fff) == -1);
+  REQUIRE(errno == EINVAL);
+
+  SECTION("a seek past EOF is legal; reading there returns 0");
+  REQUIRE(cfs_io->SeekFd(fd, static_cast<off_t>(kSize) + 4096, SEEK_SET) ==
+          static_cast<off_t>(kSize) + 4096);
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) == 0);
+
+  SECTION("every offset call rejects a descriptor we never issued");
+  REQUIRE(cfs_io->CloseFd(fd) == 0);
+  REQUIRE(cfs_io->ReadFd(fd, got.data(), kChunk) == -1);
+  REQUIRE(cfs_io->SeekFd(fd, 0, SEEK_SET) == -1);
+  REQUIRE(cfs_io->TellFd(fd) == -1);
+
+  cfs_io->RemovePath(path);
+}
+
 SIMPLE_TEST_MAIN()
