@@ -25,7 +25,7 @@
 # BARE METAL: there are deliberately no base_deploy_mode / container_* keys.
 # The clio_* packages' container_kwargs() degrades to a no-op without them.
 #
-# Prerequisites (see S3_READ_BENCH.md for the full setup):
+# Prerequisites (see docs/CLIO_S3_BENCH.md for the full setup):
 #   - Dataset staged once:  jarvis_clio_core/scripts/stage_s3_read_bench_data.py
 #   - IOWarp built with +cae +s3 and exposed via a spack view (IOWARP_VIEW)
 #   - A venv with zarr/s3fs/numpy (ZARR_VENV)
@@ -49,7 +49,7 @@
 #   and differs by the compression ratio. CLIO additionally lands its bytes in
 #   a distributed CTE tag while Zarr lands a NumPy array in one process's heap
 #   — CLIO does strictly more work, so Zarr's number is NOT "CLIO minus
-#   overhead". See S3_READ_BENCH.md.
+#   overhead". See docs/CLIO_S3_BENCH.md.
 
 scheduler:
   name: slurm

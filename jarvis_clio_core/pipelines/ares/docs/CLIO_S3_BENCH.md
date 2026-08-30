@@ -1,21 +1,47 @@
-# CLIO vs Zarr — S3 write benchmark on Ares (Issue #968)
+# CLIO vs Zarr — S3 benchmarks on Ares (Issue #968)
 
-Measures how CLIO performs as an intermediary for **writing** array data into
-real Amazon S3, against Zarr and against a raw-PUT wire-speed floor.
+Measures how CLIO performs as an intermediary between real Amazon S3 and a
+compute node, in **both directions**, against the incumbent cloud-native array
+format (Zarr) and — on the write side — against a raw-PUT wire-speed floor.
 
-This is the counterpart to [S3_READ_BENCH.md](S3_READ_BENCH.md). That benchmark
-was read-only because CLIO's S3 *write* path — the `kS3` bdev — linked the AWS
-SDK in-process, which stack-smashes `clio_run` startup. **That is now fixed**:
-the bdev was reimplemented on Poco + SigV4, mirroring the working GCS transport,
-and the AWS SDK is gone from `libclio_bdev_runtime.so` entirely. Writing is
-therefore in scope for the first time.
+Two sweeps, one package set:
 
-Like the read benchmark, this pipeline is **non-containerized**: bare-metal
-binaries from a spack view, no SIF, no apptainer.
+| | read | write |
+|---|---|---|
+| Pipeline | [`s3_read_bench.yaml`](../s3_read_bench.yaml) | [`s3_write_bench_full.yaml`](../s3_write_bench_full.yaml) |
+| CLIO path | CAE assimilator: `ParseOmni` → fork+exec `cae_s3_tool get` → CTE `PutBlob` | `AsyncPutBlob` → CTE → `kS3` bdev `WriteBlocks` → signed PUT from the runtime daemon |
+| Jarvis packages | `clio_s3_bench` / `zarr_s3_bench`, `mode: read` | `clio_s3_bench` / `zarr_s3_bench`, `mode: write`, plus `s3_raw_put_bench` |
+| Spack variants | `+cae +cte +s3` | `+cae +cte +s3 +s3_bdev` |
+
+Writing was out of scope originally: the `kS3` bdev linked the AWS SDK
+in-process, which stack-smashes `clio_run` startup. **That is fixed** — the bdev
+was reimplemented on Poco + SigV4, mirroring the working GCS transport, and the
+AWS SDK is gone from `libclio_bdev_runtime.so` entirely.
+
+Unlike the Issue #526 pipelines (see [PERF_EVAL_BENCH.md](PERF_EVAL_BENCH.md)),
+both of these are **non-containerized**: bare-metal binaries from a spack view,
+no SIF, no apptainer.
 
 ---
 
 ## What gets compared
+
+### Read
+
+| | CLIO | Zarr |
+|---|---|---|
+| Driver | `clio_s3_read_bench` (C++) | `zarr_s3_read.py` (zarr-python + s3fs) |
+| Jarvis package | `clio_s3_bench` (`mode: read`) | `zarr_s3_bench` (`mode: read`) |
+| Path | `ParseOmni` → `S3FileAssimilator` → fork+exec `cae_s3_tool get` → CTE `PutBlob` | `zarr.open` over `FsspecStore` → `arr[:]` |
+| Reads | N flat objects, whole-object GETs | N chunks of a Zarr v3 store |
+| Ends up | bytes in a distributed CTE tag | a NumPy array in process memory |
+| Compression | none | none **and** zstd, both in the same row |
+
+Both stacks move **the same 2 GiB of logical data** in every row. Across the
+granularity axis only the *request count* changes (4096 / 512 / 64 / 8), because
+each raw object set is the same 2 GiB buffer re-split.
+
+### Write
 
 | | CLIO | Zarr | Raw floor |
 |---|---|---|---|
@@ -26,10 +52,9 @@ binaries from a spack view, no SIF, no apptainer.
 | Starts from | bytes in a CLIO shared-memory buffer | a NumPy array in process memory | pre-staged local files |
 | Compression | none | none **and** zstd, both in the same row | none |
 
-All three stacks move **the same 256 MiB of logical data** in every row, in the
-same 4 MiB unit.
+All three stacks move the same logical bytes in every row, in the same unit.
 
-### Read the raw floor first
+### Read the raw floor first (write side)
 
 The `rawput` row is not a competitor — it is the **bound**. It does the least
 possible work: no CTE, no chunking layer, no metadata, no compression, just
@@ -40,100 +65,91 @@ Without it a poor CLIO number is uninterpretable. If CLIO is slow *and* rawput
 is slow, the bottleneck is the link or the bucket, and no amount of CLIO work
 will move it. Only a gap between them is a CLIO finding.
 
-> **Future work, deliberately not done here:** the *read* benchmark has no
+> **Future work, deliberately not done here:** the *read* sweep has no
 > equivalent floor, which is the same interpretability gap in the other
 > direction. Back-porting a raw-GET floor to `s3_read_bench.yaml` would make
-> those numbers attributable the same way. Do not touch the read bench for it —
-> it is a separate change.
+> those numbers attributable the same way. It is a separate change.
 
 ### Read the fairness columns, not just the headline
 
 Each driver emits a `Fairness` block alongside its throughput block, so every
 results.csv row carries the caveats:
 
-- `agg_bw_mbps` — throughput over **logical** (uncompressed) bytes on all three
-  sides. This is the directly comparable number.
-- `wire_bw_mbps` / `bytes_moved` — what actually crossed the network. **This
-  confound runs the opposite way from the read benchmark.** On reads,
-  compression meant Zarr fetched fewer bytes. On writes it means Zarr *sends*
-  fewer bytes, while CLIO's bdev sends every byte uncompressed. A zstd row that
-  looks faster may simply have transferred less.
-- `objects_written`, `put_count` — request-rate vs bandwidth regime. Note CLIO's
-  count is derived from block geometry (`object_size / block_size`), not from the
-  blob count.
-- `compression`, `decode_step` — for writes, `decode_step` is really the
-  *encode* pass. It is kept under the read-side name so one parser key serves
-  both benchmarks.
-- `subprocess_spawns`, `temp_file_bytes` — **both are 0 for CLIO here**, which
-  is the sharpest contrast with the read path: reading forks `cae_s3_tool` once
-  per object and stages each object whole through node-local disk, while
-  writing signs and PUTs directly from the runtime worker. The raw floor pays
-  one spawn per object by construction.
+- `agg_bw_mbps` — throughput over **logical** (uncompressed) bytes on every
+  stack. This is the directly comparable number.
+- `wire_bw_mbps` / `bytes_moved` — what actually crossed the network. This is
+  the single biggest confound in the comparison, and **it runs in opposite
+  directions on the two sweeps.** On reads, compression means Zarr *fetches*
+  fewer bytes (~20-26× fewer for the zstd store). On writes it means Zarr
+  *sends* fewer bytes while CLIO's bdev sends every byte uncompressed. Either
+  way, a zstd row that looks faster may simply have transferred less.
+- `objects_read` / `get_count`, `objects_written` / `put_count` — request-rate
+  vs bandwidth regime. Note CLIO's write count is derived from block geometry
+  (`object_size / block_size`), not from the blob count.
+- `compression`, `decode_step` — Zarr burns CPU coding; CLIO does not. On the
+  write side `decode_step` is really the *encode* pass, kept under the read-side
+  name so one parser key serves both sweeps.
+- `subprocess_spawns`, `temp_file_bytes` — **the sharpest contrast between the
+  two directions.** Reading, CLIO forks `cae_s3_tool` once per object and stages
+  every object whole through node-local disk before it reaches CTE; both are 0
+  for Zarr. Writing, both are 0 for CLIO — it signs and PUTs directly from the
+  runtime worker — and it is the raw floor that pays one spawn per object by
+  construction. These are structural costs of each implementation, not
+  measurement noise.
 - `runtime_worker_threads` — see the concurrency caveat below.
-- `max_rss_kb` — Zarr materializes the whole array in process. Absent if
-  `/usr/bin/time` is not installed.
+- `max_rss_kb` — Zarr materializes the whole array in process; CLIO streams it.
+  Absent if `/usr/bin/time` is not installed.
 
-**Two things that belong in any writeup:**
+**Things that belong in any writeup:**
 
-1. **The starting states differ.** CLIO writes from a CLIO shared-memory buffer
-   through a distributed, tiered CTE; Zarr writes from one process's heap. CLIO
-   does strictly more work. Zarr's number is *not* "CLIO minus overhead."
-2. **Source entropy is an input, not an accident.** `compressibility` (default
-   0.5) sets how compressible the Zarr source data is. At `0.0` zstd cannot
-   compress at all and in fact slightly *expands* the data, so the zstd row
-   measures nothing but encode overhead; at `1.0` it compresses to almost
-   nothing. Neither resembles real scientific arrays. Whatever value is used
-   must be stated alongside the numbers.
+1. **The end states differ, in both directions.** Reading, CLIO lands bytes in a
+   distributed, tiered CTE tag addressable by other CLIO clients while Zarr lands
+   a NumPy array in one process's heap; writing, CLIO starts from a CLIO
+   shared-memory buffer and goes through that same tiered CTE while Zarr writes
+   from one process's heap. CLIO does strictly more work. Zarr's number is *not*
+   "CLIO minus overhead."
+2. **CLIO's internal read pipelining is not tunable.** `kMaxChunkSize` (1 MiB)
+   and `kMaxParallelTasks` (32) are `static constexpr` inside
+   `S3FileAssimilator::Schedule`, so object size is the only granularity control
+   on the CLIO read side.
+3. **Source entropy is an input, not an accident (write side).**
+   `compressibility` (default 0.5) sets how compressible the Zarr source data is.
+   At `0.0` zstd cannot compress at all and in fact slightly *expands* the data,
+   so the zstd row measures nothing but encode overhead; at `1.0` it compresses
+   to almost nothing. Neither resembles real scientific arrays. Whatever value is
+   used must be stated alongside the numbers. On the read side the equivalent
+   knob is the staging script's `--pattern`.
 
 ### The concurrency caveat (read before interpreting any result)
 
-**The S3 PUT blocks a runtime worker thread.** `WriteBlocks` is a coroutine body
-in the bdev, and the signed PUT runs to completion inside it. So the effective
-concurrency ceiling is `clio_runtime.num_threads`, not the requested `K`.
+**Both directions block a runtime worker thread, for different reasons, with
+identical consequences.**
 
-This is structurally the same ceiling the read benchmark hit — there because the
-assimilator did `fork()` + blocking `waitpid()` on a worker, here because the
-HTTP request itself is synchronous. Different cause, identical consequence:
-**always sweep `runtime.num_threads` alongside `concurrency`**, and compare
-`requested_concurrency` against `effective_concurrency` and measured scaling
-before concluding anything.
+- *Read:* `S3FileAssimilator` downloads via `fork()` + **blocking `waitpid()`**
+  on a runtime worker thread — not a `CLIO_CO_AWAIT`. The worker is held for the
+  entire S3 GET.
+- *Write:* `WriteBlocks` is a coroutine body in the bdev, and the signed PUT runs
+  to completion inside it.
 
-The smoke pipeline does exactly this: `K=1` with 4 workers vs `K=32` with 48.
+Either way the effective concurrency ceiling is `clio_runtime.num_threads`, not
+the requested `K`. That is why `runtime.num_threads` is swept in lockstep with
+the concurrency axis in both pipelines, and why `cpus_per_task` is large.
+**Always compare `requested_concurrency` against `effective_concurrency` and
+measured scaling before concluding anything.**
 
----
+If raising K changes nothing on the read side, the worker pool is the ceiling:
+raise `runtime.num_threads`, or switch to the multi-process fallback
+(`clio_s3.nprocs > 1`, which partitions the key space via `--object-stride` /
+`--object-offset`).
 
-### What the first real run measured (2026-08-26, 4 MiB blobs, 64 blobs)
-
-| | K=1 agg | K=1 wire | K=32 agg | K=32 wire | % of floor @ K=32 |
-|---|---|---|---|---|---|
-| raw PUT floor | 4.72 | 4.72 | 10.75 | **10.75** | — (is the floor) |
-| zarr (none) | 5.06 | 5.06 | 10.62 | 10.62 | 98.8% |
-| zarr (zstd) | 7.14 | 3.71 | **19.90** | 10.34 | 96.2% |
-| CLIO → S3 bdev | 6.08 | 6.03 | 12.17 | 10.11 | 94.0% |
-
-All MB/s. Both rows `status: success`, `objects_measured` = 64 = `num_objects`,
-`bytes_measured` = 268435456 exactly, `put_count` = `objects_measured` (no
-allocator fragmentation), `--verify` clean on both.
-
-**The finding is the convergence, not any single number.** Four independent
-write paths landing within 6% of each other at K=32 is one shared constraint:
-roughly 85 Mbit/s of egress from an Ares compute node to S3. CLIO is not slow
-here — the link is. Report **ratio to floor**, which is a property of CLIO;
-the absolute MB/s is a property of the night you ran it.
-
-The corollary is that CLIO's apparently poor concurrency scaling (1.7× for 32×
-the concurrency) is *not* a CLIO property either. Zarr and the raw floor scale
-by the same amount and stop at the same place.
-
-Note the zstd row: **19.90 is the largest number in the file and it is the one
-that will get misquoted.** It moved 133 MiB of wire bytes to CLIO's 256 MiB for
-the same logical payload; on the wire it is marginally *slower* than CLIO.
+On the write side, **compare against `rawput` first, not against K=1** — see the
+measured results below for why that rule matters.
 
 ---
 
-### What the full 36-row sweep measured (2026-08-26)
+## What the write sweep measured (2026-08-26)
 
-2 sizes × 6 concurrencies × 3 repeats, all 36 rows `success`. Wire MB/s, mean of
+36 rows: 2 sizes × 6 concurrencies × 3 repeats, all `success`. Wire MB/s, mean of
 the three repeats:
 
 | K | \| | CLIO 1M | rawput 1M | zarr 1M | zstd 1M | \| | CLIO 4M | rawput 4M | zarr 4M | zstd 4M |
@@ -149,16 +165,18 @@ the three repeats:
 MiB) and +2.2% (4 MiB) from K=32 to K=64 — flat. rawput forks K processes and
 uses no runtime worker, so a per-connection concurrency limit would still be
 climbing there. It is the **link**, ~11.1 MB/s, and nothing in CLIO can beat it.
+Report **ratio to floor**, which is a property of CLIO; the absolute MB/s is a
+property of the night you ran it.
 
 **At 4 MiB CLIO converges on the floor: 0.96× at K=64**, having climbed 0.86 →
-0.83 → 0.89 → 0.92 → 0.96. Report that ratio, not the MB/s.
+0.83 → 0.89 → 0.92 → 0.96.
 
 **At 1 MiB it does not.** CLIO plateaus at 4.87 MB/s — **0.49× the floor** —
-while rawput and zarr both reach ~10.9. Per the decision rule in the smoke
-YAML's header, *CLIO well below rawput ⇒ CLIO's own ceiling*, and this is that
-case. It is a **per-object** ceiling, not a bandwidth one: CLIO saturates at
-~5.5 objects/s, worth 5.5 MB/s at 1 MiB but 22 MB/s at 4 MiB — above the link,
-which is exactly why the 4 MiB rows look healthy and hide it.
+while rawput and zarr both reach ~10.9. *CLIO well below rawput ⇒ CLIO's own
+ceiling*, and this is that case. It is a **per-object** ceiling, not a bandwidth
+one: CLIO saturates at ~5.5 objects/s, worth 5.5 MB/s at 1 MiB but 22 MB/s at
+4 MiB — above the link, which is exactly why the 4 MiB rows look healthy and
+hide it. **This defect is open.**
 
 The K=1 latency fit says the fixed cost is not the problem. Fitting
 `latency = fixed + size/rate` through the two K=1 points:
@@ -175,10 +193,9 @@ CLIO's problem is that ~180 ms of that per-object work does not pipeline across
 concurrency, where the floor's does. Compare the scaling K=1→64: rawput 5.8×,
 CLIO 2.2×.
 
-The oversubscription check the full-sweep YAML calls for comes back **clean**:
-at K=64 (`runtime.num_threads: 64` on `cpus_per_task: 40`) CLIO does not dip
-below K=32 at either size — 4.76 → 4.87 and 9.91 → 10.57. No need to re-run
-that point at 48 threads.
+The oversubscription check comes back **clean**: at K=64
+(`runtime.num_threads: 64` on `cpus_per_task: 40`) CLIO does not dip below K=32
+at either size — 4.76 → 4.87 and 9.91 → 10.57.
 
 **zstd compresses 1.93× and is link-bound like everything else.** Its
 `agg_bw_mbps` reaches 20.6 — above the 11.1 MB/s link — purely because logical
@@ -195,7 +212,9 @@ Run-to-run spread over the 3 repeats: zarr is the steadiest (median 0.3% CV),
 CLIO and rawput median ~3% with occasional 16% outliers — shared-uplink weather,
 which is what `repeat: 3` is for.
 
-## Addressing: the key prefix is mandatory
+---
+
+## Addressing: the key prefix is mandatory (write)
 
 CTE registers each target as `device.path_ + "_node<N>"`. For a cloud device
 that suffix lands on the **path string**, so:
@@ -218,18 +237,41 @@ configure a prefix.
 
 ## One-time setup
 
-### 0. Build IOWarp with the S3 bdev and expose it as a view
+### 0. Build IOWarp and expose it as a view
 
-The write path needs the **`+s3_bdev`** variant (Poco + SigV4). This is a
-different feature from `+s3`, which gates the CAE assimilator and `cae_s3_tool`
-— you need **both**, because the raw-PUT floor uses `cae_s3_tool`:
+The read sweep needs `+cae +cte +s3`; the write sweep additionally needs
+**`+s3_bdev`** (Poco + SigV4). These are different features that share the word
+"S3": `+s3` gates the CAE assimilator and `cae_s3_tool`, `+s3_bdev` gates the
+`kS3` block device. The write sweep needs **both**, because the raw-PUT floor
+uses `cae_s3_tool`. Building everything at once covers both sweeps:
 
 ```bash
-spack install iowarp@<branch> +cae +cte +s3 +s3_bdev
-spack view --dependencies no symlink /mnt/common/$USER/iowarp-s3-view iowarp@<branch>
+spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev
+spack view --dependencies no symlink /mnt/common/$USER/iowarp-s3-view iowarp@968-s3-bench
+export IOWARP_VIEW="/mnt/common/$USER/iowarp-s3-view"
 ```
 
-Two traps worth knowing before you spend a build on them:
+Alternatively, to build a local checkout without a recipe edit:
+
+```bash
+spack develop -p "$HOME/clio-core" iowarp@dev
+spack install iowarp@dev +cae +cte +s3 +s3_bdev
+```
+
+Verify the gates actually took — the root `CMakeLists.txt` silently turns
+`CAE_ENABLE_S3` back **off** if `find_package(AWSSDK)` fails, in which case the
+build succeeds with no S3 support at all:
+
+```bash
+ls "$IOWARP_VIEW/bin/clio_s3_read_bench" \
+   "$IOWARP_VIEW/bin/clio_s3_write_bench" \
+   "$IOWARP_VIEW/bin/cae_s3_tool"
+```
+
+All three must exist. Note `aws-sdk-cpp` is unpinned in the recipe and builds all
+components by default — expect 30–60 minutes.
+
+Three traps worth knowing before you spend a build on them:
 
 - **`spack view symlink` never overwrites existing links.** With another
   `iowarp` already in the view it logs conflicts and *skips* them, so the
@@ -241,155 +283,146 @@ Two traps worth knowing before you spend a build on them:
   already installed and silently skips the compile. Use
   `spack uninstall -y <spec> && spack clean -s && spack install <spec>` — the
   `spack clean -s` is required, or it re-clones the old commit.
-
-The pipeline asserts the build for you in `pre_cmds`: it fails fast if
-`libclio_bdev_runtime.so` lacks Poco NetSSL, or if it still links the AWS SDK.
+- **The write pipeline asserts the build for you** in `pre_cmds`: it fails fast
+  if `libclio_bdev_runtime.so` lacks Poco NetSSL, or if it still links the AWS
+  SDK.
 
 ### 1. Zarr venv
 
-Same venv the read benchmark uses (`zarr`, `s3fs`, `numpy`). The pipeline also
-uses its `s3fs` for the post-run purge, so it must be importable.
+```bash
+python3 -m venv "$HOME/zarr-venv"
+"$HOME/zarr-venv/bin/pip" install 'zarr>=3' s3fs numpy
+export ZARR_VENV="$HOME/zarr-venv"
+```
+
+One venv serves both sweeps. The write pipeline also uses its `s3fs` for the
+post-run purge, so it must be importable. Do **not** try to reuse
+`~/zarr_benchmarks`'s environment: it pins `requires-python >=3.13` and an
+unresolvable local path dependency.
 
 ### 2. AWS credentials
 
-**Credentials reach the runtime differently than in the read benchmark.** There,
-`cae_s3_tool` resolved `AWS_PROFILE` through the AWS SDK's credential chain.
-Here the process that signs is the `clio_run` daemon, and the Poco SigV4 signer
-reads **raw environment variables only** — it has no profile support at all.
+Long-lived IAM keys in `~/.aws/credentials`, mode 600, under a named profile:
 
-The pipeline's `pre_cmds` therefore resolve the profile to keys at job time.
-Ares has **no AWS CLI**, so `aws configure export-credentials` is unavailable;
-the credentials are parsed out of `~/.aws/credentials` (mode 600) with stdlib
-`configparser`.
-
-Exporting them is **not** enough on its own — the daemon does not inherit the
-job script's environment. The `clio_runtime` package's `forward_env` option
-carries the names listed in the pipeline into the runtime's environment. See the
-troubleshooting entry for the full mechanism; get this wrong and every `PutBlob`
-fails with `rc=11`.
-
-**No secrets are stored in the YAML** — only profile and region names. Set:
-
+```ini
+[clio-bench]
+aws_access_key_id = ...
+aws_secret_access_key = ...
+```
 ```bash
+chmod 600 ~/.aws/credentials
 export S3_BENCH_BUCKET=my-bucket
 export S3_BENCH_PROFILE=clio-bench
 export S3_BENCH_REGION=us-east-2
 ```
 
-`S3_BENCH_REGION` is **mandatory and must be the bucket's real region** — there
-is deliberately no `us-east-1` default. **SigV4 is region-scoped**, and a
-mismatch is an HTTP **301/400**, not a 403 — an unhelpful error to debug from
-the runtime log. `pre_cmds` verifies it against `GetBucketLocation` rather than
-trusting it, because botocore silently follows the redirect and the bdev's
-signer does not.
+**No secrets are stored in the YAML** — only profile and region names.
+Short-lived STS/SSO tokens are a poor fit: the full grids run longer than a
+typical 1-hour token lifetime.
 
-### 3. No dataset staging
+**The two sweeps consume those credentials differently, and this is the single
+most common way a run fails.**
 
-Unlike the read benchmark, nothing needs staging: this pipeline creates the data
-it writes. The bucket only needs to exist and be writable.
+- *Read:* `cae_s3_tool` resolves `AWS_PROFILE` through the AWS **C++** SDK's
+  credential chain, and `s3fs` resolves it through botocore. A named profile is
+  the one mechanism both honor with no code changes.
+- *Write:* the process that signs is the `clio_run` **daemon**, and the Poco
+  SigV4 signer reads **raw environment variables only** — it has no profile
+  support at all. The pipeline's `pre_cmds` therefore resolve the profile to keys
+  at job time. Ares has **no AWS CLI**, so `aws configure export-credentials` is
+  unavailable; the credentials are parsed out of `~/.aws/credentials` with
+  stdlib `configparser`.
+
+Exporting them is **not** enough on its own — the daemon does not inherit the job
+script's environment. The `clio_runtime` package's `forward_env` option carries
+the names listed in the pipeline into the runtime's environment. See the
+troubleshooting entry for the full mechanism; get this wrong and every `PutBlob`
+fails with `rc=11`.
+
+`S3_BENCH_REGION` is **mandatory for the write sweep and must be the bucket's
+real region** — there is deliberately no `us-east-1` default. **SigV4 is
+region-scoped**, and a mismatch is an HTTP **301/400**, not a 403 — an unhelpful
+error to debug from the runtime log. `pre_cmds` verifies it against
+`GetBucketLocation` rather than trusting it, because botocore silently follows
+the redirect and the bdev's signer does not.
+
+### 3. Stage the read dataset (once, ~17 GiB, from a host with egress)
+
+The write sweep needs no staging — it creates the data it writes, and the bucket
+only needs to exist and be writable. The read sweep needs a dataset:
+
+```bash
+"$ZARR_VENV/bin/python3" \
+  "$CLIO_REPO/jarvis_clio_core/scripts/stage_s3_read_bench_data.py" \
+  --bucket "$S3_BENCH_BUCKET" --prefix clio-s3-read-bench \
+  --region "$S3_BENCH_REGION"
+```
+
+Writes a 1024³ uint16 array (2 GiB) as 8 Zarr v3 stores (chunk edges
+64/128/256/512 × none/zstd) plus 4 flat-object sets at matching sizes, and a
+`manifest.json`. Idempotent — the manifest is written last, so a re-run skips
+completed work and redoes only partial uploads. Useful flags: `--dry-run`,
+`--only zarr|raw`, `--only-granularity 256`, `--force`.
+
+Sanity-check it end-to-end against a local S3-compatible store first if you
+like — both the staging script and the Zarr reader accept `--endpoint-url` (or
+`S3_ENDPOINT`), and so does `cae_s3_tool`.
+
+The default `--pattern smooth` compresses ~20–26× with zstd, close to the
+zarr_benchmarks reference dataset's 24×. It is synthetic; report the ratio
+(recorded per store in `manifest.json`) rather than presenting it as a property
+of real scientific data. `--pattern random` is incompressible and reduces the
+compression axis to a measurement of zstd's CPU cost.
 
 ---
 
 ## Running
 
-### Smoke test (2 rows, ~10 min)
+`pre_cmds` expand when the **job** runs, so export overrides *before* submitting.
 
 ```bash
+export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench S3_BENCH_REGION=us-east-2
 export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
-jarvis ppl submit $PWD/s3_write_bench.yaml
+export CLIO_REPO=$HOME/clio-core JARVIS_VENV=$HOME/jarvis-venv
 ```
 
-Output: `${HOME}/s3_write_bench_results/results.csv`, 2 rows.
-
-Run this first on any new machine, bucket, or build. It is the cheapest thing
-that proves credentials reach the daemon and bytes reach the bucket.
-
-### Full sweep (36 rows, ~3.6 h)
+### Read grid (36 rows, ~1.6 h, ~155 GiB egress)
 
 ```bash
-export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
-jarvis ppl submit $PWD/s3_write_bench_full.yaml
+jarvis ppl submit "$CLIO_REPO/jarvis_clio_core/pipelines/ares/s3_read_bench.yaml"
 ```
 
-Output: `${HOME}/s3_write_bench_full_results/results.csv`, 36 rows —
-2 granularities (1 MiB, 4 MiB) × 6 concurrencies (1, 4, 8, 16, 32, 64) ×
+Grid: bytes-per-request {512 KiB, 4 MiB, 32 MiB, 256 MiB} × concurrency
+{1, 8, 32} = 12 combinations × `repeat: 3`. Compression is not a sweep axis —
+both Zarr variants run inside each row. Output:
+`${HOME}/s3_read_bench_results/results.csv`.
+
+### Write sweep (36 rows, ~3.6 h)
+
+```bash
+jarvis ppl submit "$CLIO_REPO/jarvis_clio_core/pipelines/ares/s3_write_bench_full.yaml"
+```
+
+Grid: 2 granularities (1 MiB, 4 MiB) × 6 concurrencies (1, 4, 8, 16, 32, 64) ×
 3 repeats. Sized for overnight; `time: "08:00:00"` in the scheduler block.
+Output: `${HOME}/s3_write_bench_full_results/results.csv`.
 
-Every gate and credential path is carried over from the smoke verbatim, so a
-green smoke is a strong predictor of a green sweep. Two deliberate differences:
-`verify` is **off** (the smoke settled byte-fidelity; `objects_measured` is the
-per-row guard and costs no egress), and `num_objects` is 256 rather than 64 so
-that K=64 has several windows of work behind it instead of one.
-
-The grid is built around what the smoke found — see the header comment in
+`verify` is **off** here (byte-fidelity is settled; `objects_measured` is the
+per-row guard and costs no egress), and `num_objects` is 256 so that K=64 has
+several windows of work behind it instead of one. See the header comment in
 `s3_write_bench_full.yaml` for why there is no 16 MiB axis and what the K=64
 `rawput` point is there to settle.
 
-### Targeted diagnostic (18 rows, ~45 min)
-
-```bash
-jarvis ppl submit $PWD/jarvis_clio_core/pipelines/ares/s3_write_bench_diag.yaml
-```
-
-Scaled down from the full grid to resolve one open defect: CLIO's ~5.5
-objects/s ceiling. It is **not** a comparison sweep and should be deleted or
-ignored once the defect is fixed — scale back up with
-`s3_write_bench_full.yaml`.
-
-What it changes, and why each change is load-bearing:
-
-| | full sweep | diagnostic | why |
-|---|---|---|---|
-| blob size | 1m, 4m | **256k**, 1m, 4m | 256k is where the two hypotheses are 7× apart |
-| concurrency | swept 1→64 | **pinned 32** | the knee is known; sit past it |
-| worker pool | **zipped to K** | **16 vs 48, un-zipped** | removes the confound — see below |
-| baselines | zarr + zstd + rawput | **rawput only** | zarr's question is closed; it cost ~40% of each row |
-| rows | 36 (~3.6 h) | 18 (~45 min) | |
-
-**The confound this removes.** The full sweep zipped `clio_s3.concurrency`,
-`runtime.num_threads` and `clio_s3.worker_threads` onto one axis. That was
-right for finding the knee, but it means "CLIO stops improving past K=32" and
-"CLIO stops improving past 48 workers" are *the same data points* — nothing in
-those 36 rows separates them. Pinning K and moving only the pool separates them
-in one step.
-
-**`objects/s`, not MB/s, is the measurement.** `num_objects` is held at 256 at
-every size so the object count is constant and obj/s is comparable down the
-axis. (This inverts the full sweep's reasoning for the same knob, which held
-blob count constant to keep the K=64 window meaningful.)
-
-**Exclude link-bound rows before concluding anything.** A row at ratio ≈ 1.0 is
-doing what the network allows, not what CLIO allows, so its obj/s says nothing
-about a per-object cost. 4 MiB is exactly such a row — 5.5 obj/s there would be
-22 MB/s, twice the link — and including it makes a perfectly flat series read as
-2× variable. That is the same trap that made 4 MiB look healthy in the 36-row
-sweep. `post_cmds` does this exclusion for you and prints the verdict directly
-in the job log, so the answer arrives without opening the CSV.
-
-How to read the two verdicts:
-
-* **Axis 1** — obj/s flat across sizes *below the link* ⇒ a fixed per-object
-  cost is real, and the printout names its size in ms. Varying ⇒ it is not a
-  per-object quantum and the 1 MiB plateau needs another explanation.
-* **Axis 2** — obj/s rising 16→48 workers ⇒ **pool-bound**: effective
-  concurrency was capped below K all along, and the fix is worker accounting.
-  Flat ⇒ the pool is innocent and the serialization is in the DPE, the
-  allocator, or the bdev's per-block path — profile the runtime, do not add
-  threads.
-
-Cost is ~9k PUTs, under $0.10.
-
 ### Cost
 
-Writes are cheap: ingress to S3 is free and PUTs run ~$0.005/1000, so the smoke
-is effectively free — unlike the read grid's ~155 GiB of egress (~$14). The full
-36-row sweep issues roughly 37k PUTs, about **$0.18**. Only leftover object
-storage accrues, and `post_cmds` purges the write prefix.
+**Reads dominate.** The read grid moves ~155 GiB of egress ≈ **$14** at
+$0.09/GB; raising `repeat` scales that linearly.
 
-The one thing that is *not* free on the write side is `verify`: it re-reads
-every blob, which is GET egress. That is why the smoke has it on (128 blobs,
-cents) and the full sweep has it off (~19 GiB, ~$1.70, to re-answer a settled
-question).
+Writes are cheap: ingress to S3 is free and PUTs run ~$0.005/1000, so the 36-row
+write sweep's ~37k PUTs come to about **$0.18**. Only leftover object storage
+accrues, and `post_cmds` purges the write prefix. The one thing that is *not*
+free on the write side is `verify`: it re-reads every blob, which is GET egress
+(~19 GiB, ~$1.70) — hence off in the sweep.
 
 Object keys are deterministic (`block_<offset>`, `raw_%06d.bin`, zarr chunk
 paths), so re-runs overwrite rather than accumulate. Storage does not grow
@@ -416,8 +449,7 @@ table above, then writes five PNGs:
 | `s3_write_max_rss.png` | client peak memory (log scale) |
 
 One subplot per blob size, x-axis concurrency, one bar per stack, error bars =
-repeat stddev. The transpose of the read bench's layout, because on the write
-side the question is scaling with K and the answer differs by size.
+repeat stddev.
 
 **Read `s3_write_ratio.png` first.** When four stacks are all pinned to the same
 link, absolute MB/s says nothing about any of them; only the ratio to the floor
@@ -428,8 +460,7 @@ the error bars on the ratio are real.
 Bars are hatched where a cell is not measuring what it claims: K=1 in the ratio
 figure (the floor is fork+exec-bound there, not a floor), and any cell where
 requested K exceeds the object count (`effective_concurrency` caps at the object
-count, silently duplicating a lower-K cell — cannot happen at `num_objects: 256`,
-but a smaller smoke can trip it).
+count, silently duplicating a lower-K cell).
 
 `share_y` is per-metric. MB/s, the ratio, and RSS are comparable between panels
 and share an axis; objects/s does **not**, because a 4 MiB object at the same
@@ -439,16 +470,29 @@ bandwidth is a quarter the object rate.
 
 ## Verifying a run
 
-1. **Every row `status: success`** — 2 for the smoke, 36 for the full sweep.
-   `post_cmds` prints the count; a short count means rows failed silently.
-2. **No blank throughput columns.** `post_cmds` asserts this, because a green
-   row with a blank throughput column is a **failure**, not a success. The
-   required columns are `clio_s3.write.agg_bw_mbps`, `zarr_s3.write.agg_bw_mbps`,
-   `zarr_s3.writezstd.agg_bw_mbps`, and `raw_put.rawput.agg_bw_mbps`.
-3. **`objects_written` and `put_count` > 0** on every stack.
-4. **`clio_s3.write.objects_measured` equals `num_objects`.** This one is a `list`
-   of the bucket prefix rather than a number the benchmark computed, so it is
-   the only column a run that wrote nothing cannot fabricate. Zero means the
+### Both sweeps
+
+1. **`successful rows: N / 36`** in the `.out` log. A short count means rows
+   failed silently.
+2. **Check the numbers, not just the color.** `post_cmds` prints
+   `GREEN ROWS WITH BLANK THROUGHPUT (== FAILURES):` — it must say `none`. A
+   green row with a blank `agg_bw_mbps` is a failure: `_get_stat` is called
+   inside a try/except that logs a warning and continues, so a parse failure
+   drops the columns silently rather than failing the row.
+
+### Read
+
+3. Cross-check one row by hand: `logical_bytes` should be 2147483648 on both
+   stacks, and `objects_read` should equal `get_count` for CLIO.
+
+### Write
+
+3. Required columns: `clio_s3.write.agg_bw_mbps`, `zarr_s3.write.agg_bw_mbps`,
+   `zarr_s3.writezstd.agg_bw_mbps`, `raw_put.rawput.agg_bw_mbps`.
+   `objects_written` and `put_count` must be > 0 on every stack.
+4. **`clio_s3.write.objects_measured` equals `num_objects`.** This one is a
+   `list` of the bucket prefix rather than a number the benchmark computed, so it
+   is the only column a run that wrote nothing cannot fabricate. Zero means the
    row is fiction regardless of what the throughput columns say.
 
    **More than `num_objects` does not necessarily mean the allocator
@@ -476,7 +520,7 @@ bandwidth is a quarter the object rate.
 
    Two consequences worth knowing:
 
-   * **`objects_purged` is a new per-row column.** Nonzero means the *previous*
+   * **`objects_purged` is a per-row column.** Nonzero means the *previous*
      row leaked that many objects. It is there because the purge fixes the
      measurement, **not the leak**: something in the bdev teardown path is
      still failing to issue a `DeleteObject` per block, and this column is what
@@ -486,8 +530,20 @@ bandwidth is a quarter the object rate.
      names it, and `objects_measured` reverts to a lower bound for that row —
      compare it against `put_count` rather than `num_objects`.
 
-   To check the prefix by hand (Ares has no AWS CLI):
-   `python3 scripts/s3_cli.py ls "$S3_BENCH_BUCKET" --prefix clio-s3-write-bench/bdev`
+   To check the prefix by hand — Ares has **no AWS CLI**, so use the zarr venv's
+   botocore, which is what the pipeline itself does:
+
+   ```bash
+   "$ZARR_VENV/bin/python3" -c '
+   import os, botocore.session
+   c = botocore.session.get_session().create_client(
+       "s3", region_name=os.environ["S3_BENCH_REGION"])
+   p = c.get_paginator("list_objects_v2")
+   n = sum(len(pg.get("Contents", []))
+           for pg in p.paginate(Bucket=os.environ["S3_BENCH_BUCKET"],
+                                Prefix="clio-s3-write-bench/bdev"))
+   print(n, "objects")'
+   ```
 5. **`rawput` is the fastest row *at K ≥ 8*, compared on `wire_bw_mbps`.**
    Two qualifications, both learned the hard way on 2026-08-26:
 
@@ -502,7 +558,7 @@ bandwidth is a quarter the object rate.
    * **Compare `wire_bw_mbps`, not `agg_bw_mbps`.** `zarr_s3.writezstd`
      legitimately beats every other stack on `agg_bw_mbps` because it moves
      roughly half the bytes for the same logical payload. On the wire it is
-     no faster. See "Read the fairness columns" above.
+     no faster.
 
    If CLIO beats the floor on **wire** bandwidth at high K, *then* something
    is not reaching S3 — check that the CTE tier really is the S3 device and
@@ -514,6 +570,20 @@ bandwidth is a quarter the object rate.
 ---
 
 ## Troubleshooting
+
+### Read
+
+| Symptom | Cause |
+|---|---|
+| `clio_s3_read_bench not on PATH` | IOWarp built without `+s3`, or `AWSSDK` was not found at configure time and `CAE_ENABLE_S3` silently reverted to OFF |
+| `Preflight GET failed` | bad credentials/profile, wrong region, wrong bucket, or the dataset was never staged at that prefix |
+| CLIO rows blank, Zarr rows fine | the **runtime** could not find `cae_s3_tool`; it forks the helper, so `CAE_S3_TOOL` must be exported in `pre_cmds` (the package's own env does not reach the daemon) |
+| `zarr venv broken` | `$ZARR_VENV` missing `zarr`/`s3fs`/`numpy` |
+| Raising concurrency changes nothing | the blocking-`waitpid` worker ceiling — raise `runtime.num_threads` or use `clio_s3.nprocs > 1` |
+| No `max_rss_kb` column | `/usr/bin/time` not installed; throughput columns are unaffected |
+| Disk full under `/tmp` | `TMPDIR` needs `concurrency × object_size` (32 × 256 MiB = 8 GiB) |
+
+### Write
 
 **"Failed to initialize Clio" from the benchmark.** Ares compute nodes run
 `ptrace_scope=1`, which blocks the SHM attach path for a detached client. The
@@ -640,10 +710,7 @@ zero even on a healthy run.
 normally becomes exactly one S3 object: `AllocateFromTarget` hands the whole
 request to the allocator, `WriteBlocks` issues one `PutObject` per returned
 block, and an unfragmented request gets a single block. More objects than blobs
-means the allocator fragmented and split the request. (An earlier version of this
-benchmark derived `PUT count` as `ceil(object_size / block_size)` from a
-`--block-size` flag that configured nothing, which overstated it 4× at the smoke
-test's 4 MiB blobs. The flag is gone.)
+means the allocator fragmented and split the request.
 
 **`TaskStatModel: failed to open /tmp/clio/models/...`.** Harmless. The runtime
 persists a perf model there and logs an error per attempt if it cannot. `/tmp` is

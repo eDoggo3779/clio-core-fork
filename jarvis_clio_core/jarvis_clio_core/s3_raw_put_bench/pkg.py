@@ -27,7 +27,7 @@ class S3RawPutBench(S3BenchBase):
     raw-GET counterpart, which is the same interpretability gap in the other
     direction. `MODES` is narrowed to ('write',) so the shared helpers still
     name the right label without offering a direction that does not exist.
-    See S3_WRITE_BENCH.md.
+    See jarvis_clio_core/pipelines/ares/docs/CLIO_S3_BENCH.md.
     """
 
     #: Write-only. Narrowing this (rather than adding a `mode` option) is what

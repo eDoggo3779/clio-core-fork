@@ -2,10 +2,10 @@
 # Issue #968 - CLIO vs Zarr S3 WRITE benchmark: FULL SWEEP (36 rows).
 # =============================================================================
 #
-# Widened from s3_write_bench.yaml (2-row smoke) after that smoke came back
-# green on 2026-08-26. Every gate, credential path and preflight below is
-# carried over from it VERBATIM -- only the grid, the walltime and `verify`
-# differ. Fix a bug in one file, fix it in the other.
+# Widened from a 2-row smoke pipeline after that smoke came back green on
+# 2026-08-26. Every gate, credential path and preflight below was carried over
+# from it verbatim; only the grid, the walltime and `verify` differed, so the
+# smoke has since been deleted and this file is the only write sweep.
 #
 # WHAT THE SMOKE ESTABLISHED, AND WHY THIS GRID LOOKS LIKE IT DOES.
 #

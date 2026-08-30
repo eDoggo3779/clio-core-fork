@@ -117,7 +117,7 @@ struct BenchConfig {
  * skips the compile. The pipeline therefore greps this literal out of the
  * binary rather than trusting the spec. BUMP IT whenever a change here alters
  * what the pipeline expects to read back, and bump the matching literal in
- * pipelines/ares/s3_write_bench.yaml in the same commit.
+ * pipelines/ares/s3_write_bench_full.yaml in the same commit.
  */
 constexpr const char* kBuildMarker = "s3wb-build-marker-2026-08-26";
 

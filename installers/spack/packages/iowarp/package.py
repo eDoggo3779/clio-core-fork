@@ -20,7 +20,7 @@ class Iowarp(CMakePackage):
     # Issue #968 S3 read benchmark. Lives on a fork branch, so it needs its own
     # git= override; the benchmark (clio_s3_read_bench) is not on dev yet.
     # Build it with `+cae +cte +s3`; see
-    # jarvis_clio_core/pipelines/ares/S3_READ_BENCH.md.
+    # jarvis_clio_core/pipelines/ares/docs/CLIO_S3_BENCH.md.
     version('968-s3-bench', branch='968-clio-s3-benchmark', submodules=True,
             git='https://github.com/eDoggo3779/clio-core-fork.git')
 
