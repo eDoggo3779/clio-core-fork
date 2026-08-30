@@ -162,7 +162,7 @@ RUN echo '#!/bin/bash\n\
     fi\n\
     # Register jarvis_clio_core repo if workspace is mounted and not already added\n\
     if [ -d /workspace/jarvis_clio_core ]; then\n\
-    jarvis repo add /workspace/jarvis_clio_core --force 2>/dev/null\n\
+    jarvis repo add /workspace/jarvis_clio_core +force >/dev/null 2>&1 || true\n\
     fi\n\
     exec "$@"' > /usr/local/bin/docker-entrypoint.sh \
     && chmod +x /usr/local/bin/docker-entrypoint.sh

@@ -21,6 +21,19 @@
 // feature-flag independent, which is what lets the test build and run without
 // the S3 bdev, Poco::Net, or any credentials being present.
 
+// BLOCK_SIZE / DIGEST_SIZE are the member names Poco::HMACEngine reads off its
+// template argument, so neither this header nor Poco's can rename them -- but
+// <linux/fs.h> (reached via <liburing.h>, which fs_bdev_transport.h includes)
+// defines BLOCK_SIZE as `(1<<BLOCK_SIZE_BITS)`. Any translation unit that pulls
+// in the io_uring path before this one therefore turns both enumerators into
+// `(1<<10) = ...` and the parse collapses. Drop the macros for the span that
+// needs the identifiers and hand them back afterwards, so a TU that includes
+// this header first still sees whatever <linux/fs.h> defines later.
+#pragma push_macro("BLOCK_SIZE")
+#pragma push_macro("DIGEST_SIZE")
+#undef BLOCK_SIZE
+#undef DIGEST_SIZE
+
 #include <Poco/DigestEngine.h>
 #include <Poco/HMACEngine.h>
 #include <Poco/SHA2Engine.h>
@@ -241,5 +254,12 @@ inline std::string BuildAuthorization(const SigningInput &in,
 }
 
 }  // namespace clio::run::bdev::s3
+
+// Restore whatever the including TU had; see the push near the top. Safe to do
+// here because macro expansion already happened when Poco::HMACEngine's body
+// and Sha256Engine's enum were tokenized -- instantiating the template later
+// does not re-expand them.
+#pragma pop_macro("DIGEST_SIZE")
+#pragma pop_macro("BLOCK_SIZE")
 
 #endif  // CLIO_BDEV_SIGV4_H_
