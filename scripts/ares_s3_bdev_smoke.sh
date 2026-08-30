@@ -5,10 +5,13 @@
 # This is NOT where the S3 code is debugged. Signature correctness is settled
 # offline by `ctest -R cr_bdev_sigv4` (frozen botocore vectors) and the client's
 # wiring by `ctest -R cr_bdev_s3_rest` (a local stand-in that verifies SigV4
-# independently). Both run in any build, with no cloud. What is left for this
-# script is the one thing those cannot cover: that real AWS accepts what we
-# send, through a real CLIO runtime. If it fails, fix it locally and come back
-# -- do not grow this file.
+# independently). Neither needs the cloud, but they are NOT both available in
+# every build: cr_bdev_sigv4 is built whenever Poco is found, while
+# cr_bdev_s3_rest is registered only under -DCLIO_ENABLE_AMAZON_DRIVE=ON, which
+# defaults OFF. The s3-bdev job in .github/workflows/ci-linux.yml is what runs
+# the pair on every push and PR. What is left for this script is the one thing
+# those cannot cover: that real AWS accepts what we send, through a real CLIO
+# runtime. If it fails, fix it locally and come back -- do not grow this file.
 #
 #   Build (see the plan; no spack view -- RPATH makes one unnecessary):
 #     spack env create --without-view clio-s3
