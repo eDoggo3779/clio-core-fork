@@ -1,47 +1,42 @@
 /*
  * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
  * All rights reserved.
- *
  * This file is part of IOWarp Core.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice,
- *    this list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * BSD 3-Clause License. See LICENSE file.
  */
 
 /**
- * clio_s3_read_bench.cc - Times CAE's s3:// -> CTE read path against S3.
+ * S3 read-path benchmark.
  *
- * Reads N objects from S3 through the CAE assimilator
- * (ParseOmni -> S3FileAssimilator -> fork+exec cae_s3_tool get -> CTE PutBlob)
- * with a sliding window of K in-flight transfers, and reports throughput in the
- * shared clio_bench::PrintResults format plus a second "Fairness" block that
- * records the equivalence caveats needed to compare against a Zarr-on-S3 read.
+ * Times CAE's s3:// -> CTE read path against S3. Reads `--num-objects` objects
+ * through the CAE assimilator (ParseOmni -> S3FileAssimilator -> fork+exec
+ * cae_s3_tool get -> CTE PutBlob) with a sliding window of `--concurrency`
+ * in-flight transfers. The bench reports:
+ *   - throughput in the shared clio_bench::PrintResults format
+ *   - a second "Fairness" block recording the equivalence caveats needed to
+ *     compare against a Zarr-on-S3 read
  *
  * Counterpart driver: jarvis_clio_core/zarr_s3_read_bench/scripts/zarr_s3_read.py,
  * which emits the same two blocks so one parser serves both.
+ *
+ * Usage:
+ *   clio_s3_read_bench \
+ *     --bucket B             S3 bucket holding the staged objects (required)
+ *     --key-prefix P         key prefix; keys are <prefix>/obj_%06zu.bin
+ *                            (required)
+ *     --num-objects N        objects to read, before stride/offset (required)
+ *     --object-size SIZE     bytes per object, e.g. 32m (required)
+ *     --concurrency K        in-flight AsyncParseOmni calls (required, > 0)
+ *     [--tag-prefix P]       CTE tag prefix; one tag per object (default s3rb)
+ *     [--label L]            results namespace, the CSV "operation"
+ *                            (default Read)
+ *     [--worker-threads N]   runtime worker count to report (default 0 =
+ *                            unknown)
+ *     [--object-stride N]    multi-process split: take every Nth key
+ *                            (default 1)
+ *     [--object-offset N]    multi-process split: first key index (default 0)
+ *     [--verify]             re-read tag sizes out of CTE after the run
+ *     [--no-preflight]       skip the 1-byte ranged GET before timing starts
  *
  * Three properties of the assimilator shape this benchmark:
  *   1. ParseOmni processes a vector of contexts SERIALLY, so concurrency comes
