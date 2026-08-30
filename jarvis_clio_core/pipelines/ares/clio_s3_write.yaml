@@ -71,9 +71,9 @@
 #                                         # real region -- verified in pre_cmds
 #   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
 #   export PATH="$HOME/jarvis-venv/bin:$PATH"
-#   jarvis ppl submit <abs path>/s3_write_bench_full.yaml
+#   jarvis ppl submit <abs path>/clio_s3_write.yaml
 #
-# Output: ${HOME}/s3_write_bench_full_results/results.csv - 36 rows.
+# Output: ${HOME}/clio_s3_write_results/results.csv - 36 rows.
 #         Every *.agg_bw_mbps column must be populated, and every
 #         clio_s3.write.objects_measured must equal clio_s3.num_objects. A
 #         green row with a blank throughput column, or with zero objects
@@ -96,10 +96,10 @@ scheduler:
   # ~70 min per repeat x 3 repeats = ~3.6 h measured, with headroom for a
   # bad-network night. Sized for overnight; raise `time` before adding rows.
   time: "08:00:00"
-  output: ${HOME}/s3_write_bench_full-%j.out
-  error: ${HOME}/s3_write_bench_full-%j.err
+  output: ${HOME}/clio_s3_write-%j.out
+  error: ${HOME}/clio_s3_write-%j.err
   # MUST stay literally identical to config.hostfile below.
-  hostfile: "${HOME}/.jarvis-s3-bench/s3_write_bench_full_hostfile.txt"
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_write_hostfile.txt"
   pre_cmds:
     # 1) Toolchain. Pure PATH prepends -- never `spack load` / `conda activate`
     #    (they install shell functions that misbehave under `set -euo pipefail`).
@@ -225,7 +225,7 @@ scheduler:
     - 'rm -rf "$TMPDIR"/s3_raw_put_* /tmp/iowarp_chi* 2>/dev/null || true'
     # 5) Experiment dirs + repo registration + clean slate (the sweep runner
     #    RESUMES over an existing results.csv and would skip failed rows).
-    - 'mkdir -p "$HOME/s3_write_bench_full_results" "$HOME/.jarvis-s3-bench"'
+    - 'mkdir -p "$HOME/clio_s3_write_results" "$HOME/.jarvis-s3-bench"'
     # The runtime persists a perf model here and logs an ERROR per attempt if
     # it cannot. /tmp is node-local, so this must happen on the compute node --
     # creating it on the login node does nothing for the job.
@@ -262,7 +262,7 @@ scheduler:
       done
       jarvis repo add "$CLIO_REPO/jarvis_clio_core" 2>/dev/null || true
       echo "jarvis packages OK: $CLIO_REPO/jarvis_clio_core"
-    - 'rm -f "$HOME/s3_write_bench_full_results/results.csv"'
+    - 'rm -f "$HOME/clio_s3_write_results/results.csv"'
     # Pre-flight the EXACT call the S3 bdev makes at Init: a HEAD on the
     # bucket, signed with the RAW EXPORTED KEYS (not the profile -- the bdev
     # cannot read profiles). Cheap, and it separates four failures that
@@ -329,11 +329,11 @@ scheduler:
             f"{true_region}, with the exported keys")
       EOF
   post_cmds:
-    - 'RES="$HOME/s3_write_bench_full_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 36"'
+    - 'RES="$HOME/clio_s3_write_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 36"'
     # A green row with a blank throughput column is a FAILURE, not a success.
     # Assert it here instead of leaving it to manual inspection.
     - |
-      python3 - "$HOME/s3_write_bench_full_results/results.csv" <<'EOF'
+      python3 - "$HOME/clio_s3_write_results/results.csv" <<'EOF'
       import csv, os, sys
       path = sys.argv[1]
       if not os.path.exists(path):
@@ -386,10 +386,10 @@ scheduler:
       EOF
 
 config:
-  name: s3_write_bench_full
+  name: clio_s3_write
 
   # MUST stay literally identical to scheduler.hostfile above.
-  hostfile: "${HOME}/.jarvis-s3-bench/s3_write_bench_full_hostfile.txt"
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_write_hostfile.txt"
 
   pkgs:
     - pkg_type: jarvis_clio_core.clio_runtime
@@ -599,4 +599,4 @@ run_timeout: 2400
 # difference between two K values from ordinary link variance, and "CLIO is
 # 6% off the floor" needs an error bar before it is a claim.
 repeat: 3
-output: "${HOME}/s3_write_bench_full_results"
+output: "${HOME}/clio_s3_write_results"

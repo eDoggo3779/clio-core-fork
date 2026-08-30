@@ -41,12 +41,12 @@
 # Usage:
 #   export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench
 #   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
-#   jarvis ppl submit <abs path>/s3_read_bench.yaml
+#   jarvis ppl submit <abs path>/clio_s3_read.yaml
 #
 #   pre_cmds expand when the JOB runs, so export any overrides BEFORE submitting.
 #
 # Output:
-#   ${HOME}/s3_read_bench_results/results.csv — 36 rows. Per-stack columns:
+#   ${HOME}/clio_s3_read_results/results.csv — 36 rows. Per-stack columns:
 #   clio_s3.read.*, zarr_s3.read.* (agg_bw_mbps, wire_bw_mbps, bytes_moved,
 #   logical_bytes, get_count, compression, decode_step, subprocess_spawns,
 #   temp_file_bytes, max_rss_kb, ...).
@@ -70,10 +70,10 @@ scheduler:
   cpus_per_task: 40
   partition: compute
   time: "08:00:00"
-  output: ${HOME}/s3_read_bench-%j.out
-  error: ${HOME}/s3_read_bench-%j.err
+  output: ${HOME}/clio_s3_read-%j.out
+  error: ${HOME}/clio_s3_read-%j.err
   # MUST stay literally identical to config.hostfile below.
-  hostfile: "${HOME}/.jarvis-s3-bench/s3_read_bench_hostfile.txt"
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_read_hostfile.txt"
   pre_cmds:
     # 1) Toolchain. Pure PATH prepends -- never `spack load` / `conda activate`
     #    (they install shell functions that misbehave under `set -euo pipefail`).
@@ -110,15 +110,15 @@ scheduler:
     - 'rm -rf "$TMPDIR"/cae_s3_* /tmp/iowarp_chi* 2>/dev/null || true'
     # 5) Experiment dirs + repo registration + clean slate (the sweep runner
     #    RESUMES over an existing results.csv and would skip failed rows).
-    - 'mkdir -p "$HOME/s3_read_bench_results" "$HOME/.jarvis-s3-bench"'
+    - 'mkdir -p "$HOME/clio_s3_read_results" "$HOME/.jarvis-s3-bench"'
     - 'jarvis repo add "${CLIO_REPO:-$HOME/clio-core}/jarvis_clio_core" 2>/dev/null || true'
-    - 'rm -f "$HOME/s3_read_bench_results/results.csv"'
+    - 'rm -f "$HOME/clio_s3_read_results/results.csv"'
   post_cmds:
-    - 'RES="$HOME/s3_read_bench_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 36"'
+    - 'RES="$HOME/clio_s3_read_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 36"'
     # A green row with a blank throughput column is a FAILURE, not a success.
     # Assert it here instead of leaving it to manual inspection.
     - |
-      python3 - "$HOME/s3_read_bench_results/results.csv" <<'EOF'
+      python3 - "$HOME/clio_s3_read_results/results.csv" <<'EOF'
       import csv, os, sys
       path = sys.argv[1]
       if not os.path.exists(path):
@@ -132,10 +132,10 @@ scheduler:
       EOF
 
 config:
-  name: s3_read_bench
+  name: clio_s3_read
 
   # MUST stay literally identical to scheduler.hostfile above.
-  hostfile: "${HOME}/.jarvis-s3-bench/s3_read_bench_hostfile.txt"
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_read_hostfile.txt"
 
   pkgs:
     - pkg_type: jarvis_clio_core.clio_runtime
@@ -232,4 +232,4 @@ loop:
 run_timeout: 1800
 
 repeat: 3
-output: "${HOME}/s3_read_bench_results"
+output: "${HOME}/clio_s3_read_results"

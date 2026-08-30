@@ -8,7 +8,7 @@ Two sweeps, one package set:
 
 | | read | write |
 |---|---|---|
-| Pipeline | [`s3_read_bench.yaml`](../s3_read_bench.yaml) | [`s3_write_bench_full.yaml`](../s3_write_bench_full.yaml) |
+| Pipeline | [`clio_s3_read.yaml`](../clio_s3_read.yaml) | [`clio_s3_write.yaml`](../clio_s3_write.yaml) |
 | CLIO path | CAE assimilator: `ParseOmni` → fork+exec `cae_s3_tool get` → CTE `PutBlob` | `AsyncPutBlob` → CTE → `kS3` bdev `WriteBlocks` → signed PUT from the runtime daemon |
 | Jarvis packages | `clio_s3_bench` / `zarr_s3_bench`, `mode: read` | `clio_s3_bench` / `zarr_s3_bench`, `mode: write`, plus `s3_raw_put_bench` |
 | Spack variants | `+cae +cte +s3` | `+cae +cte +s3 +s3_bdev` |
@@ -98,7 +98,7 @@ will move it. Only a gap between them is a CLIO finding.
 
 > **Future work, deliberately not done here:** the *read* sweep has no
 > equivalent floor, which is the same interpretability gap in the other
-> direction. Back-porting a raw-GET floor to `s3_read_bench.yaml` would make
+> direction. Back-porting a raw-GET floor to `clio_s3_read.yaml` would make
 > those numbers attributable the same way. It is a separate change.
 
 ### Read the fairness columns, not just the headline
@@ -429,28 +429,28 @@ export CLIO_REPO=$HOME/clio-core JARVIS_VENV=$HOME/jarvis-venv
 ### Read grid (36 rows, ~1.6 h, ~155 GiB egress)
 
 ```bash
-jarvis ppl submit "$CLIO_REPO/jarvis_clio_core/pipelines/ares/s3_read_bench.yaml"
+jarvis ppl submit "$CLIO_REPO/jarvis_clio_core/pipelines/ares/clio_s3_read.yaml"
 ```
 
 Grid: bytes-per-request {512 KiB, 4 MiB, 32 MiB, 256 MiB} × concurrency
 {1, 8, 32} = 12 combinations × `repeat: 3`. Compression is not a sweep axis and
 is no longer a comparison either: one uncompressed Zarr pass per row. Output:
-`${HOME}/s3_read_bench_results/results.csv`.
+`${HOME}/clio_s3_read_results/results.csv`.
 
 ### Write sweep (36 rows, ~3.6 h)
 
 ```bash
-jarvis ppl submit "$CLIO_REPO/jarvis_clio_core/pipelines/ares/s3_write_bench_full.yaml"
+jarvis ppl submit "$CLIO_REPO/jarvis_clio_core/pipelines/ares/clio_s3_write.yaml"
 ```
 
 Grid: 2 granularities (1 MiB, 4 MiB) × 6 concurrencies (1, 4, 8, 16, 32, 64) ×
 3 repeats. Sized for overnight; `time: "08:00:00"` in the scheduler block.
-Output: `${HOME}/s3_write_bench_full_results/results.csv`.
+Output: `${HOME}/clio_s3_write_results/results.csv`.
 
 `verify` is **off** here (byte-fidelity is settled; `objects_measured` is the
 per-row guard and costs no egress), and `num_objects` is 256 so that K=64 has
 several windows of work behind it instead of one. See the header comment in
-`s3_write_bench_full.yaml` for why there is no 16 MiB axis and what the K=64
+`clio_s3_write.yaml` for why there is no 16 MiB axis and what the K=64
 `rawput` point is there to settle.
 
 ### Cost
