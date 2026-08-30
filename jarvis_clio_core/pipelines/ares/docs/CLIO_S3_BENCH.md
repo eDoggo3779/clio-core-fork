@@ -35,7 +35,7 @@ no SIF, no apptainer.
 | Path | `ParseOmni` → `S3FileAssimilator` → fork+exec `cae_s3_tool get` → CTE `PutBlob` | `zarr.open` over `FsspecStore` → `arr[:]` |
 | Reads | N flat objects, whole-object GETs | N chunks of a Zarr v3 store |
 | Ends up | bytes in a distributed CTE tag | a NumPy array in process memory |
-| Compression | none | none **and** zstd, both in the same row |
+| Compression | none | none |
 
 Both stacks move **the same 2 GiB of logical data** in every row. Across the
 granularity axis only the *request count* changes (4096 / 512 / 64 / 8), because
@@ -50,9 +50,40 @@ each raw object set is the same 2 GiB buffer re-split.
 | Path | `AsyncPutBlob` → CTE → `kS3` bdev `WriteBlocks` → signed PUT from the runtime daemon | `zarr.create_array` over `FsspecStore` → `arr[:] = data` | K concurrent `cae_s3_tool put` |
 | Writes | N blobs, split into `block_<offset>` objects | N chunks of a Zarr v3 store | N flat objects |
 | Starts from | bytes in a CLIO shared-memory buffer | a NumPy array in process memory | pre-staged local files |
-| Compression | none | none **and** zstd, both in the same row | none |
+| Compression | none | none | none |
 
 All three stacks move the same logical bytes in every row, in the same unit.
+
+### Zarr-zstd is deliberately not a comparator
+
+**Nothing in either grid is compressed.** CLIO gets its own compression
+mechanism later this year; until it does, comparing an uncompressed CLIO
+transfer against a compressed Zarr one measures zstd rather than either system.
+
+Both pipelines therefore pin `variants: ["none"]`, and the `zarr_s3.readzstd.*`
+/ `zarr_s3.writezstd.*` columns are gone from the results and from the
+`post_cmds` assertions. **Re-enabling is a one-line change per pipeline** —
+restore `["none", "zstd"]` and put the zstd column back in `post_cmds` — which
+is the intended move once CLIO can compress on its own side of the comparison.
+
+The 2026-08-26 write sweep, which did run zstd, is the evidence for why this
+matters. Two numbers from it, kept here as provenance and **not** as a
+comparison:
+
+- zstd compressed 1.93× and was link-bound like everything else. Its
+  `agg_bw_mbps` reached **20.6** — above the measured 11.1 MB/s link — purely
+  because logical bytes exceeded wire bytes. It was the largest number in the
+  file and the one most likely to be misquoted as a throughput win over CLIO.
+- On the wire it was **10.34 MB/s at K=32, marginally slower than CLIO's 10.11**
+  for the same logical payload, having moved 133 MiB against CLIO's 256 MiB.
+
+Note the confound ran in **opposite directions** on the two sweeps: reading,
+compression meant Zarr fetched fewer bytes; writing, it meant Zarr sent fewer.
+Either way the comparison was about the codec.
+
+The staged read dataset still contains its four zstd stores. Nothing reads them
+now; they cost storage, not egress, and leaving them staged is what keeps
+re-enabling cheap.
 
 ### Read the raw floor first (write side)
 
@@ -77,18 +108,19 @@ results.csv row carries the caveats:
 
 - `agg_bw_mbps` — throughput over **logical** (uncompressed) bytes on every
   stack. This is the directly comparable number.
-- `wire_bw_mbps` / `bytes_moved` — what actually crossed the network. This is
-  the single biggest confound in the comparison, and **it runs in opposite
-  directions on the two sweeps.** On reads, compression means Zarr *fetches*
-  fewer bytes (~20-26× fewer for the zstd store). On writes it means Zarr
-  *sends* fewer bytes while CLIO's bdev sends every byte uncompressed. Either
-  way, a zstd row that looks faster may simply have transferred less.
+- `wire_bw_mbps` / `bytes_moved` — what actually crossed the network. With
+  every stack uncompressed this should now equal `agg_bw_mbps` on every row, so
+  a gap between the two means something other than compression and is worth
+  chasing. It remains the column to compare on: it is the one that stays honest
+  if a compressed stack is ever added back.
 - `objects_read` / `get_count`, `objects_written` / `put_count` — request-rate
   vs bandwidth regime. Note CLIO's write count is derived from block geometry
   (`object_size / block_size`), not from the blob count.
-- `compression`, `decode_step` — Zarr burns CPU coding; CLIO does not. On the
-  write side `decode_step` is really the *encode* pass, kept under the read-side
-  name so one parser key serves both sweeps.
+- `compression`, `decode_step` — should read `none` / `no` on every stack in
+  every row. They are kept precisely because that is an assertion, not a
+  formality: a row where Zarr reports a codec is a row where `variants` was not
+  pinned. On the write side `decode_step` is really the *encode* pass, kept
+  under the read-side name so one parser key serves both sweeps.
 - `subprocess_spawns`, `temp_file_bytes` — **the sharpest contrast between the
   two directions.** Reading, CLIO forks `cae_s3_tool` once per object and stages
   every object whole through node-local disk before it reaches CTE; both are 0
@@ -112,13 +144,15 @@ results.csv row carries the caveats:
    and `kMaxParallelTasks` (32) are `static constexpr` inside
    `S3FileAssimilator::Schedule`, so object size is the only granularity control
    on the CLIO read side.
-3. **Source entropy is an input, not an accident (write side).**
-   `compressibility` (default 0.5) sets how compressible the Zarr source data is.
-   At `0.0` zstd cannot compress at all and in fact slightly *expands* the data,
-   so the zstd row measures nothing but encode overhead; at `1.0` it compresses
-   to almost nothing. Neither resembles real scientific arrays. Whatever value is
-   used must be stated alongside the numbers. On the read side the equivalent
-   knob is the staging script's `--pattern`.
+3. **Source entropy is currently inert, and will matter again.** The write
+   pipeline's `compressibility` (default 0.5) sets how compressible the Zarr
+   source data is; with no codec running it changes nothing on the wire. It is
+   kept set so that restoring zstd stays a one-line change, and because the
+   value has to be stated alongside any future compressed numbers: at `0.0`
+   zstd cannot compress at all and in fact slightly *expands* the data, at
+   `1.0` it compresses to almost nothing, and neither resembles real scientific
+   arrays. On the read side the equivalent knob is the staging script's
+   `--pattern`.
 
 ### The concurrency caveat (read before interpreting any result)
 
@@ -150,16 +184,19 @@ measured results below for why that rule matters.
 ## What the write sweep measured (2026-08-26)
 
 36 rows: 2 sizes × 6 concurrencies × 3 repeats, all `success`. Wire MB/s, mean of
-the three repeats:
+the three repeats. **This run predates the removal of zstd from the grid** — its
+zarr-zstd column is omitted here and summarized under "Zarr-zstd is deliberately
+not a comparator" above; nothing else about the run changes, since every figure
+below comes from the uncompressed stacks:
 
-| K | \| | CLIO 1M | rawput 1M | zarr 1M | zstd 1M | \| | CLIO 4M | rawput 4M | zarr 4M | zstd 4M |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1  | | 2.51 | 1.72 | 4.14 | 2.50 | | 6.13 | 4.76 | 4.84 | 3.61 |
-| 4  | | 2.60 | 4.04 | 9.49 | 7.74 | | 6.33 | 7.38 | 10.73 | 9.73 |
-| 8  | | 3.41 | 5.46 | 10.75 | 9.94 | | 7.64 | 9.18 | 11.08 | 10.81 |
-| 16 | | 3.92 | 7.75 | 10.87 | 10.68 | | 9.27 | 10.46 | 11.10 | 10.99 |
-| 32 | | 4.76 | 9.91 | 10.90 | 10.68 | | 9.91 | 10.83 | 11.06 | 10.91 |
-| 64 | | 4.87 | 9.95 | 10.83 | 10.51 | | 10.57 | 11.06 | 10.93 | 10.82 |
+| K | \| | CLIO 1M | rawput 1M | zarr 1M | \| | CLIO 4M | rawput 4M | zarr 4M |
+|---|---|---|---|---|---|---|---|---|
+| 1  | | 2.51 | 1.72 | 4.14 | | 6.13 | 4.76 | 4.84 |
+| 4  | | 2.60 | 4.04 | 9.49 | | 6.33 | 7.38 | 10.73 |
+| 8  | | 3.41 | 5.46 | 10.75 | | 7.64 | 9.18 | 11.08 |
+| 16 | | 3.92 | 7.75 | 10.87 | | 9.27 | 10.46 | 11.10 |
+| 32 | | 4.76 | 9.91 | 10.90 | | 9.91 | 10.83 | 11.06 |
+| 64 | | 4.87 | 9.95 | 10.83 | | 10.57 | 11.06 | 10.93 |
 
 **The K=64 rawput point settles the ceiling question.** rawput moves +0.3% (1
 MiB) and +2.2% (4 MiB) from K=32 to K=64 — flat. rawput forks K processes and
@@ -197,13 +234,8 @@ The oversubscription check comes back **clean**: at K=64
 (`runtime.num_threads: 64` on `cpus_per_task: 40`) CLIO does not dip below K=32
 at either size — 4.76 → 4.87 and 9.91 → 10.57.
 
-**zstd compresses 1.93× and is link-bound like everything else.** Its
-`agg_bw_mbps` reaches 20.6 — above the 11.1 MB/s link — purely because logical
-bytes exceed wire bytes. Quoting that as a throughput win over CLIO is the
-single easiest misread of this sweep; compare `wire_bw_mbps`.
-
-**Client memory is a clear CLIO win, by ~6×.** At 4 MiB / K=64: CLIO 266 MB,
-zarr 1664 MB, zstd 1724 MB. CLIO's K-slot SHM window grows as K × object_size and
+**Client memory is a clear CLIO win, by ~6×.** At 4 MiB / K=64: CLIO 266 MB
+against zarr's 1664 MB. CLIO's K-slot SHM window grows as K × object_size and
 nothing else; zarr materializes the whole 1 GiB array in-process. rawput is flat
 at 21 MB only because its bytes live in a temp file — `temp_file_bytes` reaches
 256 MiB at K=64, so it moved the cost to disk rather than avoiding it.
@@ -360,7 +392,10 @@ only needs to exist and be writable. The read sweep needs a dataset:
 
 Writes a 1024³ uint16 array (2 GiB) as 8 Zarr v3 stores (chunk edges
 64/128/256/512 × none/zstd) plus 4 flat-object sets at matching sizes, and a
-`manifest.json`. Idempotent — the manifest is written last, so a re-run skips
+`manifest.json`. **Only the four uncompressed stores are read** now that zstd
+is out of the grid; the zstd stores are staged anyway, so re-enabling the
+variant needs no re-staging. Pass `--only-granularity` / `--only` to trim the
+upload if that storage is unwelcome. Idempotent — the manifest is written last, so a re-run skips
 completed work and redoes only partial uploads. Useful flags: `--dry-run`,
 `--only zarr|raw`, `--only-granularity 256`, `--force`.
 
@@ -368,11 +403,14 @@ Sanity-check it end-to-end against a local S3-compatible store first if you
 like — both the staging script and the Zarr reader accept `--endpoint-url` (or
 `S3_ENDPOINT`), and so does `cae_s3_tool`.
 
-The default `--pattern smooth` compresses ~20–26× with zstd, close to the
-zarr_benchmarks reference dataset's 24×. It is synthetic; report the ratio
-(recorded per store in `manifest.json`) rather than presenting it as a property
-of real scientific data. `--pattern random` is incompressible and reduces the
-compression axis to a measurement of zstd's CPU cost.
+`--pattern` shapes the source entropy. It does not affect the current grid —
+nothing compressed is read — but it decides what the staged zstd stores are
+worth whenever the variant comes back. The default `smooth` compresses ~20–26×
+with zstd, close to the zarr_benchmarks reference dataset's 24×; it is
+synthetic, so report the ratio (recorded per store in `manifest.json`) rather
+than presenting it as a property of real scientific data. `random` is
+incompressible and would reduce a compression axis to a measurement of zstd's
+CPU cost.
 
 ---
 
@@ -393,8 +431,8 @@ jarvis ppl submit "$CLIO_REPO/jarvis_clio_core/pipelines/ares/s3_read_bench.yaml
 ```
 
 Grid: bytes-per-request {512 KiB, 4 MiB, 32 MiB, 256 MiB} × concurrency
-{1, 8, 32} = 12 combinations × `repeat: 3`. Compression is not a sweep axis —
-both Zarr variants run inside each row. Output:
+{1, 8, 32} = 12 combinations × `repeat: 3`. Compression is not a sweep axis and
+is no longer a comparison either: one uncompressed Zarr pass per row. Output:
 `${HOME}/s3_read_bench_results/results.csv`.
 
 ### Write sweep (36 rows, ~3.6 h)
@@ -449,7 +487,9 @@ table above, then writes five PNGs:
 | `s3_write_max_rss.png` | client peak memory (log scale) |
 
 One subplot per blob size, x-axis concurrency, one bar per stack, error bars =
-repeat stddev.
+repeat stddev. Stacks absent from the CSV are dropped at load, so the script
+renders three bars per cluster on a current sweep and four on an archived one
+that still carries `zarr_s3.writezstd` — no flag, no edit.
 
 **Read `s3_write_ratio.png` first.** When four stacks are all pinned to the same
 link, absolute MB/s says nothing about any of them; only the ratio to the floor
@@ -488,8 +528,8 @@ bandwidth is a quarter the object rate.
 ### Write
 
 3. Required columns: `clio_s3.write.agg_bw_mbps`, `zarr_s3.write.agg_bw_mbps`,
-   `zarr_s3.writezstd.agg_bw_mbps`, `raw_put.rawput.agg_bw_mbps`.
-   `objects_written` and `put_count` must be > 0 on every stack.
+   `raw_put.rawput.agg_bw_mbps`. `objects_written` and `put_count` must be > 0
+   on every stack.
 4. **`clio_s3.write.objects_measured` equals `num_objects`.** This one is a
    `list` of the bucket prefix rather than a number the benchmark computed, so it
    is the only column a run that wrote nothing cannot fabricate. Zero means the
@@ -555,10 +595,11 @@ bandwidth is a quarter the object rate.
      overhead pipelines across the concurrent processes and the floor becomes
      honest. It is a floor for **sustained throughput**, not for single-op
      latency.
-   * **Compare `wire_bw_mbps`, not `agg_bw_mbps`.** `zarr_s3.writezstd`
-     legitimately beats every other stack on `agg_bw_mbps` because it moves
-     roughly half the bytes for the same logical payload. On the wire it is
-     no faster.
+   * **Compare `wire_bw_mbps`, not `agg_bw_mbps`.** The two agree now that
+     every stack is uncompressed, so this costs nothing to honour — and it is
+     the habit that kept the comparison honest when `zarr_s3.writezstd` was in
+     the grid, where it beat every other stack on `agg_bw_mbps` purely by
+     moving roughly half the bytes for the same logical payload.
 
    If CLIO beats the floor on **wire** bandwidth at high K, *then* something
    is not reaching S3 — check that the CTE tier really is the S3 device and

@@ -4,12 +4,17 @@ Plot the CLIO-vs-Zarr-vs-rawput S3 write benchmark sweep results.csv.
 
 Reads the results.csv produced by s3_write_bench_full.yaml (36 rows: 2 blob
 sizes x 6 concurrencies x repeat 3) and writes clustered bar charts putting the
-four write stacks side by side in each cluster:
+write stacks side by side in each cluster:
 
     clio_s3     - CLIO CTE -> S3 bdev tier (Poco + SigV4, in the runtime daemon)
     raw_put     - fork+exec `cae_s3_tool put`, the wire-speed FLOOR
     zarr_none   - Zarr v3 over s3fs, uncompressed
-    zarr_zstd   - Zarr v3 over s3fs, zstd-compressed
+
+A fourth stack, zarr_zstd, is still declared in STACKS but is no longer part of
+the grid: CLIO gets its own compression later this year, and until it does, a
+compressed zarr write compared against an uncompressed CLIO one measures zstd
+rather than either system. Stacks with no data in the CSV are dropped at load,
+so this script keeps working unchanged on the older sweeps that do carry it.
 
 Layout is transposed relative to plot_s3_read_bench.py: there is one subplot per
 blob/chunk size and the x-axis is concurrency K, because on the write side the
@@ -18,12 +23,15 @@ which a K-faceted layout would hide.
 
 Five figures are emitted:
 
-  * wire_bw_mbps  - on-the-wire MB/s. THE cross-stack comparison. agg_bw is not
-                    comparable across stacks because zstd moves ~half the bytes
-                    for the same logical payload and would read as ~2x faster.
+  * wire_bw_mbps  - on-the-wire MB/s. THE cross-stack comparison. It stays the
+                    headline even now that every stack in the grid is
+                    uncompressed: on an older CSV carrying zarr_zstd, agg_bw is
+                    not comparable across stacks, because zstd moves ~half the
+                    bytes for the same logical payload and reads as ~2x faster.
   * agg_bw_mbps   - LOGICAL (uncompressed) MB/s: application-visible throughput.
-                    The gap against the wire figure is exactly what compression
-                    bought, so the pair has to be read together.
+                    Equal to the wire figure for every uncompressed stack; the
+                    gap on a compressed one is exactly what compression bought,
+                    so the pair has to be read together.
   * ratio_to_floor - each stack's wire bandwidth divided by the raw-PUT floor
                     measured in the SAME row. This is the honest headline: when
                     every stack is pinned to the link, absolute MB/s says
@@ -140,7 +148,11 @@ def load_success(csv_path):
                           row. Computed per row, not from column means, so the
                           repeat-to-repeat spread of the ratio is real: both
                           numerator and denominator saw the same link weather.
+
+    Also narrows the module-level STACKS to the stacks this CSV actually
+    carries -- see the note at the bottom of the function.
     """
+    global STACKS
     df = pd.read_csv(csv_path)
     if "status" in df.columns:
         df = df[df["status"] == "success"].copy()
@@ -164,6 +176,16 @@ def load_success(csv_path):
         col = f"{prefix}.wire_bw_mbps"
         if floor is not None and col in df.columns:
             df[f"{prefix}.ratio_to_floor"] = df[col] / floor.replace(0, np.nan)
+
+    # Drop stacks this sweep did not run. `Zarr zstd` left the grid once CLIO's
+    # own compression landed on the roadmap -- comparing a compressed zarr
+    # write against an uncompressed CLIO one measures zstd, not either system.
+    # Filtering on the data rather than deleting the entry keeps the older
+    # CSVs that DO carry those columns plottable, and stops a departed stack
+    # from rendering as a phantom bar and a column of NaN.
+    STACKS = [s for s in STACKS
+              if f"{s[1]}.wire_bw_mbps" in df.columns
+              and df[f"{s[1]}.wire_bw_mbps"].notna().any()]
     return df
 
 

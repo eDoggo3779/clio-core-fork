@@ -7,8 +7,15 @@
 #   1. CLIO  -> clio_s3_bench (mode: read): CAE assimilator pulls flat objects
 #               (ParseOmni -> fork+exec cae_s3_tool get -> CTE PutBlob),
 #               driving the clio_s3_read_bench binary
-#   2. Zarr   -> zarr_s3_bench (mode: read): zarr-python + s3fs reads a Zarr v3
-#               store, run twice per row (uncompressed and zstd)
+#   2. Zarr   -> zarr_s3_bench (mode: read): zarr-python + s3fs reads an
+#               UNCOMPRESSED Zarr v3 store
+#
+#   ZARR-ZSTD IS DELIBERATELY NOT A COMPARATOR. CLIO gets its own compression
+#   mechanism later this year; until it does, a compressed Zarr store moves
+#   ~20-26x fewer bytes for the same logical payload, so the comparison would
+#   measure zstd rather than either system. `variants: ["none"]` below is the
+#   whole switch -- restore ["none", "zstd"] once CLIO can compress too, and
+#   put back the zarr_s3.readzstd.* column in post_cmds.
 #
 #   Grid: bytes-per-request {512 KiB, 4 MiB, 32 MiB, 256 MiB}
 #         x concurrency {1, 8, 32}
@@ -40,16 +47,17 @@
 #
 # Output:
 #   ${HOME}/s3_read_bench_results/results.csv — 36 rows. Per-stack columns:
-#   clio_s3.read.*, zarr_s3.read.*, zarr_s3.readzstd.* (agg_bw_mbps,
-#   wire_bw_mbps, bytes_moved, logical_bytes, get_count, compression,
-#   decode_step, subprocess_spawns, temp_file_bytes, max_rss_kb, ...).
+#   clio_s3.read.*, zarr_s3.read.* (agg_bw_mbps, wire_bw_mbps, bytes_moved,
+#   logical_bytes, get_count, compression, decode_step, subprocess_spawns,
+#   temp_file_bytes, max_rss_kb, ...).
 #
 #   READ THE FAIRNESS COLUMNS. agg_bw_mbps is logical-bytes throughput on both
-#   sides and is directly comparable; wire_bw_mbps is what crossed the network
-#   and differs by the compression ratio. CLIO additionally lands its bytes in
-#   a distributed CTE tag while Zarr lands a NumPy array in one process's heap
-#   — CLIO does strictly more work, so Zarr's number is NOT "CLIO minus
-#   overhead". See docs/CLIO_S3_BENCH.md.
+#   sides and is directly comparable; wire_bw_mbps is what crossed the network.
+#   With zstd out of the grid these two now agree on both stacks, and a gap
+#   between them means something other than compression. CLIO additionally
+#   lands its bytes in a distributed CTE tag while Zarr lands a NumPy array in
+#   one process's heap — CLIO does strictly more work, so Zarr's number is NOT
+#   "CLIO minus overhead". See docs/CLIO_S3_BENCH.md.
 
 scheduler:
   name: slurm
@@ -115,8 +123,7 @@ scheduler:
       path = sys.argv[1]
       if not os.path.exists(path):
           print("NO RESULTS CSV AT", path); sys.exit(0)
-      need = ["clio_s3.read.agg_bw_mbps", "zarr_s3.read.agg_bw_mbps",
-              "zarr_s3.readzstd.agg_bw_mbps"]
+      need = ["clio_s3.read.agg_bw_mbps", "zarr_s3.read.agg_bw_mbps"]
       rows = list(csv.DictReader(open(path)))
       bad = [r.get("run_idx") for r in rows
              if r.get("status") == "success" and any(not r.get(c) for c in need)]
@@ -183,7 +190,9 @@ config:
       bucket: "${S3_BENCH_BUCKET}"
       store_prefix: "clio-s3-read-bench"
       chunk_edge: 256                                 # SWEPT
-      variants: ["none", "zstd"]
+      # Uncompressed only -- see the zstd note in the header. The staged
+      # dataset still carries the zstd stores; nothing reads them.
+      variants: ["none"]
       async_concurrency: 8                            # SWEPT
       aws_region: "${S3_BENCH_REGION}"
       venv: "${ZARR_VENV}"

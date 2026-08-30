@@ -9,15 +9,17 @@
 #
 # WHAT THE SMOKE ESTABLISHED, AND WHY THIS GRID LOOKS LIKE IT DOES.
 #
-#   At K=32 all four engines converged on the same wire bandwidth:
+#   At K=32 every engine converged on the same wire bandwidth:
 #
 #     raw PUT floor   10.75 MB/s      <- the ceiling
 #     zarr (none)     10.62 MB/s      98.8% of floor
-#     zarr (zstd)     10.34 MB/s      96.2% of floor  (wire, not logical)
 #     CLIO -> S3 bdev 10.11 MB/s      94.0% of floor
 #
-#   Four independent write paths landing inside 6% of each other is not four
-#   coincidences. It is one shared constraint: roughly 85 Mbit/s of egress
+#   (A zarr+zstd variant also ran at 10.34 MB/s on the wire. It is no longer
+#   part of the grid -- see the note below.)
+#
+#   Independent write paths landing inside 6% of each other is not a
+#   coincidence. It is one shared constraint: roughly 85 Mbit/s of egress
 #   from an Ares compute node to S3. CLIO is not slow here; the link is.
 #
 #   That reframes the whole sweep. Blob size and concurrency cannot be
@@ -42,13 +44,18 @@
 # numbers are a property of the night you ran them. The distance to the
 # rawput floor is a property of CLIO.
 #
-# DO NOT QUOTE zarr's zstd agg_bw AGAINST CLIO's. At K=32 zstd reads 19.90
-# MB/s to CLIO's 12.17 -- but zstd moved 133 MiB of wire bytes to CLIO's 256
-# MiB for the same logical payload. Its wire_bw is 10.34, i.e. slightly
-# SLOWER than CLIO on the wire. The fairness columns (compression,
-# bytes_moved, logical_bytes, wire_bw_mbps) exist for exactly this row, and
-# 19.90 is the largest number in the file, so it is the one that will get
-# misquoted.
+# ZARR-ZSTD IS DELIBERATELY NOT A COMPARATOR. CLIO gets its own compression
+# mechanism later this year; until it does, comparing an uncompressed CLIO
+# write against a compressed zarr write measures zstd, not either system.
+# The 2026-08-26 sweep is the evidence for how badly: at K=32 zstd read 19.90
+# MB/s of agg_bw to CLIO's 12.17, purely because it moved 133 MiB of wire
+# bytes to CLIO's 256 MiB for the same logical payload -- on the wire it was
+# 10.34, i.e. slightly SLOWER than CLIO. That 19.90 was the largest number in
+# the file and the one most likely to be misquoted.
+#
+# `variants: ["none"]` below is the whole switch. Restore ["none", "zstd"]
+# once CLIO can compress too, and put back the zarr_s3.writezstd.* column in
+# post_cmds.
 #
 # Cost: writes are cheap -- ingress to S3 is free, PUTs run ~$0.005/1000.
 # ~37k PUTs across the grid is about $0.18. `verify` is OFF here (it is GET
@@ -332,7 +339,7 @@ scheduler:
       if not os.path.exists(path):
           print("NO RESULTS CSV AT", path); sys.exit(0)
       need = ["clio_s3.write.agg_bw_mbps", "zarr_s3.write.agg_bw_mbps",
-              "zarr_s3.writezstd.agg_bw_mbps", "raw_put.rawput.agg_bw_mbps"]
+              "raw_put.rawput.agg_bw_mbps"]
       rows = list(csv.DictReader(open(path)))
       green = [r for r in rows if r.get("status") == "success"]
       bad = [r.get("run_idx") for r in green if any(not r.get(c) for c in need)]
@@ -483,10 +490,12 @@ config:
       # --total-bytes (num_objects * object_size) and --chunk-bytes from it.
       num_objects: 256                                # SWEPT: == clio_s3
       object_size: "4m"                               # SWEPT: == clio_s3
-      variants: ["none", "zstd"]
-      # Source entropy is an explicit input: at 0.0 zstd cannot compress and
-      # slightly EXPANDS the data, at 1.0 it compresses to nothing. Neither
-      # resembles real scientific arrays.
+      # Uncompressed only -- see the zstd note in the header.
+      variants: ["none"]
+      # Inert while variants is ["none"] (it only shapes source entropy for a
+      # codec to work on), but kept so restoring zstd is a one-line change: at
+      # 0.0 zstd cannot compress and slightly EXPANDS the data, at 1.0 it
+      # compresses to nothing. Neither resembles real scientific arrays.
       compressibility: 0.5
       async_concurrency: 8                            # SWEPT
       aws_region: "${S3_BENCH_REGION}"

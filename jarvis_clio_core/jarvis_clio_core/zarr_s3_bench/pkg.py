@@ -32,10 +32,15 @@ class ZarrS3Bench(S3BenchBase):
     land in the same results.csv row, so the compression comparison costs no
     extra sweep combinations and no extra CLIO runs.
 
-    Compression is the biggest confound on the write side and it favours zarr:
-    a zstd store sends fewer bytes than CLIO's uncompressed bdev moves. The
-    `compressibility` option makes the source entropy an explicit input rather
-    than an artifact of the test data -- see the script's module docstring.
+    Compression is the biggest confound in either direction and it favours
+    zarr: a zstd store moves fewer bytes than CLIO does for the same logical
+    payload. Both S3 pipelines therefore pin `variants: ["none"]` -- CLIO gets
+    its own compression mechanism later this year, and until it does the
+    compressed comparison measures zstd rather than either system. The
+    machinery stays because that is a temporary state; `compressibility` makes
+    the source entropy an explicit input rather than an artifact of the test
+    data, and matters again the moment a codec is switched back on -- see the
+    script's module docstring.
     """
 
     #: One driver script per mode, resolved under ``pkg_dir/scripts``.
@@ -93,10 +98,13 @@ class ZarrS3Bench(S3BenchBase):
                 'name': 'variants',
                 'msg': 'Compression variants to run in this row',
                 'type': list,
-                'default': ['none', 'zstd'],
+                'default': ['none'],
                 'help': "Each runs once; 'none' emits the bare label, 'zstd' "
                         'emits <Label>Zstd (the readzstd/writezstd columns), '
-                        'both into the same results row.'
+                        'both into the same results row. Defaults to '
+                        "uncompressed ONLY: comparing a compressed zarr "
+                        'against an uncompressed CLIO measures the codec, so '
+                        'a codec belongs here only once CLIO has one too.'
             },
             {
                 'name': 'async_concurrency',
