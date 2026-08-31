@@ -696,7 +696,7 @@ TEST_CASE("BlobReplicas - metadata snapshot covers replica layouts",
 }
 
 TEST_CASE("BlobReplicas - snapshot replica layouts restore into a fresh pool",
-          "[cte][replicas][wal][886]") {
+          "[cte][replicas][wal][886][noleak]") {
   // Covers RestoreMetadataFromLog's REPLICA branch, which nothing else in the
   // unit suite reaches.
   //
@@ -779,7 +779,27 @@ TEST_CASE("BlobReplicas - snapshot replica layouts restore into a fresh pool",
   // as a lost layout: a non-zero rc or the wrong bytes.
   clio::cte::core::Client restored(clio::run::PoolId(514, 0));
   std::vector<char> got;
-  REQUIRE(GetFrom(&restored, tag_id, "restore_blob", &got, 1) == 0);
+  const clio::run::u32 read_rc =
+      GetFrom(&restored, tag_id, "restore_blob", &got, 1);
+
+  // Tear the restored pool down BEFORE asserting, so a failing assertion does
+  // not leave a stray pool composed for the tests that follow.
+  //
+  // [noleak] on this case: composing a pool builds a container the PoolManager
+  // owns for the PROCESS lifetime -- DestroyPool unregisters it but does not
+  // return its rebuilt metadata image (~96 KB here) to the runtime private
+  // heap, which only ServerFinalize's DestroyAllContainers does. Measured with
+  // -DCLIO_CORE_ENABLE_LEAK_CHECK=ON: the delta is identical with and without
+  // this DestroyPool call, so the tag reflects real runtime-lifetime state
+  // rather than papering over a leak this test could actually release.
+  {
+    clio::run::admin::Client admin_cleanup(clio::run::kAdminPoolId);
+    auto destroy = admin_cleanup.AsyncDestroyPool(clio::run::PoolQuery::Local(),
+                                                  clio::run::PoolId(514, 0));
+    destroy.Wait();
+  }
+
+  REQUIRE(read_rc == 0);
   REQUIRE(got.size() == kValSize);
   REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
 }
