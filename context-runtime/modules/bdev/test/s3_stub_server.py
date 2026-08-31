@@ -40,6 +40,13 @@ BUCKET = "clio-stub-bucket"
 OBJECTS = {}
 LOCK = threading.Lock()
 
+# Reuse proof for test_s3_rest.cc: CONNECTIONS counts accepted TCP sockets,
+# REQUESTS counts handled requests. Keep-alive means many REQUESTS ride one
+# CONNECTION, so a client that reuses its session shows REQUESTS climbing while
+# CONNECTIONS holds. Served back over GET /__stats.
+CONNECTIONS = 0
+REQUESTS = 0
+
 
 def _sign(key, msg):
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -110,6 +117,13 @@ def verify(method, path, query, headers):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        """Runs once per accepted TCP socket -- count it for the reuse proof."""
+        super().setup()
+        global CONNECTIONS
+        with LOCK:
+            CONNECTIONS += 1
+
     def log_message(self, fmt, *args):
         """Quiet by default; set S3_STUB_VERBOSE=1 to trace requests."""
         if os.environ.get("S3_STUB_VERBOSE") == "1":
@@ -129,6 +143,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self, method):
+        global REQUESTS
+        with LOCK:
+            REQUESTS += 1
         path, query = self._split()
         reason = verify(method, path, query, self.headers)
         if reason is not None:
@@ -166,9 +183,16 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200)
 
     def do_GET(self):
+        path, _ = self._split()
+        # Reuse-proof probe. Unauthenticated and uncounted so the test can read
+        # the counters without perturbing them.
+        if path == "/__stats":
+            with LOCK:
+                body = f'{{"connections": {CONNECTIONS}, "requests": {REQUESTS}}}'
+            self._respond(200, body.encode("utf-8"))
+            return
         if not self._authorized("GET"):
             return
-        path, _ = self._split()
         with LOCK:
             body = OBJECTS.get(path)
         if body is None:

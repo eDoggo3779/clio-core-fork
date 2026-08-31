@@ -82,6 +82,10 @@ bool S3BdevTransport::Init(const CreateParams& params,
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
   allocator_.Init(num_workers, s3_capacity_, params.alignment_);
 
+  // One reusable connection per worker. ElasticHeadroom covers ids handed to
+  // workers spawned after Init (same reasoning as fs_bdev's io_contexts_).
+  conns_.resize(num_workers + clio::run::WorkOrchestrator::ElasticHeadroom());
+
   HLOG(kInfo,
        "S3 bdev ready: bucket='{}' prefix='{}' region='{}' endpoint='{}' "
        "capacity={}",
@@ -96,9 +100,19 @@ bool S3BdevTransport::Init(const CreateParams& params,
 
 void S3BdevTransport::Destroy() {
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
+  conns_.clear();  // closes each keep-alive socket via its unique_ptr dtor
   client_.reset();
 #endif
 }
+
+#ifdef CLIO_ENABLE_AMAZON_DRIVE
+s3::S3Connection *S3BdevTransport::GetWorkerConnection(size_t worker_id) {
+  if (worker_id >= conns_.size()) {
+    return nullptr;
+  }
+  return &conns_[worker_id];
+}
+#endif
 
 bool S3BdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
   return allocator_.AllocateBlocks(size, worker_id, blocks);
@@ -107,8 +121,13 @@ bool S3BdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Blo
 void S3BdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
   if (client_) {
+    // Reuse this worker's kept-alive connection; fall back to a transient one
+    // if worker_id is out of range (deletes are best-effort regardless).
+    s3::S3Connection *conn = GetWorkerConnection(static_cast<size_t>(worker_id));
+    s3::S3Connection local;
+    s3::S3Connection &c = conn ? *conn : local;
     for (const auto& block : blocks) {
-      client_->DeleteObject(client_->KeyForOffset(block.offset_)); // best effort
+      client_->DeleteObject(c, client_->KeyForOffset(block.offset_)); // best effort
     }
   }
 #endif
@@ -121,6 +140,13 @@ clio::run::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
+
+  // This worker's own keep-alive connection (never shared -- see conns_).
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
+  size_t worker_id = worker ? worker->GetId() : 0;
+  s3::S3Connection *conn = GetWorkerConnection(worker_id);
+  s3::S3Connection local_conn;
+  s3::S3Connection &s3_conn = conn ? *conn : local_conn;
 
   bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
   std::vector<char> staging;
@@ -143,7 +169,7 @@ clio::run::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
                            : data_ptr.ptr_ + data_offset;
 
     s3::S3Result res = client_->PutObject(
-        client_->KeyForOffset(block.offset_), block_data,
+        s3_conn, client_->KeyForOffset(block.offset_), block_data,
         static_cast<size_t>(block_write_size));
     if (!res.error.empty()) {
       HLOG(kError, "S3 PutObject failed: {}", res.error.c_str());
@@ -155,6 +181,10 @@ clio::run::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
     total_bytes_written += block_write_size;
     data_offset += block_write_size;
   }
+
+  // Proof of reuse in situ: connects stays 1 while reuses climbs per worker.
+  HLOG(kDebug, "S3 write worker={} connects={} reuses={}", worker_id,
+       s3_conn.connects, s3_conn.reuses);
 
   task->return_code_ = 0;
   task->bytes_written_ = total_bytes_written;
@@ -173,6 +203,13 @@ clio::run::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
+
+  // This worker's own keep-alive connection (never shared -- see conns_).
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
+  size_t worker_id = worker ? worker->GetId() : 0;
+  s3::S3Connection *conn = GetWorkerConnection(worker_id);
+  s3::S3Connection local_conn;
+  s3::S3Connection &s3_conn = conn ? *conn : local_conn;
 
   bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
   std::vector<char> staging;
@@ -195,7 +232,7 @@ clio::run::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
 
     size_t got = 0;
     s3::S3Result res = client_->GetObject(
-        client_->KeyForOffset(block.offset_), block_data,
+        s3_conn, client_->KeyForOffset(block.offset_), block_data,
         static_cast<size_t>(block_read_size), &got);
 
     if (res.not_found) {
@@ -219,6 +256,10 @@ clio::run::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
   if (data_on_device && total_bytes_read > 0) {
     ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
   }
+
+  // Proof of reuse in situ: connects stays 1 while reuses climbs per worker.
+  HLOG(kDebug, "S3 read worker={} connects={} reuses={}", worker_id,
+       s3_conn.connects, s3_conn.reuses);
 
   task->return_code_ = 0;
   task->bytes_read_ = total_bytes_read;

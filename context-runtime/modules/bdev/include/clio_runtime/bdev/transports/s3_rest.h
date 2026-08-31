@@ -19,11 +19,15 @@
 // so the SDK simply goes away.
 //
 // Data-plane semantics (PUT / GET with 404 -> sparse zero-fill / best-effort
-// DELETE / one fresh session per call, so the client is usable from many
-// workers at once) are deliberately identical to gcs_rest.h. The plumbing below
+// DELETE) are deliberately identical to gcs_rest.h. The plumbing below
 // duplicates ~60 lines of that file rather than being factored into a shared
 // header: the GCS transport works today, and a narrower blast radius is worth
 // more here than fewer total lines.
+//
+// Unlike gcs_rest.h, the S3 data-plane methods take a caller-owned
+// S3Connection handle and keep the socket alive across calls (see S3Connection
+// below). The client object itself still holds no socket, so one client remains
+// usable from many workers at once -- each worker just hands in its own handle.
 //
 // Only compiled where CLIO_ENABLE_AMAZON_DRIVE is defined and Poco::Net /
 // Poco::NetSSL are linked.
@@ -127,9 +131,28 @@ inline std::unique_ptr<Poco::Net::HTTPClientSession> MakeSession(
 }
 
 /**
- * Minimal S3 REST client. Instances are cheap and hold no live socket -- a
- * fresh session is opened per call, which keeps the client usable from several
- * runtime workers at once without sharing a non-thread-safe Poco session.
+ * A reusable HTTP(S) connection to one S3 endpoint.
+ *
+ * Not thread-safe by design: each runtime worker owns exactly one and never
+ * shares it. That is safe here because S3 ops run synchronously in the worker's
+ * task body (blocking Poco I/O, no CO_AWAIT mid-op), so a worker's connection is
+ * never touched concurrently -- the property that lets a non-thread-safe Poco
+ * session be kept alive without a lock. A null `session` means "connect on next
+ * use"; Retire() forces that on the next call after a failure or a server
+ * `Connection: close`.
+ */
+struct S3Connection {
+  std::unique_ptr<Poco::Net::HTTPClientSession> session;
+  uint64_t connects = 0;  ///< sockets opened (diagnostics / reuse proof)
+  uint64_t reuses = 0;    ///< requests served on an already-open socket
+  void Retire() { session.reset(); }
+};
+
+/**
+ * Minimal S3 REST client. Instances are cheap and hold no live socket -- the
+ * caller passes in a per-worker S3Connection, which keeps the client usable
+ * from several runtime workers at once without sharing a non-thread-safe Poco
+ * session, while still reusing the socket across calls on the same worker.
  */
 class S3RestClient {
  public:
@@ -200,32 +223,42 @@ class S3RestClient {
     return head;
   }
 
-  /** Upload `len` bytes to `key`. HTTP 2xx => success. */
-  S3Result PutObject(const std::string &key, const char *data, size_t len) {
+  /** Upload `len` bytes to `key` over `conn`. HTTP 2xx => success. */
+  S3Result PutObject(S3Connection &conn, const std::string &key,
+                     const char *data, size_t len) {
     S3Result r;
-    try {
-      Endpoint ep = Resolve(key);
-      auto session = MakeSession(ep.base);
-      Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_PUT,
-                                 ep.canonical_uri,
-                                 Poco::Net::HTTPMessage::HTTP_1_1);
-      req.setContentType("application/octet-stream");
-      req.setContentLength(static_cast<std::streamsize>(len));
-      Sign(req, "PUT", ep);
-      std::ostream &os = session->sendRequest(req);
-      if (len > 0) os.write(data, static_cast<std::streamsize>(len));
-      os.flush();
-      Poco::Net::HTTPResponse res;
-      std::istream &rs = session->receiveResponse(res);
-      r.http_status = res.getStatus();
-      std::string resp;
-      Poco::StreamCopier::copyToString(rs, resp);
-      if (!r.ok()) {
-        r.error = "S3 PUT " + key + " failed: HTTP " +
-                  std::to_string(r.http_status) + " " + resp;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      r = S3Result{};
+      bool reused = false;
+      try {
+        Endpoint ep = Resolve(key);
+        Poco::Net::HTTPClientSession *session = Connect(conn, ep.base, &reused);
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_PUT,
+                                   ep.canonical_uri,
+                                   Poco::Net::HTTPMessage::HTTP_1_1);
+        req.setContentType("application/octet-stream");
+        req.setContentLength(static_cast<std::streamsize>(len));
+        Sign(req, "PUT", ep);
+        std::ostream &os = session->sendRequest(req);
+        if (len > 0) os.write(data, static_cast<std::streamsize>(len));
+        os.flush();
+        Poco::Net::HTTPResponse res;
+        std::istream &rs = session->receiveResponse(res);
+        r.http_status = res.getStatus();
+        std::string resp;
+        Poco::StreamCopier::copyToString(rs, resp);  // drain before next use
+        if (!r.ok()) {
+          r.error = "S3 PUT " + key + " failed: HTTP " +
+                    std::to_string(r.http_status) + " " + resp;
+        }
+        RetireIfClosed(conn, res);
+        return r;
+      } catch (const Poco::Exception &e) {
+        conn.Retire();
+        if (reused && attempt == 0) continue;  // stale keep-alive; retry once
+        r.error = std::string("S3 PUT exception: ") + e.displayText();
+        return r;
       }
-    } catch (const Poco::Exception &e) {
-      r.error = std::string("S3 PUT exception: ") + e.displayText();
     }
     return r;
   }
@@ -235,67 +268,84 @@ class S3RestClient {
    * not_found and the caller zero-fills (sparse read). On success `*bytes_read`
    * (if non-null) receives the byte count copied.
    */
-  S3Result GetObject(const std::string &key, char *buf, size_t len,
-                     size_t *bytes_read) {
+  S3Result GetObject(S3Connection &conn, const std::string &key, char *buf,
+                     size_t len, size_t *bytes_read) {
     S3Result r;
-    if (bytes_read) *bytes_read = 0;
-    try {
-      Endpoint ep = Resolve(key);
-      auto session = MakeSession(ep.base);
-      Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET,
-                                 ep.canonical_uri,
-                                 Poco::Net::HTTPMessage::HTTP_1_1);
-      Sign(req, "GET", ep);
-      session->sendRequest(req);
-      Poco::Net::HTTPResponse res;
-      std::istream &rs = session->receiveResponse(res);
-      r.http_status = res.getStatus();
-      if (r.http_status == 404) {
-        r.not_found = true;  // sparse: caller zero-fills
-        Poco::NullOutputStream null;
-        Poco::StreamCopier::copyStream(rs, null);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      r = S3Result{};
+      if (bytes_read) *bytes_read = 0;
+      bool reused = false;
+      try {
+        Endpoint ep = Resolve(key);
+        Poco::Net::HTTPClientSession *session = Connect(conn, ep.base, &reused);
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET,
+                                   ep.canonical_uri,
+                                   Poco::Net::HTTPMessage::HTTP_1_1);
+        Sign(req, "GET", ep);
+        session->sendRequest(req);
+        Poco::Net::HTTPResponse res;
+        std::istream &rs = session->receiveResponse(res);
+        r.http_status = res.getStatus();
+        if (r.http_status == 404) {
+          r.not_found = true;  // sparse: caller zero-fills
+          DrainAndRetireIfClosed(conn, res, rs);
+          return r;
+        }
+        if (!r.ok()) {
+          std::string resp;
+          Poco::StreamCopier::copyToString(rs, resp);  // drain before next use
+          r.error = "S3 GET " + key + " failed: HTTP " +
+                    std::to_string(r.http_status) + " " + resp;
+          RetireIfClosed(conn, res);
+          return r;
+        }
+        // A single read() can return short on a chunked or slow response, so
+        // loop until the buffer is full or the body ends.
+        size_t total = 0;
+        while (total < len && rs) {
+          rs.read(buf + total, static_cast<std::streamsize>(len - total));
+          total += static_cast<size_t>(rs.gcount());
+          if (rs.gcount() == 0) break;
+        }
+        if (bytes_read) *bytes_read = total;
+        // Drain any body past the caller buffer so the socket stays reusable.
+        DrainAndRetireIfClosed(conn, res, rs);
+        return r;
+      } catch (const Poco::Exception &e) {
+        conn.Retire();
+        if (reused && attempt == 0) continue;  // stale keep-alive; retry once
+        r.error = std::string("S3 GET exception: ") + e.displayText();
         return r;
       }
-      if (!r.ok()) {
-        std::string resp;
-        Poco::StreamCopier::copyToString(rs, resp);
-        r.error = "S3 GET " + key + " failed: HTTP " +
-                  std::to_string(r.http_status) + " " + resp;
-        return r;
-      }
-      // A single read() can return short on a chunked or slow response, so loop
-      // until the stream is drained or the buffer is full.
-      size_t total = 0;
-      while (total < len && rs) {
-        rs.read(buf + total, static_cast<std::streamsize>(len - total));
-        total += static_cast<size_t>(rs.gcount());
-        if (rs.gcount() == 0) break;
-      }
-      if (bytes_read) *bytes_read = total;
-    } catch (const Poco::Exception &e) {
-      r.error = std::string("S3 GET exception: ") + e.displayText();
     }
     return r;
   }
 
-  /** Best-effort object delete (errors are not fatal to the caller). */
-  S3Result DeleteObject(const std::string &key) {
+  /** Best-effort object delete over `conn` (errors are not fatal to caller). */
+  S3Result DeleteObject(S3Connection &conn, const std::string &key) {
     S3Result r;
-    try {
-      Endpoint ep = Resolve(key);
-      auto session = MakeSession(ep.base);
-      Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_DELETE,
-                                 ep.canonical_uri,
-                                 Poco::Net::HTTPMessage::HTTP_1_1);
-      Sign(req, "DELETE", ep);
-      session->sendRequest(req);
-      Poco::Net::HTTPResponse res;
-      std::istream &rs = session->receiveResponse(res);
-      r.http_status = res.getStatus();
-      Poco::NullOutputStream null;
-      Poco::StreamCopier::copyStream(rs, null);
-    } catch (const Poco::Exception &e) {
-      r.error = std::string("S3 DELETE exception: ") + e.displayText();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      r = S3Result{};
+      bool reused = false;
+      try {
+        Endpoint ep = Resolve(key);
+        Poco::Net::HTTPClientSession *session = Connect(conn, ep.base, &reused);
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_DELETE,
+                                   ep.canonical_uri,
+                                   Poco::Net::HTTPMessage::HTTP_1_1);
+        Sign(req, "DELETE", ep);
+        session->sendRequest(req);
+        Poco::Net::HTTPResponse res;
+        std::istream &rs = session->receiveResponse(res);
+        r.http_status = res.getStatus();
+        DrainAndRetireIfClosed(conn, res, rs);
+        return r;
+      } catch (const Poco::Exception &e) {
+        conn.Retire();
+        if (reused && attempt == 0) continue;  // stale keep-alive; retry once
+        r.error = std::string("S3 DELETE exception: ") + e.displayText();
+        return r;
+      }
     }
     return r;
   }
@@ -312,6 +362,43 @@ class S3RestClient {
   static std::string GetEnv(const char *name) {
     const char *v = std::getenv(name);
     return (v && *v) ? std::string(v) : std::string();
+  }
+
+  /**
+   * Return an open session for `base`, reusing conn.session when it is still
+   * connected. `*reused` reports whether an already-open socket was reused, so
+   * the caller knows a mid-flight failure may just be a dropped idle keep-alive
+   * (worth one retry) rather than a real error on a fresh socket.
+   */
+  static Poco::Net::HTTPClientSession *Connect(S3Connection &conn,
+                                               const Poco::URI &base,
+                                               bool *reused) {
+    if (conn.session && conn.session->connected()) {
+      *reused = true;
+      ++conn.reuses;
+      return conn.session.get();
+    }
+    conn.session = MakeSession(base);
+    conn.session->setKeepAlive(true);
+    *reused = false;
+    ++conn.connects;
+    return conn.session.get();
+  }
+
+  /** Retire the connection if the server declined to keep it alive. */
+  static void RetireIfClosed(S3Connection &conn,
+                             const Poco::Net::HTTPResponse &res) {
+    if (!res.getKeepAlive()) conn.Retire();
+  }
+
+  /** Fully drain the response body (required before the socket is reused),
+   *  then retire the connection if the server sent Connection: close. */
+  static void DrainAndRetireIfClosed(S3Connection &conn,
+                                     const Poco::Net::HTTPResponse &res,
+                                     std::istream &rs) {
+    Poco::NullOutputStream null;
+    Poco::StreamCopier::copyStream(rs, null);
+    RetireIfClosed(conn, res);
   }
 
   /**

@@ -9,7 +9,9 @@
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
 
+#include <cstddef>
 #include <memory>
+#include <vector>
 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
 #include <clio_runtime/bdev/transports/s3_rest.h>
@@ -52,6 +54,17 @@ class S3BdevTransport : public BdevTransport {
 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
   std::unique_ptr<s3::S3RestClient> client_;
+
+  // One reusable (keep-alive) HTTP connection per worker, indexed by worker id.
+  // Lock-free like FsBdevTransport::io_contexts_: S3 ops run synchronously in a
+  // worker's task body, so a worker only ever touches its own slot. Sized with
+  // ElasticHeadroom so ids handed to workers spawned after Init still land in
+  // range. Default-constructed slots are lazy (null session -> connect on first
+  // use), so no eager init loop is needed.
+  std::vector<s3::S3Connection> conns_;
+
+  /** The connection slot for `worker_id`, or nullptr if out of range. */
+  s3::S3Connection* GetWorkerConnection(size_t worker_id);
 #endif
 };
 
