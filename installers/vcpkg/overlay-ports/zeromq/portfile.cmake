@@ -12,7 +12,7 @@ vcpkg_from_github(
         # retired_fd, and the poller aborts registering it:
         #   Bad file descriptor / not a socket (src/epoll.cpp:73)
         # Every clio client process builds a ZMQ context, so this reaches any
-        # workload that spawns short-lived clients (iowarp/clio-core#1064).
+        # workload that spawns short-lived clients (iowarp/clio-core#1067).
         # Drop this file when a release past v4.3.5 carries the fix.
         windows-ipc-connect-fallback.patch
         fix-arm.patch
