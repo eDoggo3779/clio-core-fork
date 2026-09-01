@@ -45,6 +45,25 @@ void ParsePoolName(const std::string &pool_name, std::string &bucket,
     prefix.pop_back();
   }
 }
+
+// Report connection churn -- one line per socket this worker has newly opened.
+//
+// kDebug would have been the natural level for a diagnostic, but HLOG compiles
+// out everything below CTP_LOG_LEVEL and that defaults to kInfo, so a kDebug
+// line is simply absent from every release build (Ares included) and no runtime
+// env var can bring it back. Hence kInfo -- which is only affordable because
+// this fires per newly-opened socket rather than per object: a healthy run
+// prints one line per worker for the whole run, while a run that reconnects
+// every time prints one per object, and that volume is itself the finding.
+void ReportConnectionChurn(const char *op, size_t worker_id,
+                           s3::S3Connection &conn) {
+  if (conn.connects <= conn.logged_connects) {
+    return;
+  }
+  conn.logged_connects = conn.connects;
+  HLOG(kInfo, "S3 {} worker={} opened socket #{} (reuses so far: {})", op,
+       worker_id, conn.connects, conn.reuses);
+}
 }  // namespace
 #endif
 
@@ -100,6 +119,28 @@ bool S3BdevTransport::Init(const CreateParams& params,
 
 void S3BdevTransport::Destroy() {
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
+  // One compact per-worker tally before the sockets go. This is the line a
+  // smoke greps: `requests` is what the worker sent, `sockets` is what it cost
+  // in connections, so sockets==1 with requests>>1 IS connection reuse, and
+  // sockets==requests means every op reconnected and the mechanism is dead.
+  // Emitted only for workers that did S3 I/O, so an idle pool stays quiet.
+  uint64_t total_sockets = 0, total_requests = 0;
+  for (size_t i = 0; i < conns_.size(); ++i) {
+    const s3::S3Connection &c = conns_[i];
+    if (c.connects == 0) {
+      continue;
+    }
+    total_sockets += c.connects;
+    total_requests += c.connects + c.reuses;
+    HLOG(kInfo, "S3 keepalive worker={} sockets={} requests={} reuses={}", i,
+         c.connects, c.connects + c.reuses, c.reuses);
+  }
+  if (total_sockets > 0) {
+    HLOG(kInfo, "S3 keepalive TOTAL sockets={} requests={} reuse_ratio={:.2f}",
+         total_sockets, total_requests,
+         static_cast<double>(total_requests) /
+             static_cast<double>(total_sockets));
+  }
   conns_.clear();  // closes each keep-alive socket via its unique_ptr dtor
   client_.reset();
 #endif
@@ -182,9 +223,7 @@ clio::run::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
     data_offset += block_write_size;
   }
 
-  // Proof of reuse in situ: connects stays 1 while reuses climbs per worker.
-  HLOG(kDebug, "S3 write worker={} connects={} reuses={}", worker_id,
-       s3_conn.connects, s3_conn.reuses);
+  ReportConnectionChurn("write", worker_id, s3_conn);
 
   task->return_code_ = 0;
   task->bytes_written_ = total_bytes_written;
@@ -257,9 +296,7 @@ clio::run::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
     ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
   }
 
-  // Proof of reuse in situ: connects stays 1 while reuses climbs per worker.
-  HLOG(kDebug, "S3 read worker={} connects={} reuses={}", worker_id,
-       s3_conn.connects, s3_conn.reuses);
+  ReportConnectionChurn("read", worker_id, s3_conn);
 
   task->return_code_ = 0;
   task->bytes_read_ = total_bytes_read;

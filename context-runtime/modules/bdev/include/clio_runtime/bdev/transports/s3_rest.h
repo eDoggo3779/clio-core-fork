@@ -145,6 +145,10 @@ struct S3Connection {
   std::unique_ptr<Poco::Net::HTTPClientSession> session;
   uint64_t connects = 0;  ///< sockets opened (diagnostics / reuse proof)
   uint64_t reuses = 0;    ///< requests served on an already-open socket
+  /// How many of `connects` the owner has already reported. Lets a caller log
+  /// once per newly-opened socket instead of once per request; see
+  /// ReportConnectionChurn in s3_bdev_transport.cc.
+  uint64_t logged_connects = 0;
   void Retire() { session.reset(); }
 };
 

@@ -1,0 +1,414 @@
+# =============================================================================
+# S3 bdev KEEP-ALIVE SMOKE -- read path (GetObject). 2 rows, ~8 minutes.
+# =============================================================================
+#
+# PURPOSE: prove that `S3RestClient::GetObject` also rides the per-worker
+# persistent connection, and that a read reuses the socket a write already
+# opened. Companion to clio_s3_write_smoke.yaml (the PUT path). Neither is a
+# performance sweep -- 32 MiB per row says nothing about bandwidth.
+#
+# READ THIS BEFORE LOOKING FOR THE READ SWEEP. clio_s3_read.yaml does NOT
+# exercise this mechanism, and editing it into a smoke would have measured
+# nothing. Its read path is the CAE assimilator: ParseOmni -> fork+exec
+# cae_s3_tool get -> CTE PutBlob, landing in a `ram::cte_ram_tier1` device.
+# The GETs are issued by the AWS SDK inside a short-lived child process, and
+# `S3RestClient` is not in that path at all -- there is no session to keep
+# alive, and each object gets a fresh process, let alone a fresh socket.
+#
+# The only route by which a GET reaches S3RestClient::GetObject is a CTE
+# GetBlob against an S3-BACKED BDEV TIER, which is what this file builds:
+#
+#   clio_s3_write_bench --verify
+#     -> AsyncPutBlob  x N   -> S3BdevTransport::WriteBlocks -> PutObject
+#     -> AsyncGetBlob  x N   -> S3BdevTransport::ReadBlocks  -> GetObject
+#
+# The write phase is therefore not incidental -- it is required. The bdev owns
+# its own key layout (block_<offset>), so there is no way to pre-stage objects
+# it would read. The single S3 device below is load-bearing for the same
+# reason it is in the write smoke: with any RAM tier present the DPE could
+# serve GetBlob without touching S3, and the read half would prove nothing.
+#
+# HOW IT IS PROVEN, AND WHY THE GATE IS A COUNT AND NOT A LOG LINE.
+# The transport logs one line per NEWLY OPENED socket, plus a per-worker tally
+# at teardown:
+#
+#     S3 keepalive worker=3 sockets=1 requests=64 reuses=63
+#     S3 keepalive TOTAL sockets=4 requests=256 reuse_ratio=64.00
+#
+# By the time verify runs, every worker already holds an open socket from the
+# write phase, so a successful read opens NOTHING and prints NO new "opened
+# socket" line. Absence of a read-side line is the success case, which makes it
+# useless as a gate. What does move is `requests`: it counts PUTs and GETs
+# alike, so 128 blobs written and read back must show requests >= 256 while
+# sockets stays at roughly one per worker. That is the assertion below.
+#
+# Usage:
+#   export S3_BENCH_BUCKET=my-bucket S3_BENCH_PROFILE=clio-bench
+#   export S3_BENCH_REGION=us-east-2      # MANDATORY, the bucket's real region
+#   export IOWARP_VIEW=/mnt/common/$USER/iowarp-s3-view ZARR_VENV=$HOME/zarr-venv
+#   export PATH="$HOME/jarvis-venv/bin:$PATH"
+#   jarvis ppl submit <abs path>/clio_s3_read_smoke.yaml
+#
+# Output: ${HOME}/clio_s3_ka_smoke_r_results/results.csv (2 rows), plus the
+#         `S3 keepalive` tallies in the job log, which are the deliverable.
+
+scheduler:
+  name: slurm
+  job_name: clio_s3_ka_smoke_r
+  nodes: 1
+  ntasks_per_node: 1
+  # 40, NOT MORE. Ares compute nodes have 40 allocatable CPUs and sbatch
+  # rejects the job outright above that, before anything runs.
+  cpus_per_task: 40
+  partition: compute
+  time: "00:30:00"
+  output: ${HOME}/clio_s3_ka_smoke_r-%j.out
+  error: ${HOME}/clio_s3_ka_smoke_r-%j.err
+  # MUST stay literally identical to config.hostfile below.
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_ka_smoke_r_hostfile.txt"
+  pre_cmds:
+    # 1) Toolchain. Pure PATH prepends -- never `spack load` / `conda activate`
+    #    (they install shell functions that misbehave under `set -euo pipefail`).
+    - 'export PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
+    - 'export LD_LIBRARY_PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib:${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib64:${LD_LIBRARY_PATH:-}"'
+    - 'command -v clio_run            >/dev/null 2>&1 || { echo "ERROR: clio_run not on PATH (view: ${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view})" >&2; exit 1; }'
+    # NOTE: the write bench, not the read bench. See the header -- the read
+    # bench drives the CAE assimilator and never reaches S3RestClient.
+    - 'command -v clio_s3_write_bench >/dev/null 2>&1 || { echo "ERROR: clio_s3_write_bench not on PATH — was IOWarp built with +s3_bdev?" >&2; exit 1; }'
+    - 'command -v jarvis              >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
+    - '"${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" -c "import botocore" || { echo "ERROR: botocore missing from ${ZARR_VENV:-$HOME/zarr-venv} (needed for preflight/purge/count)" >&2; exit 1; }'
+    - |
+      RUN_ROOT="$(dirname "$(dirname "$(readlink -f "$(command -v clio_run)")")")"
+      BENCH_ROOT="$(dirname "$(dirname "$(readlink -f "$(command -v clio_s3_write_bench)")")")"
+      if [ "$RUN_ROOT" != "$BENCH_ROOT" ]; then
+        echo "ERROR: mixed IOWarp installs on PATH -- these must be one prefix" >&2
+        echo "  clio_run            -> $RUN_ROOT" >&2
+        echo "  clio_s3_write_bench -> $BENCH_ROOT" >&2
+        exit 1
+      fi
+      echo "install root OK: $RUN_ROOT"
+    # THE GATE THAT MATTERS. The keep-alive code lives in
+    # libclio_bdev_runtime.so, not in the benchmark binary, so the bench build
+    # stamp says nothing about it. `spack develop` rebuilds in place and branch
+    # versions do not rehash, so a `git pull` without a `spack install` leaves
+    # a library that predates the change with the same spec name, hash and
+    # view. The tally format string only exists in a build carrying this work.
+    - |
+      LIB="$(command -v clio_run)"; LIB="${LIB%/bin/clio_run}/lib/libclio_bdev_runtime.so"
+      [ -f "$LIB" ] || LIB="${LIB%/lib/*}/lib64/libclio_bdev_runtime.so"
+      [ -f "$LIB" ] || { echo "ERROR: libclio_bdev_runtime.so not found under the install root" >&2; exit 1; }
+      ldd "$LIB" 2>/dev/null | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — built without +s3_bdev?" >&2; exit 1; }
+      ldd "$LIB" 2>/dev/null | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
+      strings "$LIB" 2>/dev/null | grep -qF "S3 keepalive worker=" || {
+        echo "ERROR: $LIB PREDATES the persistent-connection change (no 'S3 keepalive' tally)." >&2
+        echo "  This smoke would pass meaninglessly against it. Pulling the repo" >&2
+        echo "  does NOT rebuild a spack-develop install:" >&2
+        echo "    spack install iowarp@968-s3-bench" >&2
+        exit 1; }
+      echo "keepalive build gate OK: $LIB carries the S3 keepalive tally"
+    # 2) AWS credentials. NO SECRETS IN THIS FILE -- only profile/region names.
+    #    The clio_run daemon signs, and its Poco SigV4 signer reads RAW ENV
+    #    VARS ONLY, so the profile is resolved to keys here and forwarded.
+    - 'export AWS_PROFILE="${S3_BENCH_PROFILE:-clio-bench}"'
+    - '[ -n "${S3_BENCH_REGION:-}" ] || { echo "ERROR: S3_BENCH_REGION not set -- it must be the real region of the bucket" >&2; exit 1; }'
+    - 'export AWS_DEFAULT_REGION="$S3_BENCH_REGION"'
+    - 'unset S3_ENDPOINT AWS_ENDPOINT_URL'
+    - '[ -r "$HOME/.aws/credentials" ] || { echo "ERROR: ~/.aws/credentials missing/unreadable" >&2; exit 1; }'
+    - '[ -n "${S3_BENCH_BUCKET:-}" ] || { echo "ERROR: S3_BENCH_BUCKET not set" >&2; exit 1; }'
+    - |
+      eval "$(python3 - "$AWS_PROFILE" <<'PY'
+      import configparser, os, shlex, sys
+      profile = sys.argv[1]
+      cfg = configparser.ConfigParser()
+      cfg.read(os.path.expanduser("~/.aws/credentials"))
+      if profile not in cfg:
+          # stdout is eval'd by the shell, so diagnostics must go to stderr.
+          sys.exit(f"no profile [{profile}] in ~/.aws/credentials")
+      sec = cfg[profile]
+      for env, key in (("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
+                       ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
+                       ("AWS_SESSION_TOKEN", "aws_session_token")):
+          if sec.get(key):
+              print(f"export {env}={shlex.quote(sec[key])}")
+      PY
+      )"
+    - '[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "ERROR: AWS_ACCESS_KEY_ID empty after reading profile [$AWS_PROFILE] — the runtime cannot sign without it" >&2; exit 1; }'
+    - 'echo "credentials exported from [$AWS_PROFILE], region $AWS_DEFAULT_REGION"'
+    # 3) Stale-state cleanup. pkill patterns are BRACKETED so they never match
+    #    this script's own argv. Only chi_* is removed from /dev/shm.
+    - 'pkill -9 -f "[c]himaera" 2>/dev/null || true'
+    - 'pkill -9 -f "[c]lio_run" 2>/dev/null || true'
+    - '{ command -v fuser >/dev/null 2>&1 && fuser -k 9413/tcp; } >/dev/null 2>&1 || true'
+    - 'rm -f /dev/shm/chi_* 2>/dev/null || true'
+    - 'rm -rf /tmp/iowarp_chi* 2>/dev/null || true'
+    # 4) Experiment dirs + repo registration + clean slate.
+    - 'mkdir -p "$HOME/clio_s3_ka_smoke_r_results" "$HOME/.jarvis-s3-bench"'
+    - 'mkdir -p /tmp/clio/models 2>/dev/null || echo "note: /tmp/clio/models not creatable; TaskStatModel will log errors (harmless)"'
+    - |
+      if [ -z "${CLIO_REPO:-}" ]; then
+        for cand in "$HOME/clio-core-fork" "$HOME/clio-core"; do
+          if [ -d "$cand/jarvis_clio_core/jarvis_clio_core" ]; then CLIO_REPO="$cand"; break; fi
+        done
+      fi
+      [ -n "${CLIO_REPO:-}" ] || { echo "ERROR: no CLIO checkout found; set CLIO_REPO" >&2; exit 1; }
+      export CLIO_REPO
+      RT_PKG="$CLIO_REPO/jarvis_clio_core/jarvis_clio_core/clio_runtime/pkg.py"
+      [ -f "$RT_PKG" ] || { echo "ERROR: $RT_PKG missing -- CLIO_REPO=$CLIO_REPO is wrong" >&2; exit 1; }
+      grep -q "forward_env" "$RT_PKG" || {
+        echo "ERROR: $RT_PKG has no forward_env option, so AWS credentials" >&2
+        echo "  cannot reach the clio_run daemon and every PutBlob will fail." >&2
+        exit 1; }
+      for shadow in "$HOME/.ppi-jarvis/builtin/clio_runtime" \
+                    "$HOME/.ppi-jarvis/builtin/clio_s3_bench"; do
+        if [ -e "$shadow" ]; then
+          echo "ERROR: $shadow shadows the checkout; jarvis will load the stale copy. Remove it." >&2
+          exit 1
+        fi
+      done
+      jarvis repo add "$CLIO_REPO/jarvis_clio_core" 2>/dev/null || true
+      echo "jarvis packages OK: $CLIO_REPO/jarvis_clio_core"
+    - 'rm -f "$HOME/clio_s3_ka_smoke_r_results/results.csv"'
+    # Pre-flight the EXACT call the S3 bdev makes at Init, signed with the RAW
+    # EXPORTED KEYS, plus an authoritative region check -- botocore follows S3
+    # region redirects and would report success on a wrong region, while the
+    # bdev's signer has no redirect logic and would 301 on every request.
+    - |
+      "${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" - <<'EOF' || exit 1
+      import os, sys
+      import botocore.session, botocore.exceptions
+      key    = os.environ.get("AWS_ACCESS_KEY_ID", "")
+      secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+      token  = os.environ.get("AWS_SESSION_TOKEN") or None
+      region = os.environ.get("AWS_DEFAULT_REGION", "")
+      bucket = os.environ.get("S3_BENCH_BUCKET", "")
+      if not key or not secret:
+          sys.exit("ERROR: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are empty "
+                   "after the credential export. The S3 bdev needs raw keys.")
+      client = botocore.session.get_session().create_client(
+          "s3", region_name=region, aws_access_key_id=key,
+          aws_secret_access_key=secret, aws_session_token=token)
+      try:
+          client.head_bucket(Bucket=bucket)
+      except botocore.exceptions.ClientError as e:
+          code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+          sys.exit(f"ERROR: HeadBucket on '{bucket}' failed with HTTP {code}: {e}\n"
+                   f"  403 -> the key pair needs s3:ListBucket on the bucket itself\n"
+                   f"  301 -> AWS_DEFAULT_REGION={region} is not the region of the bucket\n"
+                   f"  404 -> bucket name is wrong")
+      try:
+          loc = client.get_bucket_location(Bucket=bucket).get("LocationConstraint")
+      except botocore.exceptions.ClientError as e:
+          sys.exit(f"ERROR: GetBucketLocation on '{bucket}' failed: {e}")
+      true_region = {None: "us-east-1", "": "us-east-1",
+                     "EU": "eu-west-1"}.get(loc, loc)
+      if true_region != region:
+          sys.exit(f"ERROR: S3_BENCH_REGION={region} but bucket '{bucket}' "
+                   f"lives in {true_region}.\n"
+                   f"  Fix: export S3_BENCH_REGION={true_region}")
+      print(f"S3 preflight OK: HeadBucket {bucket}, region confirmed {true_region}")
+      EOF
+  post_cmds:
+    - 'RES="$HOME/clio_s3_ka_smoke_r_results/results.csv"; n=$(grep -c success "$RES" 2>/dev/null || true); n=${n:-0}; echo "successful rows: $n / 2"'
+    # THE GATE. Two assertions, and the second is what makes this the READ
+    # smoke rather than a slower copy of the write one:
+    #
+    #   1. reuse_ratio > 1  -- sockets are being reused at all.
+    #   2. requests >= 2 x num_objects -- the GETs went over those same
+    #      sockets. 128 blobs written and verified is 256 S3 operations; a run
+    #      where verify somehow bypassed the bdev (a cached blob, a RAM tier
+    #      that crept into the config) would show ~128 and fail here even
+    #      though every row is green and every byte compared equal.
+    #
+    # Deliberately NOT asserted: the presence of an "S3 read worker=... opened
+    # socket" line. Verify runs after the write phase, so the workers already
+    # hold open sockets and a correct read opens none -- absence is the success
+    # case. See the header.
+    #
+    # HLOG writes every level to stderr and the daemon is launched exec_async
+    # with inherited fds, so the tallies land in this job's Slurm log. Both
+    # .out and .err are scanned because which one carries it depends on how
+    # jarvis wired the daemon's stdio, and that is not worth depending on.
+    - |
+      python3 - <<'EOF'
+      import glob, os, re, sys
+      NUM_OBJECTS = 128          # keep in sync with clio_s3.num_objects below
+      MIN_REQUESTS = 2 * NUM_OBJECTS
+
+      job = os.environ.get("SLURM_JOB_ID", "*")
+      home = os.path.expanduser("~")
+      logs = (glob.glob(f"{home}/clio_s3_ka_smoke_r-{job}.out")
+              + glob.glob(f"{home}/clio_s3_ka_smoke_r-{job}.err"))
+      text = ""
+      for p in logs:
+          try:
+              with open(p, errors="replace") as f:
+                  text += f.read()
+          except OSError as e:
+              print(f"note: could not read {p}: {e}")
+      if not logs:
+          sys.exit("FAIL: no job log found to scan for keepalive tallies")
+
+      per_worker = re.findall(
+          r"S3 keepalive worker=(\d+) sockets=(\d+) requests=(\d+) reuses=(\d+)",
+          text)
+      totals = re.findall(
+          r"S3 keepalive TOTAL sockets=(\d+) requests=(\d+) reuse_ratio=([\d.]+)",
+          text)
+
+      if not per_worker:
+          sys.exit(
+              "FAIL: no 'S3 keepalive' tally in the job log.\n"
+              "  Either no S3 I/O happened, or the installed\n"
+              "  libclio_bdev_runtime.so predates this change -- though the\n"
+              "  pre_cmds build gate should have caught that.")
+
+      print(f"keepalive tallies found: {len(per_worker)} worker line(s), "
+            f"{len(totals)} total line(s)")
+      worst_ratio = None
+      for wid, sockets, requests, reuses in per_worker:
+          s, r = int(sockets), int(requests)
+          ratio = r / s if s else 0.0
+          print(f"  worker={wid} sockets={s} requests={r} "
+                f"reuses={reuses} ratio={ratio:.2f}")
+          if worst_ratio is None or ratio < worst_ratio:
+              worst_ratio = ratio
+
+      print("\nTOTAL lines:", totals or "none")
+      if not totals:
+          sys.exit("FAIL: no 'S3 keepalive TOTAL' line -- the transport never "
+                   "reached Destroy, so the run did not tear down cleanly.")
+
+      failures = []
+      for sockets, requests, ratio in totals:
+          req = int(requests)
+          if float(ratio) <= 1.0:
+              failures.append(
+                  f"reuse_ratio {ratio} <= 1.00: every operation opened its "
+                  f"own socket, so persistent connections are NOT in effect")
+          if req < MIN_REQUESTS:
+              failures.append(
+                  f"requests={req} < {MIN_REQUESTS} (2 x {NUM_OBJECTS}): the "
+                  f"verify GETs did not go through the S3 bdev. Check that "
+                  f"cte_core still has exactly one device and it is the S3 "
+                  f"tier -- a RAM tier would serve GetBlob without S3.")
+
+      if failures:
+          for f in failures:
+              print("FAIL:", f)
+          sys.exit(1)
+      print(f"\nPASS: PUTs and GETs share reused sockets "
+            f"(worst per-worker ratio {worst_ratio:.2f}, "
+            f"requests >= {MIN_REQUESTS} per run)")
+      EOF
+    # Purge the smoke prefix. Never fails the job.
+    - |
+      "${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" - <<'EOF' || echo "purge skipped (non-fatal)"
+      import os, sys
+      import botocore.session
+      bucket = os.environ.get("S3_BENCH_BUCKET")
+      if not bucket:
+          print("S3_BENCH_BUCKET unset; nothing to purge"); sys.exit(0)
+      prefix = "clio-s3-ka-smoke-r/"
+      c = botocore.session.get_session().create_client(
+          "s3", region_name=os.environ.get("AWS_DEFAULT_REGION"))
+      keys = []
+      for page in c.get_paginator("list_objects_v2").paginate(
+              Bucket=bucket, Prefix=prefix):
+          for o in page.get("Contents", []):
+              keys.append({"Key": o["Key"]})
+      n = 0
+      for i in range(0, len(keys), 1000):
+          r = c.delete_objects(Bucket=bucket,
+                               Delete={"Objects": keys[i:i + 1000]})
+          n += len(r.get("Deleted", []))
+      print(f"purged {n} object(s) under s3://{bucket}/{prefix}")
+      EOF
+
+config:
+  name: clio_s3_ka_smoke_r
+
+  # MUST stay literally identical to scheduler.hostfile above.
+  hostfile: "${HOME}/.jarvis-s3-bench/clio_s3_ka_smoke_r_hostfile.txt"
+
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4           # SWEPT with concurrency
+      client_data_segment_size: "4G"
+      port: 9413
+      # IPC (unix socket), NOT shm: the benchmark is a detached client and Ares
+      # compute nodes run ptrace_scope=1, which denies the /proc reopen SHM
+      # mode needs (shm_open -> EACCES, "Failed to initialize Clio").
+      ipc_mode: "ipc"
+      # info, NOT debug: the keepalive tally is logged at kInfo precisely so it
+      # survives a release build, and debug would bury it.
+      log_level: "info"
+      swim_enabled: false
+      sleep: 4
+      # The daemon does NOT inherit the job script's environment -- jarvis
+      # builds it from EnvironmentManager.COMMON_ENV_VARS, which has no AWS_*
+      # entry, and the SigV4 signer reads raw keys from the environment only.
+      forward_env:
+        - AWS_ACCESS_KEY_ID
+        - AWS_SECRET_ACCESS_KEY
+        - AWS_SESSION_TOKEN      # optional; skipped when unset
+        - AWS_DEFAULT_REGION
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      # EXACTLY ONE device, and it is the S3 tier. This is the load-bearing
+      # line of the whole read smoke: add a RAM tier and the DPE may satisfy
+      # the verify GetBlob out of memory, the bytes still compare equal, every
+      # row still goes green -- and GetObject is never called. The requests
+      # assertion in post_cmds is the backstop that catches it if this drifts.
+      devices:
+        - ["s3://${S3_BENCH_BUCKET}/clio-s3-ka-smoke-r/bdev", "8GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      pool_query: "local"
+
+    - pkg_type: jarvis_clio_core.clio_s3_bench
+      pkg_name: clio_s3
+      mode: write
+      # 256 KiB x 128 = 32 MiB written, then all 128 read back = 256 S3
+      # operations. Small on purpose: this smoke is bounded by round trips, not
+      # bandwidth. Do not read throughput off it. Keep num_objects in sync with
+      # NUM_OBJECTS in the post_cmds gate.
+      object_size: "256k"
+      num_objects: 128
+      concurrency: 4                                  # SWEPT
+      worker_threads: 4                               # SWEPT (reported only)
+      bucket: "${S3_BENCH_BUCKET}"
+      key_prefix: "clio-s3-ka-smoke-r/bdev"
+      purge_prefix: true
+      venv: "${ZARR_VENV}"
+      tag_prefix: "s3kar"
+      aws_region: "${S3_BENCH_REGION}"
+      aws_profile: "${S3_BENCH_PROFILE}"
+      # ON -- this is the entire point of the read smoke. Verify reads every
+      # blob back with AsyncGetBlob, which reaches ReadBlocks -> GetObject on
+      # the socket the write phase already opened, and compares bytes.
+      verify: true
+
+vars:
+  # Concurrency is the only axis, zipped with the worker pool because each S3
+  # operation blocks a whole runtime worker for its duration.
+  #
+  # Row 1 (K=4)  -- deep reuse: ~64 requests per socket across write + verify.
+  # Row 2 (K=16) -- isolation: reuse must hold with many workers active, and
+  #                 sockets must scale with workers rather than collapsing to
+  #                 one (shared session) or exploding (broken slot indexing).
+  clio_s3.concurrency:    [4, 16]
+  runtime.num_threads:    [4, 16]
+  clio_s3.worker_threads: [4, 16]
+
+loop:
+  - [clio_s3.concurrency, runtime.num_threads, clio_s3.worker_threads]
+
+# Per-combination backstop. Write + verify of 32 MiB should take well under a
+# minute; 600 s means something is hung, and expiry fails the row and continues.
+run_timeout: 600
+
+# No repeats: this proves a mechanism, not a measurement.
+repeat: 1
+output: "${HOME}/clio_s3_ka_smoke_r_results"

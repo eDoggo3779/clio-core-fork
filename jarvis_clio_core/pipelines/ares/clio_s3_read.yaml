@@ -24,6 +24,14 @@
 #   Both stacks move the SAME 2 GiB of logical data in every row; only the
 #   request count changes across the granularity axis (4096/512/64/8 requests).
 #
+# THIS SWEEP DOES NOT EXERCISE THE S3 BDEV, and in particular it says nothing
+# about the S3RestClient persistent-connection work. Its read path is the CAE
+# assimilator -- ParseOmni -> fork+exec cae_s3_tool get -> CTE PutBlob -- so the
+# GETs are issued by the AWS SDK inside a short-lived child process, landing in
+# the `ram::cte_ram_tier1` device below. S3RestClient is nowhere in that path.
+# To smoke the bdev's read path (ReadBlocks -> GetObject) use
+# clio_s3_read_smoke.yaml, which reads back through an S3-backed bdev tier.
+#
 # This is a "pipeline test" (scheduler: + config: + vars: + loop: + output:),
 # NOT a plain pipeline — only this shape produces results.csv. There are no
 # `scheduler.*` entries in vars:, which is what makes it Mode A: the whole
