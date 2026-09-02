@@ -74,27 +74,55 @@ needs `s3:GetBucketLocation` for the region check.
 
 ---
 
-## 2. Build — the step that is easy to skip
+## 2. Build — use `spack develop`, and verify what you got
 
-The keep-alive code is in `libclio_bdev_runtime.so`. `spack develop` builds
-**rebuild in place**, and branch versions **do not rehash**, so a `git pull`
-alone leaves a library that predates the change with the same spec name, the
-same hash and the same view.
+The keep-alive code is in `libclio_bdev_runtime.so`. **Build it as a develop
+spec**, in the `clio-s3` environment. A develop spec builds in place from your
+checkout, so an edit is an incremental recompile of a few objects; a
+non-develop branch spec pins `commit=` at concretization time, so every `git
+pull` needs a `spack concretize -f` *and* a full rebuild before it will produce
+anything new — slower, and it fails silently by rebuilding the old commit.
 
-```bash
-cd $CLIO_REPO && git pull                    # branch: 968-clio-s3-benchmark
-spack install iowarp@968-s3-bench            # REQUIRED — the pull rebuilds nothing
-```
-
-For a non-develop spec:
+### 2a. One-time: put the environment on develop
 
 ```bash
-spack uninstall -y iowarp@968-s3-bench && spack clean -s \
-  && spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev
+spack env activate clio-s3
+
+spack develop -p $CLIO_REPO iowarp@968-s3-bench   # idempotent
+
+# exactly one iowarp spec, carrying the variants the smoke needs
+spack remove iowarp || true
+spack add iowarp@968-s3-bench +cae +cte +s3 +s3_bdev
+spack concretize -f
+spack install
 ```
 
-Confirm before submitting — this is exactly what the pipeline's build gate
-checks, and it is cheap to check yourself first:
+Confirm develop actually took — the spec must carry `dev_path`, and must
+**not** carry a `commit=`:
+
+```bash
+spack spec -l iowarp@968-s3-bench | grep -E 'dev_path|commit='
+```
+
+### 2b. Every time after that
+
+```bash
+cd $CLIO_REPO && git pull        # branch: 968-clio-s3-benchmark
+spack env activate clio-s3       # if not already active
+spack install                    # REQUIRED — the pull alone rebuilds nothing
+```
+
+If `spack install` reports the spec is already installed and skips the build
+(develop-spec change detection is not always reliable), force it:
+
+```bash
+spack install --overwrite -y iowarp@968-s3-bench
+```
+
+### 2c. Confirm the library before submitting
+
+This is exactly what the pipeline's build gate checks, and it is cheap to check
+yourself first:
 
 ```bash
 LIB=$IOWARP_VIEW/lib/libclio_bdev_runtime.so   # or lib64/
@@ -104,8 +132,26 @@ ldd "$LIB" | grep aws-cpp-sdk                     # must print NOTHING
 ```
 
 If the `strings` count is 0 you have the old transport installed, and the smoke
-would pass meaninglessly. The AWS SDK must stay absent — linking it into the
-runtime process stack-smashes runtime init.
+would pass meaninglessly. The AWS SDK must stay absent **from this library's
+link line** — linking it into the runtime process stack-smashes runtime init.
+Note that `aws-sdk-cpp` legitimately appears in `spack find -d` output: `+cae`
+needs it for the out-of-process `cae_s3_tool`. The dependency tree is not the
+gate; the `ldd` line is.
+
+### 2d. If `spack uninstall` says "matches multiple packages"
+
+Old builds accumulate — a pre-`s3_bdev` one, a pinned non-develop one, the
+develop one. Do **not** reach for `spack uninstall --force`: it orphans the
+environment's view, which is what `$IOWARP_VIEW` resolves through. The
+environment owns those references, so let garbage collection do it:
+
+```bash
+spack env activate clio-s3
+spack gc -y        # reaps only installs nothing references
+```
+
+If a spec survives `gc`, another environment still lists it — find it with
+`spack env list` and `spack -e <env> find`, and remove it there.
 
 > If `spack install` fails on Poco with `GLIBCXX_3.4.31` / `CXXABI_1.3.15`
 > undefined references, that is the recurring `.bashrc` contamination: remove
