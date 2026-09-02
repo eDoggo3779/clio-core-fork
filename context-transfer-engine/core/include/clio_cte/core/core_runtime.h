@@ -817,6 +817,11 @@ private:
    */
   clio::run::TaskResume GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask> &task);
 
+  /** Residency: is this byte range physically present in the tier?
+   *  See GetResidencyTask for why only the tier can answer this. */
+  clio::run::TaskResume GetResidency(
+      clio::run::shared_ptr<GetResidencyTask> &task);
+
   /**
    * Get contained blobs operation - returns all blob names in a tag
    * @param task GetContainedBlobs task containing tag ID and results
