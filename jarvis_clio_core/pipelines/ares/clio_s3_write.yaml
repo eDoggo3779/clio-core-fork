@@ -162,13 +162,37 @@ scheduler:
     # The S3 bdev must actually be in the runtime library, or CTE will fall
     # back to a local tier and this measures RAM. Assert it rather than trust
     # the build. Poco present + AWS SDK absent is the signature of the
-    # Poco+SigV4 transport.
+    # Poco+SigV4 transport -- but that signature is ALSO satisfied by the
+    # pre-keep-alive transport, so it is not sufficient on its own. This sweep
+    # exists to measure whether persistent connections moved the ceiling; run
+    # against a library without them and it produces a "before" number wearing
+    # an "after" label, after 3.6 hours. Assert the tally literal too, exactly
+    # as the smokes do.
     - |
-      LIB="$(command -v clio_run)"; LIB="${LIB%/bin/clio_run}/lib/libclio_bdev_runtime.so"
+      echo "bdev gate: host=$(hostname -s) time=$(date -Is)"
+      CLIO_RUN_BIN="$(command -v clio_run || true)"
+      echo "bdev gate: clio_run  -> $(readlink -f "$CLIO_RUN_BIN" 2>&1 || true)"
+      LIB="${CLIO_RUN_BIN%/bin/clio_run}/lib/libclio_bdev_runtime.so"
       [ -f "$LIB" ] || LIB="${LIB%/lib/*}/lib64/libclio_bdev_runtime.so"
-      ldd "$LIB" 2>/dev/null | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — built without +s3_bdev?" >&2; exit 1; }
-      ldd "$LIB" 2>/dev/null | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
-      echo "bdev link check OK: $LIB"
+      [ -f "$LIB" ] || { echo "ERROR: libclio_bdev_runtime.so not found under the install root" >&2; exit 1; }
+      echo "bdev gate: lib       -> $(readlink -f "$LIB" 2>&1 || true)"
+      LDD_OUT="$(ldd "$LIB" 2>&1)" || { echo "ERROR: ldd failed on $LIB:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — built without +s3_bdev?" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
+      # grep -a, not strings: binutils is not guaranteed on a compute node and
+      # the view precedes /usr/bin on PATH. Keep the count and the exit status
+      # apart so a read failure cannot masquerade as "old build".
+      KA_RC=0
+      KA_COUNT="$(grep -acF "S3 keepalive worker=" "$LIB")" || KA_RC=$?
+      echo "bdev gate: keepalive tally matches = ${KA_COUNT:-0} (grep rc=$KA_RC)"
+      [ "$KA_RC" -le 1 ] || { echo "ERROR: could not read $LIB (grep exit $KA_RC) -- an I/O or permission failure, not a verdict on the build" >&2; exit 1; }
+      [ "${KA_COUNT:-0}" -ge 1 ] || {
+        echo "ERROR: $LIB PREDATES the persistent-connection change." >&2
+        echo "  This sweep would spend 3.6 h producing a pre-keep-alive number" >&2
+        echo "  and label it as the post-change result. Rebuild first:" >&2
+        echo "    spack install iowarp@968-s3-bench" >&2
+        exit 1; }
+      echo "bdev link check OK: $LIB (Poco present, no AWS SDK, keepalive tally present)"
     - 'echo "toolchain: clio_run=$(command -v clio_run) bench=$(command -v clio_s3_write_bench) jarvis=$(command -v jarvis)"'
     # 2) AWS credentials. NO SECRETS IN THIS FILE -- only profile/region names.
     #    THIS DIFFERS FROM THE READ BENCH. There, cae_s3_tool resolved
