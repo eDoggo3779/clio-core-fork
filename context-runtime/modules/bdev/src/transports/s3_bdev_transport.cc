@@ -9,6 +9,7 @@
 #include <clio_runtime/work_orchestrator.h>
 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -136,10 +137,17 @@ void S3BdevTransport::Destroy() {
          c.connects, c.connects + c.reuses, c.reuses);
   }
   if (total_sockets > 0) {
-    HLOG(kInfo, "S3 keepalive TOTAL sockets={} requests={} reuse_ratio={:.2f}",
-         total_sockets, total_requests,
-         static_cast<double>(total_requests) /
-             static_cast<double>(total_sockets));
+    // Round the ratio here, not in the format string: ctp::Formatter only
+    // understands a bare "{}" -- tokenize() steps over a placeholder with a
+    // blind i += 2 and never looks for the closing brace -- so "{:.2f}" emits
+    // the value followed by a literal ".2f}". That trailing garbage is not
+    // cosmetic: it lands inside the number the smoke's post_cmds parse.
+    char ratio[32];
+    std::snprintf(ratio, sizeof(ratio), "%.2f",
+                  static_cast<double>(total_requests) /
+                      static_cast<double>(total_sockets));
+    HLOG(kInfo, "S3 keepalive TOTAL sockets={} requests={} reuse_ratio={}",
+         total_sockets, total_requests, ratio);
   }
   conns_.clear();  // closes each keep-alive socket via its unique_ptr dtor
   client_.reset();

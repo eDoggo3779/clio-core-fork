@@ -281,7 +281,8 @@ scheduler:
           r"S3 keepalive worker=(\d+) sockets=(\d+) requests=(\d+) reuses=(\d+)",
           text)
       totals = re.findall(
-          r"S3 keepalive TOTAL sockets=(\d+) requests=(\d+) reuse_ratio=([\d.]+)",
+          r"S3 keepalive TOTAL sockets=(\d+) requests=(\d+) "
+          r"reuse_ratio=(\d+(?:\.\d+)?)(?![\d.])",
           text)
 
       if not per_worker:
@@ -293,19 +294,27 @@ scheduler:
 
       print(f"keepalive tallies found: {len(per_worker)} worker line(s), "
             f"{len(totals)} total line(s)")
+      # A worker that served a single request CANNOT reuse anything, so its
+      # ratio is 1.00 by arithmetic, not by failure. The elastic pool spawns
+      # workers late (#785) and the last ones routinely get exactly one op --
+      # scoring them would fail a healthy run. Only workers with >= 2 requests
+      # are held to the reuse floor.
       worst_ratio = None
       for wid, sockets, requests, reuses in per_worker:
           s, r = int(sockets), int(requests)
           ratio = r / s if s else 0.0
+          note = "" if r >= 2 else "   (1 request: cannot reuse, not scored)"
           print(f"  worker={wid} sockets={s} requests={r} "
-                f"reuses={reuses} ratio={ratio:.2f}")
-          if worst_ratio is None or ratio < worst_ratio:
+                f"reuses={reuses} ratio={ratio:.2f}{note}")
+          if r >= 2 and (worst_ratio is None or ratio < worst_ratio):
               worst_ratio = ratio
 
       print("\nTOTAL lines:", totals or "none")
       if not totals:
-          sys.exit("FAIL: no 'S3 keepalive TOTAL' line -- the transport never "
-                   "reached Destroy, so the run did not tear down cleanly.")
+          sys.exit(
+              "FAIL: no well-formed 'S3 keepalive TOTAL' line. Either the\n"
+              "  transport never reached Destroy, so the run did not tear down\n"
+              "  cleanly, or the tally is malformed -- check the raw log.")
 
       failures = []
       for sockets, requests, ratio in totals:

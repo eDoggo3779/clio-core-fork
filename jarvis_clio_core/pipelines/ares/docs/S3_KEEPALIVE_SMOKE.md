@@ -33,6 +33,11 @@ S3 keepalive worker=3 sockets=1 requests=64 reuses=63
 S3 keepalive TOTAL sockets=4 requests=256 reuse_ratio=64.00
 ```
 
+The ratio is rounded in C++ with `snprintf`, not by a format spec: `ctp::Formatter`
+understands only a bare `{}` (its `tokenize()` skips a placeholder with `i += 2`
+and never seeks the closing brace), so `{:.2f}` would emit `42.6667.2f}` and
+poison the number these pipelines parse.
+
 `sockets` is TCP connections opened, `requests` is S3 operations sent over
 them. **`sockets == 1` with `requests >> 1` is reuse; `sockets == requests`
 means the mechanism is dead.** Both pipelines grep this out of the job log and
@@ -212,7 +217,7 @@ PASS: sockets are being reused across S3 operations (worst per-worker ratio 32.0
 | `no 'S3 keepalive' tally in the job log` | No S3 I/O happened, or the wrong library is installed (the build gate should have caught the latter) |
 | gate says `PREDATES` but a manual check passes | The gate prints `host=`, `clio_run =`, `lib ->` and the resolved spack hash — compare those against what you checked by hand. A different node, a different `PATH`, or a stale NFS view of `$IOWARP_VIEW` all show up there |
 | `reuse_ratio <= 1.00` | Every operation opened its own socket — the mechanism is not working |
-| `a worker reused nothing` | One worker's slot is reconnecting even though others are not — suspect slot indexing |
+| `a worker with >= 2 requests reused nothing` | One worker's slot is reconnecting even though others are not — suspect slot indexing. Workers that served exactly **one** request are excluded: they cannot reuse by arithmetic, and the elastic pool (#785) routinely hands the last-spawned workers a single op |
 | `requests < 2 x num_objects` (read smoke) | The verify GETs bypassed the bdev. Check `cte_core` still has exactly one device and it is the S3 tier |
 | `no 'S3 keepalive TOTAL' line` | The transport never reached `Destroy` — the run did not tear down cleanly |
 
