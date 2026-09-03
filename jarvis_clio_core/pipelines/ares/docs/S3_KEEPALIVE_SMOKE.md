@@ -125,13 +125,26 @@ This is exactly what the pipeline's build gate checks, and it is cheap to check
 yourself first:
 
 ```bash
-LIB=$IOWARP_VIEW/lib/libclio_bdev_runtime.so   # or lib64/
-strings "$LIB" | grep -c "S3 keepalive worker="   # must be >= 1
+# Resolve the library the way the gate does -- from PATH, not from
+# $IOWARP_VIEW. If some other install shadows the view, this is what you and
+# the job will actually load, and the two must agree.
+LIB="$(command -v clio_run)"; LIB="${LIB%/bin/clio_run}/lib/libclio_bdev_runtime.so"
+[ -f "$LIB" ] || LIB="${LIB%/lib/*}/lib64/libclio_bdev_runtime.so"
+readlink -f "$LIB"                                # note the spack hash
+
+grep -acF "S3 keepalive worker=" "$LIB"           # must be >= 1
 ldd "$LIB" | grep PocoNetSSL                      # must match
 ldd "$LIB" | grep aws-cpp-sdk                     # must print NOTHING
 ```
 
-If the `strings` count is 0 you have the old transport installed, and the smoke
+Use `grep -a`, not `strings`. `strings` comes from binutils, which is not
+guaranteed on a compute node, and the view goes on `PATH` ahead of `/usr/bin` —
+so `strings "$LIB" 2>/dev/null | grep -q` can report "no tally" when what
+actually happened is that `strings` was missing or the file was unreadable.
+`grep -a` reads the ELF itself and distinguishes the two: exit 1 means the
+literal is absent, exit 2 means the read failed.
+
+If the count is 0 you have the old transport installed, and the smoke
 would pass meaninglessly. The AWS SDK must stay absent **from this library's
 link line** — linking it into the runtime process stack-smashes runtime init.
 Note that `aws-sdk-cpp` legitimately appears in `spack find -d` output: `+cae`
@@ -197,6 +210,7 @@ PASS: sockets are being reused across S3 operations (worst per-worker ratio 32.0
 | Message | Cause |
 |---|---|
 | `no 'S3 keepalive' tally in the job log` | No S3 I/O happened, or the wrong library is installed (the build gate should have caught the latter) |
+| gate says `PREDATES` but a manual check passes | The gate prints `host=`, `clio_run =`, `lib ->` and the resolved spack hash — compare those against what you checked by hand. A different node, a different `PATH`, or a stale NFS view of `$IOWARP_VIEW` all show up there |
 | `reuse_ratio <= 1.00` | Every operation opened its own socket — the mechanism is not working |
 | `a worker reused nothing` | One worker's slot is reconnecting even though others are not — suspect slot indexing |
 | `requests < 2 x num_objects` (read smoke) | The verify GETs bypassed the bdev. Check `cte_core` still has exactly one device and it is the S3 tier |

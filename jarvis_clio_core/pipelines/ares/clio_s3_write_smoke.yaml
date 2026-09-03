@@ -116,12 +116,41 @@ scheduler:
     # back to kDebug, CTP_LOG_LEVEL=1 compiles it out, the literal disappears,
     # and this gate fires.
     - |
-      LIB="$(command -v clio_run)"; LIB="${LIB%/bin/clio_run}/lib/libclio_bdev_runtime.so"
+      # Say out loud which library is about to be judged. Every past failure of
+      # this gate was the gate inspecting a different file than the operator
+      # was checking by hand, and none of it was visible from the error.
+      echo "keepalive gate: host=$(hostname -s) time=$(date -Is)"
+      echo "keepalive gate: PATH=$PATH"
+      CLIO_RUN_BIN="$(command -v clio_run || true)"
+      echo "keepalive gate: clio_run    = ${CLIO_RUN_BIN:-<not on PATH>}"
+      echo "keepalive gate: clio_run   -> $(readlink -f "$CLIO_RUN_BIN" 2>&1 || true)"
+      LIB="${CLIO_RUN_BIN%/bin/clio_run}/lib/libclio_bdev_runtime.so"
       [ -f "$LIB" ] || LIB="${LIB%/lib/*}/lib64/libclio_bdev_runtime.so"
       [ -f "$LIB" ] || { echo "ERROR: libclio_bdev_runtime.so not found under the install root" >&2; exit 1; }
-      ldd "$LIB" 2>/dev/null | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — built without +s3_bdev?" >&2; exit 1; }
-      ldd "$LIB" 2>/dev/null | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
-      strings "$LIB" 2>/dev/null | grep -qF "S3 keepalive worker=" || {
+      echo "keepalive gate: lib         = $LIB"
+      echo "keepalive gate: lib        -> $(readlink -f "$LIB" 2>&1 || true)"
+      ls -lL "$LIB" || true
+      # Keep ldd's stderr: an unreadable or stale-handle file must look like an
+      # I/O error, never like a clean answer.
+      LDD_OUT="$(ldd "$LIB" 2>&1)" || { echo "ERROR: ldd failed on $LIB:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — built without +s3_bdev?" >&2; exit 1; }
+      printf '%s\n' "$LDD_OUT" | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
+      # `grep -a` reads the ELF directly, so this needs no binutils. The old
+      # form was `strings "$LIB" 2>/dev/null | grep -qF ...`, which turned a
+      # missing `strings` (binutils is not guaranteed on a compute node, and
+      # the view is prepended to PATH ahead of /usr/bin) or an unreadable file
+      # into an empty pipe — indistinguishable from an old build, and reported
+      # as one. Keep the count and the exit status separate so they stay so.
+      echo "keepalive gate: strings(1)  = $(command -v strings || echo '<absent, and no longer needed>')"
+      KA_RC=0
+      KA_COUNT="$(grep -acF "S3 keepalive worker=" "$LIB")" || KA_RC=$?
+      echo "keepalive gate: matches     = ${KA_COUNT:-0} (grep rc=$KA_RC)"
+      [ "$KA_RC" -le 1 ] || {
+        echo "ERROR: could not read $LIB (grep exit $KA_RC). This is an I/O or" >&2
+        echo "  permission failure, NOT a verdict on the build. See grep's" >&2
+        echo "  message above; check the NFS mount and the view symlink." >&2
+        exit 1; }
+      [ "${KA_COUNT:-0}" -ge 1 ] || {
         echo "ERROR: $LIB PREDATES the persistent-connection change (no 'S3 keepalive' tally)." >&2
         echo "  This smoke would pass meaninglessly against it. Pulling the repo" >&2
         echo "  does NOT rebuild a spack-develop install:" >&2
