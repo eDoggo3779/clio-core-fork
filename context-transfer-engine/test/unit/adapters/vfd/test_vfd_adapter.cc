@@ -393,35 +393,6 @@ herr_t FindClioErr(unsigned n, const H5E_error2_t *err, void *data) {
   }
   return 0;
 }
-
-// H5Ewalk callback: print one frame. Used only when a stack-content assertion
-// is about to fail.
-herr_t PrintErrFrame(unsigned n, const H5E_error2_t *err, void *data) {
-  (void)data;
-  std::fprintf(stderr, "[vfd-suite]   stack[%u] %s:%u %s(): %s\n", n,
-               err && err->file_name ? err->file_name : "?",
-               err ? err->line : 0u,
-               err && err->func_name ? err->func_name : "?",
-               err && err->desc ? err->desc : "(no description)");
-  return 0;
-}
-
-// "The driver pushed no diagnosable error" is the least actionable sentence a
-// CI log can contain: it says what is NOT there and nothing about what is. The
-// distinction between "the driver never ran", "the driver pushed a DIFFERENT
-// message" and "something wiped the stack" is entirely in the frames, so print
-// them. Call this BEFORE restoring the auto-printer -- H5Eset_auto2 is harmless
-// to the stack, but the frames are the evidence and nothing should get between
-// the walk that failed and the walk that reports it.
-void DumpErrStack(const char *what) {
-  std::fprintf(stderr, "[vfd-suite] %s -- HDF5 error stack follows:\n", what);
-  if (H5Ewalk2(H5E_DEFAULT, H5E_WALK_UPWARD, PrintErrFrame, nullptr) < 0) {
-    std::fprintf(stderr, "[vfd-suite]   (H5Ewalk2 failed)\n");
-  }
-  if (H5Eget_num(H5E_DEFAULT) == 0) {
-    std::fprintf(stderr, "[vfd-suite]   (the stack is empty)\n");
-  }
-}
 }  // namespace
 
 int main() {
@@ -714,25 +685,15 @@ int main() {
   // the auto-printer so the expected stack doesn't clutter output, and walk the
   // stack to confirm the driver's own error (not just HDF5's) was recorded.
   {
-    const char *kAbsent = "/tmp/clio_cte_vfd_absent_xyz.h5";
-    // "Non-existent" is an assumption about /tmp, not a fact: a leftover from an
-    // earlier run (or from another user on a shared node -- /tmp is not private
-    // on an HPC compute node) turns this case into "open a file that is not
-    // HDF5", which fails in the superblock reader without the driver's open
-    // path ever failing. Same red X, entirely different cause. Make it a fact.
-    std::remove(kAbsent);
-
     H5E_auto2_t old_func = nullptr;
     void *old_data = nullptr;
     H5Eget_auto2(H5E_DEFAULT, &old_func, &old_data);
     H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
     H5Eclear2(H5E_DEFAULT);
-    hid_t missing = H5Fopen(kAbsent, H5F_ACC_RDONLY, fapl);
+    hid_t missing = H5Fopen("/tmp/clio_cte_vfd_absent_xyz.h5",
+                            H5F_ACC_RDONLY, fapl);
     bool found_clio_err = false;
     H5Ewalk2(H5E_DEFAULT, H5E_WALK_UPWARD, FindClioErr, &found_clio_err);
-    if (!found_clio_err) {
-      DumpErrStack("9: no driver error found on the stack");
-    }
     H5Eset_auto2(H5E_DEFAULT, old_func, old_data);
     CHECK(missing < 0, "9: H5Fopen of a missing file must fail closed");
     CHECK(found_clio_err,
@@ -1305,9 +1266,6 @@ int main() {
     hid_t blocked = H5Fopen(kClioBusy, H5F_ACC_RDWR, fapl_lk);
     bool found_clio_err = false;
     H5Ewalk2(H5E_DEFAULT, H5E_WALK_UPWARD, FindClioErr, &found_clio_err);
-    if (!found_clio_err) {
-      DumpErrStack("21: no driver error found on the stack");
-    }
     H5Eset_auto2(H5E_DEFAULT, of, od);
 
     CHECK(blocked < 0, "21: opening a file locked by another holder fails");

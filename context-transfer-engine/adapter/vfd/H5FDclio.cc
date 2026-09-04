@@ -139,30 +139,15 @@ unsigned long H5FDclio_cache_truncate_failures_g = 0;
  * FAIL/NULL to signal the failure to the library; this records a diagnosable
  * reason (incl. errno) that composes with HDF5's own stack and is surfaced by
  * the normal H5Eprint auto-handler at the API boundary -- instead of failing
- * silently.
- *
- * The push is UNCONDITIONAL. It used to be skipped whenever the driver's own
- * error class had not been registered, which turned "fail closed and say why"
- * into "fail closed silently" -- the exact defect section 9 of the unit suite
- * exists to catch, and the one failure mode that leaves a caller with an open
- * that failed for no stated reason. The class ids are a nicety (they label the
- * frame "CLIO VFD"); when any of them is unavailable the message still goes on
- * the stack under HDF5's own VFL class, because the message is the part that
- * matters. Note all three ids are checked, not just the class: H5Epush2 fails
- * outright on an invalid major/minor, so a half-registered class was another
- * way to push nothing. */
+ * silently. No-op until the class is registered by H5FD_clio_init(). */
 #define H5FD_CLIO_ERROR(msg)                                               \
   do {                                                                     \
-    const int h5fd_clio_errno = errno;                                     \
-    const bool h5fd_clio_own_cls =                                         \
-        (H5FDclio_err_class_g >= 0 && H5FDclio_err_major_g >= 0 &&         \
-         H5FDclio_err_minor_g >= 0);                                       \
-    H5Epush2(H5E_DEFAULT, __FILE__, __func__, __LINE__,                    \
-             h5fd_clio_own_cls ? H5FDclio_err_class_g : H5E_ERR_CLS,       \
-             h5fd_clio_own_cls ? H5FDclio_err_major_g : H5E_VFL,           \
-             h5fd_clio_own_cls ? H5FDclio_err_minor_g : H5E_CANTINIT,      \
-             "%s (errno=%d: %s)", (msg), h5fd_clio_errno,                  \
-             strerror(h5fd_clio_errno));                                   \
+    if (H5FDclio_err_class_g >= 0) {                                       \
+      H5Epush2(H5E_DEFAULT, __FILE__, __func__, __LINE__,                  \
+               H5FDclio_err_class_g, H5FDclio_err_major_g,                 \
+               H5FDclio_err_minor_g, "%s (errno=%d: %s)", (msg), errno,    \
+               strerror(errno));                                           \
+    }                                                                      \
   } while (0)
 
 /* POSIX I/O mode used as the third parameter to open/_open
@@ -375,37 +360,6 @@ static inline bool H5FD__clio_sieve_valid(size_t v) {
 static const H5FD_clio_fapl_t H5FD_clio_fapl_default_g = {
     /*cache_enabled*/ 1, /*fsync_on_flush*/ 0,
     /*sieve_max*/ H5FD_CLIO_SIEVE_MAX_DEF};
-
-/* H5Pget_driver_info() reports "this FAPL carries no driver-info block" exactly
-   the way it reports a real failure: NULL, plus H5E_PLIST/H5E_CANTGET pushed on
-   the error stack. Here the absent block is the NORMAL case -- H5Pset_driver(
-   fapl, id, NULL), H5Pset_driver_by_name(), HDF5_DRIVER=clio_vfd and the
-   defaults all leave it unset; only H5Pset_fapl_clio() sets one -- so calling it
-   bare made every single open print an HDF5-DIAG error block to stderr and leave
-   a bogus frame sitting underneath the driver's own messages. Nothing failed,
-   so nothing should be reported: take the value with the auto-printer muted and
-   drop whatever the call pushed.
-
-   Counted rather than assumed to be one frame, and popped rather than cleared:
-   H5Eclear2() here would also discard anything the CALLER had on the stack
-   before the open. */
-static const H5FD_clio_fapl_t *H5FD__clio_peek_fapl(hid_t fapl_id) {
-  H5E_auto2_t auto_func = nullptr;
-  void *auto_data = nullptr;
-  H5Eget_auto2(H5E_DEFAULT, &auto_func, &auto_data);
-  H5Eset_auto2(H5E_DEFAULT, nullptr, nullptr);
-
-  const ssize_t before = H5Eget_num(H5E_DEFAULT);
-  const H5FD_clio_fapl_t *fa =
-      (const H5FD_clio_fapl_t *)H5Pget_driver_info(fapl_id);
-  const ssize_t after = H5Eget_num(H5E_DEFAULT);
-  if (before >= 0 && after > before) {
-    H5Epop(H5E_DEFAULT, (size_t)(after - before));
-  }
-
-  H5Eset_auto2(H5E_DEFAULT, auto_func, auto_data);
-  return fa;
-}
 
 /*
  * Apply the driver config string, if the FAPL carries one.
@@ -732,7 +686,8 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
 
   // Driver-specific FAPL config: use the caller's policy if a driver-info block
   // was set (H5Pset_fapl_clio), else the default (cache on).
-  const H5FD_clio_fapl_t *fa_in = H5FD__clio_peek_fapl(fapl_id);
+  const H5FD_clio_fapl_t *fa_in =
+      (const H5FD_clio_fapl_t *)H5Pget_driver_info(fapl_id);
   H5FD_clio_fapl_t fa = fa_in ? *fa_in : H5FD_clio_fapl_default_g;
 
   /* Driver config string. HDF5 does not hand this to a callback the way it does
@@ -2010,10 +1965,8 @@ herr_t H5Pget_fapl_clio(hid_t fapl_id, hbool_t *cache_enabled /*out*/) {
   // No driver-info block means the file would open with the default policy
   // (H5Pset_driver(fapl, driver, NULL)); report that same default so the getter
   // always describes what an open would actually do.
-  // Peeked, not fetched bare: this getter SUCCEEDS when there is no block, so it
-  // must not leave H5Pget_driver_info's "can't get driver info" behind on the
-  // caller's error stack. See H5FD__clio_peek_fapl.
-  const H5FD_clio_fapl_t *fa = H5FD__clio_peek_fapl(fapl_id);
+  const H5FD_clio_fapl_t *fa =
+      (const H5FD_clio_fapl_t *)H5Pget_driver_info(fapl_id);
   *cache_enabled =
       fa ? fa->cache_enabled : H5FD_clio_fapl_default_g.cache_enabled;
   return SUCCEED;
