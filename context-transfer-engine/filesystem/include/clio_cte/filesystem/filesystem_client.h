@@ -1066,10 +1066,72 @@ class Client : public clio::cte::core::Client {
     return v;
   }
 
+  /**
+   * What a caller wants done about a byte range the tier does not hold.
+   *
+   * The two consumers need OPPOSITE answers from the same lookup, and getting
+   * it backwards is silent data corruption rather than an error:
+   *
+   *   kZeroFillHoles -- POSIX filesystem semantics. This client IS the
+   *     filesystem, so a range inside the file with nothing behind it was
+   *     never written and reads as zeros. Correct for CfsIo.
+   *
+   *   kRefuseHoles -- cache-over-authoritative semantics. The tier is a cache
+   *     in front of a file that holds the real bytes, so "not here" means "ask
+   *     the authoritative copy", NEVER "the answer is zeros". Correct for the
+   *     HDF5 VFD, which write-throughs to a native file.
+   */
+  enum class ShmHolePolicy { kZeroFillHoles, kRefuseHoles };
+
+  /**
+   * Read committed bytes from shared memory, refusing rather than inventing
+   * anything the tier does not hold. See ShmHolePolicy::kRefuseHoles.
+   *
+   * @return bytes read, or -1 meaning "not fast-pathable, use the
+   *         authoritative source" -- which for this policy also covers "some
+   *         of that range is not cached".
+   */
+  FsSsize TryReadShmResident(const std::string &path, clio::run::u64 off,
+                             void *buf, size_t count) {
+    return TryReadShmImpl(path, off, buf, count, ShmHolePolicy::kRefuseHoles);
+  }
+
   // FsSsize, not ssize_t: MSVC has no ssize_t, and this layer's whole
   // vocabulary was ported to FsSsize/FsOff so it builds on Windows.
   FsSsize TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
+    return TryReadShmImpl(path, off, buf, count, ShmHolePolicy::kZeroFillHoles);
+  }
+
+  FsSsize TryReadShmImpl(const std::string &path, clio::run::u64 off, void *buf,
+                         size_t count, ShmHolePolicy policy) {
+    // Read-your-own-writes, here rather than only in Read().
+    //
+    // CFS writes defer by default, and in-flight bytes are visible ONLY
+    // through this registry -- the page blob still holds the previously
+    // committed content until they land. Read() consults it before calling
+    // this function, so for that caller the check below costs an atomic load
+    // and returns 0. But TryReadShmResident is a PUBLIC entry point the VFD
+    // calls directly, and it never runs Read(): an in-place rewrite followed
+    // by a read in the same session would otherwise find the stale committed
+    // page, succeed, and hand back pre-write bytes. kShmFilePendingAppend does
+    // not cover it either, because an in-place rewrite is not an append.
+    //
+    // Depending on the caller for a correctness precondition is what made that
+    // reachable, so the function now establishes it itself.
+    const clio::run::u64 defer_key = FileKey(path);
+    const int served =
+        DeferTryServe(defer_key, off, static_cast<char *>(buf), count);
+    if (served > 0) {
+      // Fully covered by in-flight writes: those bytes ARE the current value.
+      return static_cast<FsSsize>(count);
+    }
+    if (served == -1) {
+      // Partial coverage: the bytes outside the in-flight writes are stale
+      // until those writes land, so this is the one case that has to wait.
+      DeferAwaitKey(defer_key);
+    }
+
     if (!ShmReadFastPathEnabled()) {
       return -1;
     }
@@ -1116,6 +1178,12 @@ class Client : public clio::cte::core::Client {
     char *dst = static_cast<char *>(buf);
     clio::run::u64 done = 0;
     clio::run::u64 cur = off;
+    // Bound on residency probes per request. Each probe is metadata-only and
+    // replaces a whole-request data RPC, so a few are a clear win -- but they
+    // are still round trips, and a heavily perforated range would spend more
+    // on asking than the single RPC it is trying to avoid. Past the bound,
+    // take the RPC, which answers everything in one go.
+    unsigned residency_probes = 0;
     while (done < want) {
       clio::run::u64 page_off = cur % kFsPageSize;
       clio::run::u64 to_read = kFsPageSize - page_off;
@@ -1125,10 +1193,44 @@ class Client : public clio::cte::core::Client {
       if (!cte->TryReadBlobShm(rec.tag_id_, PageName(cur), dst + done,
                                static_cast<size_t>(to_read),
                                static_cast<size_t>(page_off))) {
-        // Abandon the WHOLE request rather than mixing sources. A hole reads
-        // as zeros and a missing page is indistinguishable from an uncached
-        // one, so the only safe reading of a failure here is "let the runtime
-        // answer".
+        // A miss here used to abandon the WHOLE request, because "hole" and
+        // "cached elsewhere" were indistinguishable from this side and only
+        // one of them can be answered with zeros. GetResidency draws that
+        // distinction at the tier, which is the only place that knows it.
+        //
+        // Zeroing is correct for an absent page, and specifically here:
+        //   * the range is already clamped to the LOGICAL size above, so this
+        //     page lies inside the file, and a page inside the file with no
+        //     blob behind it was never written -- POSIX says zeros. This is
+        //     the same rule the runtime's own read path applies when it
+        //     pre-zeros before GetBlob.
+        //   * uncommitted writes cannot be hiding here. Read() serves or
+        //     awaits the deferred registry BEFORE calling this path, and
+        //     IsFastPathable() refuses a record carrying kShmFilePendingAppend.
+        //
+        // Anything other than a definite absence -- present but unreachable,
+        // or a failed probe -- still falls back, because those are exactly the
+        // cases where zeros would be wrong.
+        // kRefuseHoles: the authoritative copy has these bytes, so there is
+        // nothing to decide -- do not probe, do not invent, just refuse.
+        if (policy == ShmHolePolicy::kRefuseHoles) {
+          ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
+          return -1;
+        }
+        if (residency_probes < kMaxResidencyProbes) {
+          ++residency_probes;
+          auto res = cte->AsyncGetResidency(rec.tag_id_, PageName(cur),
+                                            static_cast<clio::run::u64>(page_off),
+                                            static_cast<clio::run::u64>(to_read));
+          res.Wait();
+          if (res->GetReturnCode() == 0 && res->exists_ == 0) {
+            std::memset(dst + done, 0, static_cast<size_t>(to_read));
+            ShmReadHoles().fetch_add(1, std::memory_order_relaxed);
+            done += to_read;
+            cur += to_read;
+            continue;
+          }
+        }
         ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
         return -1;
       }
@@ -1149,6 +1251,18 @@ class Client : public clio::cte::core::Client {
     });
     ShmReadHits().fetch_add(1, std::memory_order_relaxed);
     return static_cast<FsSsize>(done);
+  }
+
+  /** Max GetResidency probes in one ShmRead (see the call site). */
+  static constexpr unsigned kMaxResidencyProbes = 8;
+
+  /** Pages served as holes: absent at the tier, so zeros are the answer and no
+   *  data round trip was needed. Counted apart from hits because they are a
+   *  different thing -- bytes produced locally, not bytes read from the tier --
+   *  and folding them into hits would overstate what the cache served. */
+  static std::atomic<clio::run::u64> &ShmReadHoles() {
+    static std::atomic<clio::run::u64> n{0};
+    return n;
   }
 
   // Zero-IPC read accounting. A silently-disabled fast path and a working one

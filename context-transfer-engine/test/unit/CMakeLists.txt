@@ -138,6 +138,11 @@ add_executable(test_bdev_free_visibility
     test_bdev_free_visibility.cc
 )
 
+# Residency op (VFD_VOL_PLAN §1): present vs absent vs unreachable.
+add_executable(test_residency_op
+    test_residency_op.cc
+)
+
 # Batching benchmark (#820): many small writes at ONE blob, A/B'd on the same
 # binary via CLIO_TASK_BATCHING.
 add_executable(bench_same_blob_batching
@@ -469,6 +474,18 @@ target_link_libraries(test_vectored_blob_io
 
 # Link test_bdev_fragmentation (#820) - same deps.
 target_link_libraries(test_bdev_fragmentation
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Link test_residency_op - same deps.
+target_link_libraries(test_residency_op
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -889,6 +906,13 @@ set_tests_properties(cte_bdev_fragmentation PROPERTIES
 
 # issue #919: placement must see space freed since the last StatTargets tick.
 # Four fill/stat/delete/put cycles; a stray periodic tick can rescue one, not all.
+add_test(NAME cte_residency_op
+    COMMAND test_residency_op)
+set_tests_properties(cte_residency_op PROPERTIES
+    TIMEOUT 300
+    LABELS "cte;residency"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
 add_test(NAME cte_bdev_free_visibility
     COMMAND test_bdev_free_visibility)
 set_tests_properties(cte_bdev_free_visibility PROPERTIES

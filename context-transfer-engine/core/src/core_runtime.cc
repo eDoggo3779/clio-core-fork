@@ -976,6 +976,16 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       auto typed = task.template Cast<GetBlobSizeTask>();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
+    case Method::kGetResidency: {
+      // Blob-keyed, so it must reach the container that OWNS the blob.
+      // Without this the task fell to the default (the client's Dynamic
+      // query, resolved as LOCAL), and on more than one node a probe for a
+      // remotely-owned blob would find no BlobInfo and report exists_ = 0 --
+      // which a caller is entitled to read as "hole, zeros are correct".
+      // Absence is the one answer this op must never get wrong.
+      auto typed = task.template Cast<GetResidencyTask>();
+      return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
+    }
     case Method::kRegisterReplicaContainer: {
       // Coherence registration must land on the blob's OWNER container —
       // that is whose next primary write performs the invalidation.
@@ -5256,11 +5266,24 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       }
       task->entries_flushed_++;
 
-      // Entry type 3 == one replica's layout (issue #886), written right
-      // after its blob's type-2 record so restore can attach it to the
+      // Entry type 4 == one replica's layout (issue #886), written right
+      // after its blob's record so restore can attach it to the
       // just-inserted BlobInfo. A NEW type for the same no-version-header
       // reason as type 2: an old reader stops loudly instead of parsing
-      // replica blocks as the next entry. The snapshot MUST carry replicas —
+      // replica blocks as the next entry.
+      //
+      // It MUST NOT be 3, which is what it was until this fix: 3 is already
+      // the tag of the BLOB record written just above (droppable_ layout), and
+      // the reader's blob branch accepts 1|2|3. Every replica record was
+      // therefore parsed as a blob record, which desynchronised the whole
+      // stream: the reader went on to interpret string bytes as binary fields
+      // and produced garbage bdev pool ids (observed: 1936876912 == "pers",
+      // 1650422899 == "st_b"). Those ids matched no registered target, so the
+      // volatile-block filter -- which keeps a block when the target is
+      // unknown -- failed OPEN and the DRAM primary survived a reboot, which
+      // is exactly what cte_replication_persist_integration asserts against.
+      // The replica branch in the reader was dead code for the same reason.
+      // The snapshot MUST carry replicas —
       // FlushMetadata may truncate the WAL below, and the kExtendReplica
       // records being truncated are the only other place these layouts live.
       // Empty replicas are skipped; they hold nothing to restore and are
@@ -5270,7 +5293,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
         if (rep.blocks_.empty()) {
           continue;
         }
-        uint8_t rep_entry_type = 3;
+        uint8_t rep_entry_type = 4;
         uint32_t rep_idx = static_cast<uint32_t>(rep_i + 1);
         uint32_t rep_name_len = static_cast<uint32_t>(rep.name_.size());
         float rep_score = rep.score_;
@@ -5740,10 +5763,14 @@ void Runtime::RestoreMetadataFromLog() {
       MirrorBlobToShm(composite_key, blob_info);
       blobs_restored++;
 
-    } else if (entry_type == 3) {
-      // Replica layout (issue #886), attached to the blob whose type-2 record
+    } else if (entry_type == 4) {
+      // Replica layout (issue #886), attached to the blob whose record
       // FlushMetadata wrote just before it. Same volatile-block filter as the
       // primary restore.
+      //
+      // Tag 4, not 3: the blob branch above accepts 1|2|3, so while replicas
+      // were written as 3 this branch was unreachable and every replica record
+      // was misparsed as a blob (see the writer for the full consequence).
       uint32_t key_len;
       ifs.read(reinterpret_cast<char *>(&key_len), sizeof(key_len));
       std::string composite_key(key_len, '\0');
@@ -6235,6 +6262,7 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
       return stat;
     }
     case Method::kGetBlobSize:
+    case Method::kGetResidency:
     case Method::kGetOrCreateTag:
     case Method::kGetTagSize:
     case Method::kGetTagName:
@@ -7623,6 +7651,111 @@ clio::run::TaskResume Runtime::GetBlobScore(clio::run::shared_ptr<GetBlobScoreTa
          blob_info_ptr->score_);
 
   } catch (const std::exception &e) {
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::GetResidency(
+    clio::run::shared_ptr<GetResidencyTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string blob_name = task->blob_name_.str();
+    if (blob_name.empty()) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+
+    std::shared_ptr<BlobInfo> info = CheckBlobExists(blob_name, tag_id);
+    if (info == nullptr) {
+      // Absence is the ANSWER here, not a failure, so rc stays 0. This is the
+      // whole point of the op: a caller that cannot tell "no such bytes" from
+      // "cannot reach these bytes" has to assume the worst and take the slow
+      // path. exists_ = 0 says zeros are correct for this range.
+      task->exists_ = 0;
+      task->present_bytes_ = 0;
+      task->direct_readable_ = 0;
+      CLIO_CO_RETURN;
+    }
+    // Pin the extents before touching blocks_ (issue #753). This handler walks
+    // the block list twice -- once to total it, once inside
+    // BuildShmBlobRecord -- and an extent-freeing mutator on another worker
+    // (DelBlob, truncate, reorganize) may run concurrently: DelBlob documents
+    // the resulting use-after-free on exactly this list. Reading it unpinned
+    // was a torn read at best.
+    //
+    // Never wait while pinned: TryPinRead fails rather than blocks when a
+    // drainer is active, and yielding with a pin held would deadlock the
+    // drainer's poll for pins == 0.
+    while (!info->TryPinRead()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+    BlobReadPinGuard residency_pin(info.get());
+
+    // Liveness re-check, and it MUST be after the pin (issue #753). The lookup
+    // above resolved a shared_ptr that keeps this BlobInfo alive even after a
+    // DelBlob has released the token, freed every extent and erased the name
+    // binding. Deciding existence before the pin leaves the whole delete free
+    // to complete in that window, and this op would then report exists_ = 1
+    // with an empty block list -- "the blob is real, your range just is not
+    // backed", when the truth is that it is gone.
+    //
+    // A deleted blob must read as ABSENT, which is the answer that actually
+    // helps a caller: it is the verdict that licenses zeros.
+    if (info->GetTotalSize() == 0) {
+      task->exists_ = 0;
+      task->present_bytes_ = 0;
+      task->direct_readable_ = 0;
+      CLIO_CO_RETURN;
+    }
+    task->exists_ = 1;
+
+    // Present bytes = the sum of the block sizes, i.e. what is physically
+    // stored. Deliberately NOT the blob's logical size: after a sparse write
+    // or an ftruncate-grow the logical span covers bytes that were never
+    // written, and reporting those as present is exactly the confusion this
+    // op exists to remove.
+    clio::run::u64 stored = 0;
+    for (size_t i = 0; i < info->blocks_.size(); ++i) {
+      stored += info->blocks_[i].size_;
+    }
+    const clio::run::u64 off = task->offset_;
+    if (off >= stored) {
+      task->present_bytes_ = 0;
+    } else {
+      const clio::run::u64 avail = stored - off;
+      clio::run::u64 want = task->size_;
+      if (want == 0 || want > avail) {
+        want = avail;  // 0 means "to the end"; a longer ask is clamped
+      }
+      task->present_bytes_ = want;
+    }
+
+    // Direct-readability is answered by BUILDING the mirror record and asking
+    // it, rather than re-deriving the rule. The rule is subtle (node-local RAM
+    // only, transformed bytes never qualify, unknown target refuses) and a
+    // second copy of it that drifts would make this op confidently wrong about
+    // the very path it exists to steer.
+    // direct_readable_ must be bounded by what the SHM record actually
+    // describes, not merely by the blob qualifying. A record is truncated at
+    // kMaxInlineBlocks, so IsDirectReadable() can be true while the cached
+    // blocks cover only a prefix -- and a caller told "a shared-memory read
+    // can serve this range" would then read past CoveredBytes(). The two
+    // fields are derived from different block sets (present_bytes_ from the
+    // blob, this from the record), so the narrower one has to win.
+    ShmBlobRecord rec;
+    task->direct_readable_ = 0;
+    if (BuildShmBlobRecord(*info, &rec) && rec.IsDirectReadable()) {
+      const clio::run::u64 covered = rec.CoveredBytes();
+      const clio::run::u64 end = task->offset_ + task->present_bytes_;
+      task->direct_readable_ = (task->present_bytes_ > 0 && end <= covered)
+                                   ? 1
+                                   : 0;
+    }
+  } catch (const std::exception &e) {
+    HLOG(kError, "GetResidency failed: {}", e.what());
     task->return_code_ = 1;
   }
   CLIO_CO_RETURN;
