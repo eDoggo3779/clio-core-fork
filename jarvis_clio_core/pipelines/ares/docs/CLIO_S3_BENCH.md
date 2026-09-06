@@ -278,8 +278,8 @@ The read sweep needs `+cae +cte +s3`; the write sweep additionally needs
 uses `cae_s3_tool`. Building everything at once covers both sweeps:
 
 ```bash
-spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev
-spack view --dependencies no symlink /mnt/common/$USER/iowarp-s3-view iowarp@968-s3-bench
+spack install iowarp@dev +cae +cte +s3 +s3_bdev
+spack view --dependencies no symlink /mnt/common/$USER/iowarp-s3-view iowarp@dev
 export IOWARP_VIEW="/mnt/common/$USER/iowarp-s3-view"
 ```
 
@@ -639,7 +639,7 @@ already has an `iowarp` in it silently keeps serving the old one. The reliable
 fix is to skip the view entirely and point `IOWARP_VIEW` straight at the prefix:
 
 ```bash
-export IOWARP_VIEW=$(spack find --format '{prefix}' iowarp@968-s3-bench | tail -1)
+export IOWARP_VIEW=$(spack find --format '{prefix}' iowarp@dev | tail -1)
 ```
 
 RPATH makes the symlink farm unnecessary, and a prefix has the `bin/` and `lib/`
@@ -680,15 +680,15 @@ builds compile from the working tree, so pulling the branch does **not** rebuild
 them, and nothing about the spec, the hash or the view changes to show it. Run:
 
 ```bash
-spack install iowarp@968-s3-bench      # dev spec: rebuilds in place
+spack install iowarp@dev      # dev spec: rebuilds in place
 ```
 
 For a non-`develop` spec, branch versions never rehash when the branch moves, so
 `spack install` reports "already installed" and skips the compile entirely:
 
 ```bash
-spack uninstall -y iowarp@968-s3-bench && spack clean -s \
-  && spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev
+spack uninstall -y iowarp@dev && spack clean -s \
+  && spack install iowarp@dev +cae +cte +s3 +s3_bdev
 ```
 
 The gate greps a build stamp (`kBuildMarker` in `clio_s3_write_bench.cc`) out of

@@ -29,8 +29,8 @@
 # assimilator -- ParseOmni -> fork+exec cae_s3_tool get -> CTE PutBlob -- so the
 # GETs are issued by the AWS SDK inside a short-lived child process, landing in
 # the `ram::cte_ram_tier1` device below. S3RestClient is nowhere in that path.
-# To smoke the bdev's read path (ReadBlocks -> GetObject) use
-# clio_s3_read_smoke.yaml, which reads back through an S3-backed bdev tier.
+# The bdev's read path (ReadBlocks -> GetObject) is covered by the module's own
+# ctests (clio_run_s3_rest_test), not by any pipeline here.
 #
 # This is a "pipeline test" (scheduler: + config: + vars: + loop: + output:),
 # NOT a plain pipeline — only this shape produces results.csv. There are no

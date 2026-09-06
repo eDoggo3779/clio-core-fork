@@ -128,7 +128,7 @@ scheduler:
         echo "ERROR: mixed IOWarp installs on PATH -- these must be one prefix" >&2
         echo "  clio_run            -> $RUN_ROOT" >&2
         echo "  clio_s3_write_bench -> $BENCH_ROOT" >&2
-        echo "  Fix: export IOWARP_VIEW=\$(spack find --format '{prefix}' iowarp@968-s3-bench | tail -1)" >&2
+        echo "  Fix: export IOWARP_VIEW=\$(spack find --format '{prefix}' iowarp@dev | tail -1)" >&2
         exit 1
       fi
       CTE_LIB="$RUN_ROOT/lib/libclio_cte_core_runtime.so"
@@ -138,8 +138,8 @@ scheduler:
         echo "ERROR: $CTE_LIB predates the s3/gcs bdev_type allowlist." >&2
         echo "  It will log \"Invalid bdev_type 's3'\", warn \"No storage devices" >&2
         echo "  configured\", and fail every PutBlob with rc=11. Rebuild:" >&2
-        echo "    spack uninstall -y iowarp@968-s3-bench && spack clean -s \\" >&2
-        echo "      && spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev" >&2
+        echo "    spack uninstall -y iowarp@dev && spack clean -s \\" >&2
+        echo "      && spack install iowarp@dev +cae +cte +s3 +s3_bdev" >&2
         exit 1; }
       # Same trick for the benchmark binary itself. `spack develop` builds
       # rebuild in place, so a `git pull` without a `spack install` leaves an
@@ -151,10 +151,10 @@ scheduler:
       grep -aqF "$WANT_MARKER" "$(command -v clio_s3_write_bench)" || {
         echo "ERROR: clio_s3_write_bench is STALE -- it predates $WANT_MARKER." >&2
         echo "  Pulling the repo does not rebuild it. For the dev spec:" >&2
-        echo "    spack install iowarp@968-s3-bench" >&2
+        echo "    spack install iowarp@dev" >&2
         echo "  For a non-develop spec, branch versions do not rehash, so:" >&2
-        echo "    spack uninstall -y iowarp@968-s3-bench && spack clean -s \\" >&2
-        echo "      && spack install iowarp@968-s3-bench +cae +cte +s3 +s3_bdev" >&2
+        echo "    spack uninstall -y iowarp@dev && spack clean -s \\" >&2
+        echo "      && spack install iowarp@dev +cae +cte +s3 +s3_bdev" >&2
         exit 1; }
       echo "install root OK: $RUN_ROOT"
       echo "CTE s3 allowlist OK: $CTE_LIB"
@@ -190,7 +190,7 @@ scheduler:
         echo "ERROR: $LIB PREDATES the persistent-connection change." >&2
         echo "  This sweep would spend 3.6 h producing a pre-keep-alive number" >&2
         echo "  and label it as the post-change result. Rebuild first:" >&2
-        echo "    spack install iowarp@968-s3-bench" >&2
+        echo "    spack install iowarp@dev" >&2
         exit 1; }
       echo "bdev link check OK: $LIB (Poco present, no AWS SDK, keepalive tally present)"
     - 'echo "toolchain: clio_run=$(command -v clio_run) bench=$(command -v clio_s3_write_bench) jarvis=$(command -v jarvis)"'
@@ -262,7 +262,7 @@ scheduler:
     # (`forward_env`) twenty minutes into the allocation.
     - |
       if [ -z "${CLIO_REPO:-}" ]; then
-        for cand in "$HOME/clio-core-fork" "$HOME/clio-core"; do
+        for cand in "$HOME/clio-core"; do
           if [ -d "$cand/jarvis_clio_core/jarvis_clio_core" ]; then CLIO_REPO="$cand"; break; fi
         done
       fi
