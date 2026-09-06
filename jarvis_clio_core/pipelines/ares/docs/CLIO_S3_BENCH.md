@@ -11,7 +11,7 @@ Two sweeps, one package set:
 | Pipeline | [`clio_s3_read.yaml`](../clio_s3_read.yaml) | [`clio_s3_write.yaml`](../clio_s3_write.yaml) |
 | CLIO path | CAE assimilator: `ParseOmni` → fork+exec `cae_s3_tool get` → CTE `PutBlob` | `AsyncPutBlob` → CTE → `kS3` bdev `WriteBlocks` → signed PUT from the runtime daemon |
 | Jarvis packages | `clio_s3_bench` / `zarr_s3_bench`, `mode: read` | `clio_s3_bench` / `zarr_s3_bench`, `mode: write`, plus `s3_raw_put_bench` |
-| Spack variants | `+cae +cte +s3` | `+cae +cte +s3 +s3_bdev` |
+| Spack variants | `+cae +cte +s3_cae` | `+cae +cte +s3_cae +s3_bdev` |
 
 Writing was out of scope originally: the `kS3` bdev linked the AWS SDK
 in-process, which stack-smashes `clio_run` startup. **That is fixed** — the bdev
@@ -271,14 +271,14 @@ configure a prefix.
 
 ### 0. Build IOWarp and expose it as a view
 
-The read sweep needs `+cae +cte +s3`; the write sweep additionally needs
+The read sweep needs `+cae +cte +s3_cae`; the write sweep additionally needs
 **`+s3_bdev`** (Poco + SigV4). These are different features that share the word
-"S3": `+s3` gates the CAE assimilator and `cae_s3_tool`, `+s3_bdev` gates the
+"S3": `+s3_cae` gates the CAE assimilator and `cae_s3_tool`, `+s3_bdev` gates the
 `kS3` block device. The write sweep needs **both**, because the raw-PUT floor
 uses `cae_s3_tool`. Building everything at once covers both sweeps:
 
 ```bash
-spack install iowarp@dev +cae +cte +s3 +s3_bdev
+spack install iowarp@dev +cae +cte +s3_cae +s3_bdev
 spack view --dependencies no symlink /mnt/common/$USER/iowarp-s3-view iowarp@dev
 export IOWARP_VIEW="/mnt/common/$USER/iowarp-s3-view"
 ```
@@ -287,7 +287,7 @@ Alternatively, to build a local checkout without a recipe edit:
 
 ```bash
 spack develop -p "$HOME/clio-core" iowarp@dev
-spack install iowarp@dev +cae +cte +s3 +s3_bdev
+spack install iowarp@dev +cae +cte +s3_cae +s3_bdev
 ```
 
 Verify the gates actually took — the root `CMakeLists.txt` silently turns
@@ -578,7 +578,7 @@ without bound even if a purge is skipped.
 
 | Symptom | Cause |
 |---|---|
-| `clio_s3_read_bench not on PATH` | IOWarp built without `+s3`, or `AWSSDK` was not found at configure time and `CAE_ENABLE_S3` silently reverted to OFF |
+| `clio_s3_read_bench not on PATH` | IOWarp built without `+s3_cae`, or `AWSSDK` was not found at configure time and `CAE_ENABLE_S3` silently reverted to OFF |
 | `Preflight GET failed` | bad credentials/profile, wrong region, wrong bucket, or the dataset was never staged at that prefix |
 | CLIO rows blank, Zarr rows fine | the **runtime** could not find `cae_s3_tool`; it forks the helper, so `CAE_S3_TOOL` must be exported in `pre_cmds` (the package's own env does not reach the daemon) |
 | `zarr venv broken` | `$ZARR_VENV` missing `zarr`/`s3fs`/`numpy` |
@@ -688,7 +688,7 @@ For a non-`develop` spec, branch versions never rehash when the branch moves, so
 
 ```bash
 spack uninstall -y iowarp@dev && spack clean -s \
-  && spack install iowarp@dev +cae +cte +s3 +s3_bdev
+  && spack install iowarp@dev +cae +cte +s3_cae +s3_bdev
 ```
 
 The gate greps a build stamp (`kBuildMarker` in `clio_s3_write_bench.cc`) out of

@@ -104,8 +104,8 @@ class S3RawPutBench(S3BenchBase):
                 'msg': 'Path to the cae_s3_tool helper',
                 'type': str,
                 'default': 'cae_s3_tool',
-                'help': 'Built under CAE_ENABLE_S3 / spack +s3. Resolved on '
-                        'PATH when left as the bare name.'
+                'help': 'Built under CAE_ENABLE_S3 / spack +s3_cae. '
+                        'Resolved on PATH when left as the bare name.'
             },
             {
                 'name': 'tmpdir',

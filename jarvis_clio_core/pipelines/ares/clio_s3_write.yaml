@@ -107,7 +107,7 @@ scheduler:
     - 'export LD_LIBRARY_PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib:${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib64:${LD_LIBRARY_PATH:-}"'
     - 'command -v clio_run            >/dev/null 2>&1 || { echo "ERROR: clio_run not on PATH (view: ${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view})" >&2; exit 1; }'
     - 'command -v clio_s3_write_bench >/dev/null 2>&1 || { echo "ERROR: clio_s3_write_bench not on PATH — was IOWarp built with +s3_bdev?" >&2; exit 1; }'
-    - 'command -v cae_s3_tool         >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3? (needed for the rawput floor)" >&2; exit 1; }'
+    - 'command -v cae_s3_tool         >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3_cae? (needed for the rawput floor)" >&2; exit 1; }'
     - 'command -v jarvis              >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
     - '"${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" -c "import zarr,s3fs,numpy" || { echo "ERROR: zarr venv broken at ${ZARR_VENV:-$HOME/zarr-venv}" >&2; exit 1; }'
     # Every IOWarp binary must come from ONE install root. A stale symlink
@@ -139,7 +139,7 @@ scheduler:
         echo "  It will log \"Invalid bdev_type 's3'\", warn \"No storage devices" >&2
         echo "  configured\", and fail every PutBlob with rc=11. Rebuild:" >&2
         echo "    spack uninstall -y iowarp@dev && spack clean -s \\" >&2
-        echo "      && spack install iowarp@dev +cae +cte +s3 +s3_bdev" >&2
+        echo "      && spack install iowarp@dev +cae +cte +s3_cae +s3_bdev" >&2
         exit 1; }
       # Same trick for the benchmark binary itself. `spack develop` builds
       # rebuild in place, so a `git pull` without a `spack install` leaves an
@@ -154,7 +154,7 @@ scheduler:
         echo "    spack install iowarp@dev" >&2
         echo "  For a non-develop spec, branch versions do not rehash, so:" >&2
         echo "    spack uninstall -y iowarp@dev && spack clean -s \\" >&2
-        echo "      && spack install iowarp@dev +cae +cte +s3 +s3_bdev" >&2
+        echo "      && spack install iowarp@dev +cae +cte +s3_cae +s3_bdev" >&2
         exit 1; }
       echo "install root OK: $RUN_ROOT"
       echo "CTE s3 allowlist OK: $CTE_LIB"

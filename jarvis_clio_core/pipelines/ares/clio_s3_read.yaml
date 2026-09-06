@@ -42,7 +42,7 @@
 #
 # Prerequisites (see docs/CLIO_S3_BENCH.md for the full setup):
 #   - Dataset staged once:  jarvis_clio_core/scripts/stage_s3_read_bench_data.py
-#   - IOWarp built with +cae +s3 and exposed via a spack view (IOWARP_VIEW)
+#   - IOWarp built with +cae +s3_cae and exposed via a spack view (IOWARP_VIEW)
 #   - A venv with zarr/s3fs/numpy (ZARR_VENV)
 #   - ~/.aws/credentials (mode 600) + a profile name in S3_BENCH_PROFILE
 #
@@ -88,8 +88,8 @@ scheduler:
     - 'export PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/bin:${JARVIS_VENV:-$HOME/jarvis-venv}/bin:$PATH"'
     - 'export LD_LIBRARY_PATH="${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib:${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view}/lib64:${LD_LIBRARY_PATH:-}"'
     - 'command -v clio_run           >/dev/null 2>&1 || { echo "ERROR: clio_run not on PATH (view: ${IOWARP_VIEW:-/mnt/common/$USER/iowarp-s3-view})" >&2; exit 1; }'
-    - 'command -v clio_s3_read_bench >/dev/null 2>&1 || { echo "ERROR: clio_s3_read_bench not on PATH — was IOWarp built with +cae +s3?" >&2; exit 1; }'
-    - 'command -v cae_s3_tool        >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3?" >&2; exit 1; }'
+    - 'command -v clio_s3_read_bench >/dev/null 2>&1 || { echo "ERROR: clio_s3_read_bench not on PATH — was IOWarp built with +cae +s3_cae?" >&2; exit 1; }'
+    - 'command -v cae_s3_tool        >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3_cae?" >&2; exit 1; }'
     - 'command -v jarvis             >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
     - '"${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" -c "import zarr,s3fs,numpy" || { echo "ERROR: zarr venv broken at ${ZARR_VENV:-$HOME/zarr-venv}" >&2; exit 1; }'
     - 'echo "toolchain: clio_run=$(command -v clio_run) bench=$(command -v clio_s3_read_bench) jarvis=$(command -v jarvis)"'

@@ -47,7 +47,7 @@ class ClioS3Bench(S3BenchBase):
     """
 
     #: One executable per mode. Both are installed to bin/ by the same build,
-    #: but under different cmake gates (+cae +s3 for read, +s3_bdev for write),
+    #: but under different cmake gates (+cae +s3_cae for read, +s3_bdev for write),
     #: which is why the pipelines gate on `command -v` for the one they need.
     EXECUTABLES = {
         'read': 'clio_s3_read_bench',
