@@ -276,12 +276,15 @@ RUN cd /tmp \
     && rm -rf /tmp/cppzmq-*
 
 # libaio 0.3.113 (shared + static with -fPIC)
+# Source is the upstream release tarball on releases.pagure.org; pagure.io's
+# /archive/<tag>/ endpoint now 404s, and without curl -f that HTML error page
+# was piped straight into tar ("gzip: stdin: not in gzip format").
 # Build twice: first with symver intact for a working shared library,
 # then with symver stripped for a static archive that can be linked into
 # shared objects without "version node not found" errors.
 RUN cd /tmp \
-    && curl -sL https://pagure.io/libaio/archive/libaio-0.3.113/libaio-libaio-0.3.113.tar.gz | tar xz \
-    && cd libaio-libaio-0.3.113 \
+    && curl -fsSL --retry 3 --retry-delay 2 https://releases.pagure.org/libaio/libaio-0.3.113.tar.gz | tar xz \
+    && cd libaio-0.3.113 \
     && make prefix=/usr/local CFLAGS="-fPIC -O2" \
     && make prefix=/usr/local install \
     && ldconfig \
