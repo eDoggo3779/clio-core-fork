@@ -47,6 +47,16 @@ LOCK = threading.Lock()
 CONNECTIONS = 0
 REQUESTS = 0
 
+# Short-body mode (S3_STUB_SHORT_ONCE=1): the FIRST GET seen for each key serves
+# only the first half of the requested bytes -- with an honest Content-Length and
+# an honest Content-Range whose /total still names the full object -- then any
+# later GET for that key serves the requested range in full. This models a
+# keep-alive socket dropping mid-object: the client sees delivered < expected and
+# must resume with a ranged GET from where it left off. Tracked per key so a
+# resume is not itself truncated.
+SHORT_ONCE = os.environ.get("S3_STUB_SHORT_ONCE") == "1"
+SHORT_SERVED = set()
+
 
 def _sign(key, msg):
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -153,12 +163,44 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _respond(self, status, body=b"", head_only=False):
+    def _respond(self, status, body=b"", head_only=False, content_length=None,
+                 extra_headers=None):
         self.send_response(status)
-        self.send_header("Content-Length", str(len(body)))
+        # content_length lets a HEAD advertise the real object size while sending
+        # no body; otherwise it is the body length.
+        clen = content_length if content_length is not None else len(body)
+        self.send_header("Content-Length", str(clen))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         if body and not head_only:
             self.wfile.write(body)
+
+    @staticmethod
+    def _parse_range(header, size):
+        """Parse a `bytes=a-[b]` Range header against object `size`.
+
+        Returns (start, end_inclusive) clamped to the object, or None when the
+        header is absent/unparseable, or the string 'unsatisfiable' when the
+        start is past the end of the object (HTTP 416).
+        """
+        if not header:
+            return None
+        h = header.strip()
+        if not h.startswith("bytes="):
+            return None
+        spec = h[len("bytes="):]
+        if "," in spec:  # multi-range: not supported by the client, ignore
+            return None
+        lo, _, hi = spec.partition("-")
+        try:
+            start = int(lo)
+        except ValueError:
+            return None
+        if start >= size:
+            return "unsatisfiable"
+        end = size - 1 if hi == "" else min(int(hi), size - 1)
+        return (start, end)
 
     def do_HEAD(self):
         if not self._authorized("HEAD"):
@@ -169,8 +211,11 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(200, head_only=True)
             return
         with LOCK:
-            exists = path in OBJECTS
-        self._respond(200 if exists else 404, head_only=True)
+            obj = OBJECTS.get(path)
+        if obj is None:
+            self._respond(404, head_only=True)
+        else:
+            self._respond(200, head_only=True, content_length=len(obj))
 
     def do_PUT(self):
         if not self._authorized("PUT"):
@@ -198,7 +243,45 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             self._respond(404, b"<Error><Code>NoSuchKey</Code></Error>")
             return
-        self._respond(200, body)
+
+        total = len(body)
+        rng = self._parse_range(self.headers.get("Range"), total)
+        if rng == "unsatisfiable":
+            self._respond(
+                416, b"<Error><Code>InvalidRange</Code></Error>",
+                extra_headers={"Content-Range": f"bytes */{total}"})
+            return
+
+        if rng is None:
+            # Whole-object GET (200). Honour short-once even here so a plain read
+            # loop exercises resume too.
+            start, end = 0, total - 1
+            status = 200
+        else:
+            start, end = rng
+            status = 206
+
+        short = False
+        # Confined to the streaming tests' own keys ("/stream/"): the legacy
+        # whole-buffer GetObject path does not resume by design, so truncating
+        # its objects would be a false failure, not a bug.
+        if SHORT_ONCE and "/stream/" in path:
+            with LOCK:
+                if path not in SHORT_SERVED:
+                    SHORT_SERVED.add(path)
+                    short = True
+        if short and end > start:
+            end = start + (end - start) // 2  # serve only the first half, once
+
+        slice_body = body[start:end + 1]
+        if status == 206 or start != 0 or end != total - 1:
+            # Any partial delivery is a 206 with a Content-Range naming the full
+            # object size, so the client can learn `total` and resume.
+            self._respond(
+                206, slice_body,
+                extra_headers={"Content-Range": f"bytes {start}-{end}/{total}"})
+        else:
+            self._respond(200, slice_body)
 
     def do_DELETE(self):
         if not self._authorized("DELETE"):

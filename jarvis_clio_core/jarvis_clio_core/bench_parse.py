@@ -84,6 +84,9 @@ FAIRNESS_NUMERIC = {
 FAIRNESS_TEXT = {
     'compression': r'Compression:\s+(\S+)',
     'decode_step': r'Decode step:\s+(\S+)',
+    # Read bench only: names the transport (e.g. "in-process Poco+SigV4
+    # (persistent connection)"). Captures to end of line since it has spaces.
+    'transport': r'Transport:\s+(.+)',
 }
 
 _RSS = re.compile(r'Maximum resident set size \(kbytes\):\s+(\d+)')

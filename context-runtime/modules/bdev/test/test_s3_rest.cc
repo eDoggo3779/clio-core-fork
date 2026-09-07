@@ -313,4 +313,142 @@ TEST_CASE("s3_rest_reuses_one_connection", "[s3_rest]") {
   REQUIRE(two.connections - after.connections == 2);
 }
 
+// Stream `key` whole into `dst` using the incremental GET handle the CAE
+// assimilator uses, resuming with a ranged GET whenever a response body ends
+// short of the advertised object size. Mirrors the assimilator's recovery loop
+// so this test proves the primitives compose the way CAE relies on. Uses a
+// deliberately odd read size so chunk boundaries never align with the body.
+static size_t StreamWhole(s3::S3RestClient &client, s3::S3Connection &conn,
+                          const std::string &key, std::vector<char> &dst) {
+  s3::S3RestClient::S3GetStream st;
+  s3::S3Result r = client.BeginGetObject(conn, key, 0, 0, &st);
+  REQUIRE(r.ok());
+  const uint64_t expected = st.total_size;
+  dst.assign(static_cast<size_t>(expected), 0);
+  size_t delivered = 0;
+  int guard = 0;
+  while (delivered < expected) {
+    char buf[777];
+    size_t got = 0;
+    client.ReadBody(st, buf, sizeof(buf), &got);
+    if (got > 0) {
+      std::memcpy(dst.data() + delivered, buf, got);
+      delivered += got;
+      continue;
+    }
+    // Body ended before the full object -> retire this response and resume
+    // from the byte we reached with a ranged GET.
+    client.EndGetObject(conn, st);
+    if (delivered >= expected) break;
+    REQUIRE(++guard < 256);
+    s3::S3Result rs = client.BeginGetObject(
+        conn, key, delivered, expected - delivered, &st);
+    REQUIRE(rs.ok());
+  }
+  client.EndGetObject(conn, st);
+  return delivered;
+}
+
+TEST_CASE("s3_rest_streaming_get_whole_object", "[s3_rest]") {
+  if (!StubAvailable()) {
+    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+    return;
+  }
+  s3::S3RestClient client = MakeClient("clio/stream");
+  s3::S3Connection conn;
+  const std::string key = "clio/stream/whole.bin";
+  std::vector<char> in = Pattern(300000, 9);  // not a multiple of the read size
+  REQUIRE(client.PutObject(conn, key, in.data(), in.size()).ok());
+
+  std::vector<char> out;
+  size_t total = StreamWhole(client, conn, key, out);
+  REQUIRE(total == in.size());
+  REQUIRE(out.size() == in.size());
+  REQUIRE(std::memcmp(out.data(), in.data(), in.size()) == 0);
+}
+
+TEST_CASE("s3_rest_streaming_ranged_get_returns_the_slice", "[s3_rest]") {
+  if (!StubAvailable()) {
+    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+    return;
+  }
+  s3::S3RestClient client = MakeClient("clio/stream");
+  s3::S3Connection conn;
+  const std::string key = "clio/stream/ranged.bin";
+  std::vector<char> in = Pattern(100000, 3);
+  REQUIRE(client.PutObject(conn, key, in.data(), in.size()).ok());
+
+  const uint64_t off = 40000, len = 25000;
+  s3::S3RestClient::S3GetStream st;
+  s3::S3Result r = client.BeginGetObject(conn, key, off, len, &st);
+  REQUIRE(r.ok());
+  REQUIRE(r.http_status == 206);
+  REQUIRE(st.content_length > 0);
+  REQUIRE(st.content_length <= len);   // <= len: short mode truncates the first
+  REQUIRE(st.total_size == in.size()); // Content-Range names the full object
+
+  // Read the full range, resuming with a ranged GET if the body ends short
+  // (the S3_STUB_SHORT_ONCE mode truncates the first response for each key).
+  std::vector<char> out(len, 0);
+  size_t delivered = 0;
+  int guard = 0;
+  while (delivered < len) {
+    size_t got = 0;
+    client.ReadBody(st, out.data() + delivered, len - delivered, &got);
+    delivered += got;
+    if (delivered >= len) break;
+    if (got == 0) {
+      client.EndGetObject(conn, st);
+      REQUIRE(++guard < 64);
+      s3::S3Result rs =
+          client.BeginGetObject(conn, key, off + delivered, len - delivered, &st);
+      REQUIRE(rs.ok());
+    }
+  }
+  client.EndGetObject(conn, st);
+  REQUIRE(delivered == len);
+  REQUIRE(std::memcmp(out.data(), in.data() + off, len) == 0);
+}
+
+TEST_CASE("s3_rest_streaming_reuses_one_connection", "[s3_rest]") {
+  if (!StubAvailable()) {
+    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+    return;
+  }
+  // Several whole-object streamed reads (each many ReadBody calls, and under
+  // S3_STUB_SHORT_ONCE at least one ranged resume) ride ONE socket.
+  s3::S3RestClient client = MakeClient("clio/stream");
+  s3::S3Connection conn;
+  const int kObjs = 4;
+  for (int i = 0; i < kObjs; ++i) {
+    const std::string key = "clio/stream/reuse_" + std::to_string(i) + ".bin";
+    std::vector<char> in = Pattern(70000 + i * 1000, 7 + i);
+    REQUIRE(client.PutObject(conn, key, in.data(), in.size()).ok());
+    std::vector<char> out;
+    REQUIRE(StreamWhole(client, conn, key, out) == in.size());
+    REQUIRE(out == in);
+  }
+  REQUIRE(conn.connects == 1);
+}
+
+TEST_CASE("s3_rest_streaming_out_of_range_is_an_error", "[s3_rest]") {
+  if (!StubAvailable()) {
+    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+    return;
+  }
+  s3::S3RestClient client = MakeClient("clio/stream");
+  s3::S3Connection conn;
+  const std::string key = "clio/stream/small.bin";
+  std::vector<char> in = Pattern(4096, 2);
+  REQUIRE(client.PutObject(conn, key, in.data(), in.size()).ok());
+
+  // Start past the end of the object: S3 answers 416, and that must surface as
+  // an error rather than a silent empty (which would truncate a real import).
+  s3::S3RestClient::S3GetStream st;
+  s3::S3Result r = client.BeginGetObject(conn, key, 999999, 100, &st);
+  REQUIRE_FALSE(r.ok());
+  REQUIRE(r.http_status == 416);
+  REQUIRE(st.body == nullptr);
+}
+
 SIMPLE_TEST_MAIN()

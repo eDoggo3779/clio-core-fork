@@ -29,10 +29,19 @@
 // below). The client object itself still holds no socket, so one client remains
 // usable from many workers at once -- each worker just hands in its own handle.
 //
-// Only compiled where CLIO_ENABLE_AMAZON_DRIVE is defined and Poco::Net /
-// Poco::NetSSL are linked.
+// Compiled where CLIO_ENABLE_S3_REST is defined and Poco::Net / Poco::NetSSL are
+// linked. That derived flag is on whenever *either* consumer of this header is
+// enabled: the kS3 bdev tier (CLIO_ENABLE_AMAZON_DRIVE) or the CAE s3://
+// assimilator's in-process read path (CAE_ENABLE_S3). The header used to key off
+// CLIO_ENABLE_AMAZON_DRIVE alone, which excluded the CAE consumer.
+//
+// The CAE assimilator uses the streaming GET handle (S3GetStream +
+// BeginGetObject / ReadBody / EndGetObject) so a large object is delivered in
+// bounded chunks into shared memory rather than buffered whole; the bdev uses
+// the whole-buffer GetObject. Both keep the socket alive across calls through a
+// caller-owned S3Connection.
 
-#ifdef CLIO_ENABLE_AMAZON_DRIVE
+#ifdef CLIO_ENABLE_S3_REST
 
 #include <Poco/Exception.h>
 #include <Poco/NullStream.h>
@@ -354,6 +363,139 @@ class S3RestClient {
     return r;
   }
 
+  /**
+   * A GET whose body the caller drains incrementally with ReadBody, instead of
+   * GetObject's fill-one-buffer contract. Used by the CAE assimilator so a
+   * multi-hundred-MiB object streams through fixed-size shared-memory chunks
+   * rather than landing whole in memory. `body` is borrowed from the leased
+   * S3Connection's session and is valid only until EndGetObject / the next op
+   * on that connection -- never close or delete it.
+   */
+  struct S3GetStream {
+    Poco::Net::HTTPResponse response;  ///< headers of the in-flight response
+    std::istream *body = nullptr;      ///< borrowed body stream (do not own)
+    uint64_t content_length = 0;       ///< bytes in THIS response (ranged or whole)
+    uint64_t total_size = 0;           ///< full object size if known, else == content_length
+    bool not_found = false;            ///< 404: object absent
+  };
+
+  /**
+   * "scheme://host[:port]" for `key` -- the key a caller leases a connection
+   * by. The bucket and (on real AWS) the region live in the hostname, so this
+   * string uniquely identifies the socket endpoint a request will use.
+   */
+  std::string ConnectionKey(const std::string &key) const {
+    Endpoint ep = Resolve(key);
+    return ep.base.getScheme() + "://" + ep.host_header;
+  }
+
+  /**
+   * Open a GET on `conn` and hand back a live response to stream with ReadBody.
+   *
+   * range_off==0 && range_size==0 fetches the whole object (HTTP 200); any other
+   * combination sends a `Range: bytes=off-[off+size-1]` header and expects 206,
+   * with the full object size parsed from Content-Range into `out->total_size`.
+   * `out->content_length` is always the byte count of THIS response body. A 404
+   * sets `out->not_found` and returns a not-ok result. Signs and reuses the
+   * connection exactly as GetObject does, retrying once if a reused keep-alive
+   * socket drops mid-request.
+   */
+  S3Result BeginGetObject(S3Connection &conn, const std::string &key,
+                          uint64_t range_off, uint64_t range_size,
+                          S3GetStream *out) {
+    S3Result r;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      r = S3Result{};
+      *out = S3GetStream{};
+      bool reused = false;
+      try {
+        Endpoint ep = Resolve(key);
+        Poco::Net::HTTPClientSession *session = Connect(conn, ep.base, &reused);
+        Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_GET,
+                                   ep.canonical_uri,
+                                   Poco::Net::HTTPMessage::HTTP_1_1);
+        const bool ranged = (range_off != 0 || range_size != 0);
+        if (ranged) {
+          std::string rng = "bytes=" + std::to_string(range_off) + "-";
+          if (range_size != 0) rng += std::to_string(range_off + range_size - 1);
+          req.set("Range", rng);
+        }
+        Sign(req, "GET", ep);
+        session->sendRequest(req);
+        out->body = &session->receiveResponse(out->response);
+        r.http_status = out->response.getStatus();
+        if (r.http_status == 404) {
+          out->not_found = true;
+          r.not_found = true;
+          DrainAndRetireIfClosed(conn, out->response, *out->body);
+          out->body = nullptr;
+          return r;
+        }
+        if (!r.ok()) {
+          std::string resp;
+          Poco::StreamCopier::copyToString(*out->body, resp);  // drain error body
+          r.error = "S3 GET " + key + " failed: HTTP " +
+                    std::to_string(r.http_status) + " " + resp;
+          RetireIfClosed(conn, out->response);
+          out->body = nullptr;
+          return r;
+        }
+        out->content_length =
+            ParseContentLength(out->response, ranged, &out->total_size);
+        return r;
+      } catch (const Poco::Exception &e) {
+        conn.Retire();
+        if (reused && attempt == 0) continue;  // stale keep-alive; retry once
+        r.error = std::string("S3 GET exception: ") + e.displayText();
+        *out = S3GetStream{};
+        return r;
+      }
+    }
+    return r;
+  }
+
+  /**
+   * Copy up to `len` body bytes from `stream` into `buf`, looping over short
+   * socket reads. `*bytes_read` (if non-null) receives the count. A 0 count with
+   * an empty error means the body ended -- the caller compares total delivered
+   * against the expected length and may resume with a ranged BeginGetObject.
+   */
+  S3Result ReadBody(S3GetStream &stream, char *buf, size_t len,
+                    size_t *bytes_read) {
+    S3Result r;
+    if (bytes_read) *bytes_read = 0;
+    if (stream.body == nullptr) {
+      r.error = "S3 ReadBody called on a closed stream";
+      return r;
+    }
+    try {
+      std::istream &rs = *stream.body;
+      size_t total = 0;
+      while (total < len && rs) {
+        rs.read(buf + total, static_cast<std::streamsize>(len - total));
+        std::streamsize n = rs.gcount();
+        total += static_cast<size_t>(n);
+        if (n == 0) break;
+      }
+      if (bytes_read) *bytes_read = total;
+    } catch (const Poco::Exception &e) {
+      r.error = std::string("S3 ReadBody exception: ") + e.displayText();
+    }
+    return r;
+  }
+
+  /**
+   * Finish a streamed GET: drain any bytes the caller did not consume (so the
+   * socket stays reusable) and retire the connection if the server closed it.
+   * Safe to call on an already-closed stream.
+   */
+  void EndGetObject(S3Connection &conn, S3GetStream &stream) {
+    if (stream.body != nullptr) {
+      DrainAndRetireIfClosed(conn, stream.response, *stream.body);
+      stream.body = nullptr;
+    }
+  }
+
  private:
   /** Where a request goes, and what the signer must agree with. */
   struct Endpoint {
@@ -366,6 +508,40 @@ class S3RestClient {
   static std::string GetEnv(const char *name) {
     const char *v = std::getenv(name);
     return (v && *v) ? std::string(v) : std::string();
+  }
+
+  /**
+   * Bytes in this response body (Content-Length), plus the full object size in
+   * `*total_size`. Whenever the response carries a Content-Range
+   * "bytes a-b/total" trailer -- i.e. any 206, even one the server returned for
+   * a request we did not range -- the full size is parsed from it; otherwise it
+   * equals the body length. A missing/`*` total falls back to the body length.
+   * `ranged` is advisory only (the header is authoritative).
+   */
+  static uint64_t ParseContentLength(const Poco::Net::HTTPResponse &res,
+                                     bool ranged, uint64_t *total_size) {
+    (void)ranged;
+    uint64_t body_len = 0;
+    if (res.hasContentLength()) {
+      body_len = static_cast<uint64_t>(res.getContentLength());
+    }
+    uint64_t total = body_len;
+    if (res.has("Content-Range")) {
+      const std::string &cr = res.get("Content-Range");
+      size_t slash = cr.find('/');
+      if (slash != std::string::npos && slash + 1 < cr.size()) {
+        std::string tail = cr.substr(slash + 1);
+        if (tail != "*") {
+          try {
+            total = std::stoull(tail);
+          } catch (...) {
+            // Leave total == body_len on an unparseable trailer.
+          }
+        }
+      }
+    }
+    if (total_size) *total_size = total;
+    return body_len;
   }
 
   /**
@@ -538,6 +714,6 @@ class S3RestClient {
 
 }  // namespace clio::run::bdev::s3
 
-#endif  // CLIO_ENABLE_AMAZON_DRIVE
+#endif  // CLIO_ENABLE_S3_REST
 
 #endif  // CLIO_BDEV_S3_REST_H_

@@ -40,6 +40,14 @@
 #include <memory>
 #include <string>
 
+// The long-lived container owns the S3 keep-alive connection pool the s3://
+// assimilator leases from (see s3_conn_pool.h). Only runtime TUs include this
+// header, and they carry the bdev module's include path, so pulling in the Poco
+// transport here is confined to the runtime library.
+#ifdef CLIO_ENABLE_S3_REST
+#include <clio_cae/core/factory/s3_conn_pool.h>
+#endif
+
 // Forward declaration for CTE client
 namespace clio::cte::core {
   class Client;
@@ -155,6 +163,11 @@ class Runtime : public clio::run::Container {
    * Destroy the container (Method::kDestroy)
    */
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task) {
+#ifdef CLIO_ENABLE_S3_REST
+    // One compact keep-alive tally before the pooled sockets close, mirroring
+    // the bdev's line but tagged "CAE S3". sockets==1 & requests>>1 is reuse.
+    s3_conn_pool_.LogTally();
+#endif
     HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
     CLIO_TASK_BODY_BEGIN
@@ -218,6 +231,12 @@ class Runtime : public clio::run::Container {
 
   Client client_;
   std::shared_ptr<clio::cte::core::Client> cte_client_;
+#ifdef CLIO_ENABLE_S3_REST
+  /// Keep-alive S3 connections leased by the s3:// assimilator, one lease per
+  /// object for its whole lifetime (safe across worker migration). Long-lived
+  /// with the container so sockets persist across imports.
+  S3ConnectionPool s3_conn_pool_;
+#endif
   clio::run::PoolId next_pool_id_;  // CTE core pool when CAE is the interceptor
 };
 

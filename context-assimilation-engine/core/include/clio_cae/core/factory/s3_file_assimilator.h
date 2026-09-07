@@ -45,6 +45,9 @@ class Client;
 
 namespace clio::cae::core {
 
+// Forward declaration; defined under CLIO_ENABLE_S3_REST in s3_conn_pool.h.
+class S3ConnectionPool;
+
 /**
  * S3FileAssimilator - Imports an object straight from Amazon S3 (or any
  * S3-compatible endpoint, e.g. MinIO) into CTE.
@@ -62,10 +65,13 @@ namespace clio::cae::core {
 class S3FileAssimilator : public BaseAssimilator {
  public:
   /**
-   * Constructor with CTE client
+   * Constructor with CTE client and optional keep-alive connection pool.
    * @param cte_client Shared pointer to initialized CTE client
+   * @param s3_pool    Long-lived pool of reusable S3 connections (owned by
+   *                   Runtime), or nullptr to connect fresh per object.
    */
-  explicit S3FileAssimilator(std::shared_ptr<clio::cte::core::Client> cte_client);
+  explicit S3FileAssimilator(std::shared_ptr<clio::cte::core::Client> cte_client,
+                             S3ConnectionPool* s3_pool = nullptr);
 
   /**
    * Schedule assimilation tasks for an S3 object
@@ -102,6 +108,7 @@ class S3FileAssimilator : public BaseAssimilator {
   bool ParseS3Url(const std::string& url, std::string& bucket, std::string& key);
 
   std::shared_ptr<clio::cte::core::Client> cte_client_;
+  S3ConnectionPool* s3_pool_ = nullptr;  ///< not owned; may be null
 };
 
 }  // namespace clio::cae::core

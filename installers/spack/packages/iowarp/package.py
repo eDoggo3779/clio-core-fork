@@ -84,10 +84,16 @@ class Iowarp(CMakePackage):
     depends_on('libfuse@3:', when='+fuse')
     depends_on('boost+context', when='+boost_coro')
 
-    # CAE cloud import backends (opt-in). aws-sdk-cpp for the S3 assimilator
-    # (find_package(AWSSDK COMPONENTS s3)); the iowarp-overlay storage-only
-    # google-cloud-cpp for the GCS assimilator (find_package(google_cloud_cpp_storage)).
+    # CAE cloud import backends (opt-in). The S3 assimilator now needs BOTH:
+    #   * Poco -- the in-process s3:// READ path signs SigV4 and streams over
+    #     Poco::Net (shared s3_rest.h from the bdev), because loading the AWS SDK
+    #     into the CLIO_INIT'ing runtime corrupts startup; and
+    #   * aws-sdk-cpp -- still built for the standalone cae_s3_tool helper, used
+    #     by the benchmark raw-PUT/raw-GET floors and test seeding, never linked
+    #     into the runtime (find_package(AWSSDK COMPONENTS s3)).
+    # google-cloud-cpp (iowarp-overlay, storage-only) is for the GCS assimilator.
     depends_on('aws-sdk-cpp', when='+s3_cae')
+    depends_on('poco', when='+s3_cae')
     depends_on('google-cloud-cpp', when='+gcs')
 
     # The S3 bdev tier is a Poco::Net HTTPS client that signs with SigV4; it

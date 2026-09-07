@@ -59,7 +59,12 @@ if(CLIO_ENABLE_AMAZON_DRIVE)
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
-  target_compile_definitions(clio_run_s3_rest_test PRIVATE CLIO_ENABLE_AMAZON_DRIVE)
+  # s3_rest.h is #ifdef'd on CLIO_ENABLE_S3_REST (the capability flag shared with
+  # the CAE consumer); the root CMake also defines it globally, but set it here
+  # too so the test builds even when configured stand-alone with only the bdev
+  # feature flag.
+  target_compile_definitions(clio_run_s3_rest_test PRIVATE
+    CLIO_ENABLE_AMAZON_DRIVE CLIO_ENABLE_S3_REST)
   if(CLIO_CORE_ENABLE_TESTS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
@@ -71,6 +76,19 @@ if(CLIO_ENABLE_AMAZON_DRIVE)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
       )
       set_tests_properties(cr_bdev_s3_rest PROPERTIES TIMEOUT 120)
+      # Same binary, but the stub truncates the first GET of every key so every
+      # streamed read must resume with a ranged GET. Exercises the keep-alive
+      # drop / mid-object recovery path the CAE assimilator depends on.
+      add_test(
+        NAME cr_bdev_s3_rest_resume
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/s3_stub_server.py
+                -- $<TARGET_FILE:clio_run_s3_rest_test>
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+      )
+      set_tests_properties(cr_bdev_s3_rest_resume PROPERTIES
+        TIMEOUT 120
+        ENVIRONMENT "S3_STUB_SHORT_ONCE=1")
     else()
       message(STATUS "Python3 not found; skipping the cr_bdev_s3_rest test")
     endif()

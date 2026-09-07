@@ -9,9 +9,9 @@
  * S3 read-path benchmark.
  *
  * Times CAE's s3:// -> CTE read path against S3. Reads `--num-objects` objects
- * through the CAE assimilator (ParseOmni -> S3FileAssimilator -> fork+exec
- * cae_s3_tool get -> CTE PutBlob) with a sliding window of `--concurrency`
- * in-flight transfers. The bench reports:
+ * through the CAE assimilator (ParseOmni -> S3FileAssimilator -> in-process
+ * Poco+SigV4 GET streamed into CTE PutBlob) with a sliding window of
+ * `--concurrency` in-flight transfers. The bench reports:
  *   - throughput in the shared clio_bench::PrintResults format
  *   - a second "Fairness" block recording the equivalence caveats needed to
  *     compare against a Zarr-on-S3 read
@@ -44,25 +44,28 @@
  *   2. S3FileAssimilator names blobs "chunk_0..chunk_N" relative to the
  *      destination tag, restarting at 0 for every context -- so every object
  *      MUST get its own tag or objects silently overwrite one another.
- *   3. The download is a fork() + blocking waitpid() on a runtime worker
- *      thread, so effective concurrency is capped by the runtime's worker
- *      count, not by K. Sweep runtime threads alongside K and compare
+ *   3. The download is a synchronous blocking GET on a runtime worker thread,
+ *      so effective concurrency is still capped by the runtime's worker count,
+ *      not by K (a persistent connection removes per-object fixed cost, not the
+ *      worker-blocking ceiling). Sweep runtime threads alongside K and compare
  *      "Requested concurrency" against measured scaling.
  *
- * The AWS SDK is deliberately NOT linked into this process: loading it into a
- * process that runs CLIO_INIT corrupts runtime startup. All S3 I/O happens
- * out-of-process via the cae_s3_tool helper.
+ * The AWS SDK is deliberately NOT linked into the runtime OR this process:
+ * loading it into a process that runs CLIO_INIT corrupts runtime startup. The
+ * runtime signs and streams over Poco (s3_rest.h). This bench binary forks
+ * cae_s3_tool ONCE for the pre-timing Preflight (a 1-byte GET), which links the
+ * SDK only in that short-lived child.
  *
- * Environment (read by the RUNTIME process, which forks the helper -- exporting
- * these in the benchmark's own environment is not sufficient when the runtime
- * was started separately):
- *   CAE_S3_TOOL         Path to the cae_s3_tool helper (else PATH lookup).
- *   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / AWS_PROFILE
- *   AWS_DEFAULT_REGION  Region (default us-east-1).
- *   S3_ENDPOINT / AWS_ENDPOINT_URL   Endpoint override for S3-compatible
- *                       stores; MUST stay unset for real AWS.
- *   TMPDIR              Staging dir for downloaded objects. Peak usage is
- *                       concurrency * object_size.
+ * Environment (read by the RUNTIME process, which now does the GET in-process --
+ * exporting these only in the benchmark's own environment is not sufficient when
+ * the runtime was started separately; forward them to the daemon):
+ *   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN   Credentials;
+ *                       else the AWS_PROFILE section of ~/.aws/credentials.
+ *   AWS_PROFILE / AWS_DEFAULT_REGION / AWS_REGION   Profile + region (no silent
+ *                       default -- a wrong/absent region is a hard error).
+ *   S3_ENDPOINT         Endpoint override for S3-compatible stores; MUST stay
+ *                       unset for real AWS.
+ *   CAE_S3_TOOL         Path to cae_s3_tool for the Preflight fork (else PATH).
  */
 
 #include <sys/wait.h>
@@ -445,7 +448,9 @@ int VerifyTags(const BenchConfig& c, const std::vector<size_t>& indices) {
  * Every line here is scraped into a results.csv column so a reader can tell
  * what each stack actually did: how many bytes crossed the wire, how many GETs
  * it took, whether anything was compressed or decoded, and what CLIO-specific
- * overheads (per-object subprocess spawn, full temp-file staging) were paid.
+ * overheads were paid -- now zero per-object subprocess spawns and zero
+ * temp-file staging, since the read path is in-process over a persistent
+ * connection.
  *
  * @param c Benchmark configuration.
  * @param r Timed-loop results.
@@ -467,10 +472,15 @@ void PrintFairness(const BenchConfig& c, const RunResult& r) {
   HLOG(kInfo, "Wall time us: {} ({} ms)", r.wall_us, r.wall_us / 1000.0);
   HLOG(kInfo, "Wire bandwidth: {} MB/s",
        clio_bench::CalcBandwidth(bytes_moved, r.wall_us));
-  // One fork+exec of cae_s3_tool per object, and each object is staged whole
-  // through TMPDIR before it reaches CTE. Zarr pays neither cost.
-  HLOG(kInfo, "Subprocess spawns: {}", r.objects_done);
-  HLOG(kInfo, "Temp file bytes: {}", bytes_moved);
+  // The assimilator now reads s3:// IN-PROCESS over a persistent Poco + SigV4
+  // connection: no per-object fork+exec of cae_s3_tool, and no whole-object
+  // temp-file staging. Both proxies are therefore 0 -- the win this port
+  // targets. (The cross-object socket-reuse proof lives in the daemon's
+  // "CAE S3 keepalive TOTAL sockets=.. requests=.." line, not here: the socket
+  // counts belong to the runtime process, not to this client benchmark.)
+  HLOG(kInfo, "Transport: in-process Poco+SigV4 (persistent connection)");
+  HLOG(kInfo, "Subprocess spawns: 0");
+  HLOG(kInfo, "Temp file bytes: 0");
   // kMaxChunkSize in S3FileAssimilator::Schedule -- a hard-coded constexpr,
   // not tunable from here.
   HLOG(kInfo, "Transport chunk bytes: 1048576");
