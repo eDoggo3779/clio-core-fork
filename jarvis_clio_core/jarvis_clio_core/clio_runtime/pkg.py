@@ -456,8 +456,32 @@ class ClioRuntime(Service):
                 pass
             time.sleep(1)
         else:
-            self.log(f'WARNING: Runtime did not respond on {host}:{port} after 30s',
-                     color=Color.RED)
+            # Hard failure, not a warning. Continuing here used to log
+            # "IOWarp runtime started" for a runtime that does not exist; the
+            # sweep then ran on to the next package, which died ~150 log lines
+            # later with `IpcManager::ClientInit: Failed to create IPC
+            # transport: ... failed to connect to /tmp/clio_<user>/clio_<port>
+            # .ipc` and got blamed on the benchmark (observed: job 23911 run2).
+            # Raising attributes the failure to the runtime, where it belongs.
+            #
+            # The cause to check first is a STALE hostfile: the per-run copy at
+            # <pipeline_shared_dir>/hostfile is preferred over self.hostfile
+            # whenever it exists (see _generate_config) and nothing invalidates
+            # it across jobs, so a run directory left over from an earlier
+            # allocation still names that allocation's node. pssh to it then
+            # fails with `Access denied by pam_slurm_adopt: you have no active
+            # jobs on this node`, no daemon is ever launched on the node the
+            # benchmark actually runs on, and the hostfile's node is not in
+            # $SLURM_JOB_NODELIST. Fix by removing the stale run directories.
+            nodelist = os.environ.get('SLURM_JOB_NODELIST', '')
+            hint = ''
+            if nodelist and host not in nodelist:
+                hint = (f" -- host is NOT in SLURM_JOB_NODELIST ({nodelist}): "
+                        f"the hostfile is stale, left over from an earlier "
+                        f"allocation. Remove the pipeline's per-run shared "
+                        f"directories and resubmit.")
+            raise ValueError(
+                f'Runtime did not respond on {host}:{port} after 30s{hint}')
 
         self.log("IOWarp runtime started")
 

@@ -61,7 +61,25 @@ class Runtime : public clio::run::Container {
   using CreateParams = clio::cae::core::CreateParams;
 
   Runtime() = default;
-  ~Runtime() override = default;
+
+  /**
+   * The keep-alive tally is emitted here, in the C++ destructor, NOT in the
+   * kDestroy task method. PoolManager::DestroyAllContainers() (the graceful
+   * runtime-shutdown path) runs container destructors only -- it deliberately
+   * does not dispatch ChiMod Destroy *task* methods, because driving a
+   * coroutine inline during finalize crashes; routing them through the workers
+   * is tracked as #563. A tally in kDestroy is therefore unreachable on every
+   * ordinary shutdown. The destructor runs on both paths (explicit pool
+   * destroy and shutdown), so it is the only placement that always fires.
+   * Still early enough for HLOG: DestroyAllContainers precedes StopWorkers,
+   * and logs its own "Destroyed N container(s)" line right after this.
+   */
+  ~Runtime() override {
+#ifdef CLIO_ENABLE_S3_REST
+    // sockets==1 & requests>>1 is reuse. No-ops when no S3 I/O happened.
+    s3_conn_pool_.LogTally();
+#endif
+  }
 
   /**
    * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
@@ -163,11 +181,9 @@ class Runtime : public clio::run::Container {
    * Destroy the container (Method::kDestroy)
    */
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task) {
-#ifdef CLIO_ENABLE_S3_REST
-    // One compact keep-alive tally before the pooled sockets close, mirroring
-    // the bdev's line but tagged "CAE S3". sockets==1 & requests>>1 is reuse.
-    s3_conn_pool_.LogTally();
-#endif
+    // The "CAE S3 keepalive TOTAL" tally is emitted from ~Runtime(), not here:
+    // this task method is not dispatched on runtime shutdown (see the ctor
+    // comment and #563), so a tally here would never be seen in practice.
     HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
     CLIO_TASK_BODY_BEGIN
