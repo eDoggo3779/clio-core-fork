@@ -203,11 +203,19 @@ def print_fairness(label, args, elapsed_us, n_ops, k):
     print(f"Wall time us: {elapsed_us} ({elapsed_us / 1000.0} ms)")
     print(f"Wire bandwidth: {wire_bw} MB/s")
     # One process per GET is this floor's defining cost -- process spawn +
-    # Aws::InitAPI + fresh handshake + whole-object temp file, exactly what the
-    # in-process assimilator no longer pays. That is why it is a floor, not a
-    # competitor: CLIO's read path pays none of it.
+    # Aws::InitAPI + fresh handshake, exactly what the in-process assimilator no
+    # longer pays. That is why it is a floor, not a competitor: CLIO's read path
+    # pays none of it.
     print(f"Subprocess spawns: {n_ops}")
-    print(f"Temp file bytes: {k * args.object_size}")
+    # Temp staging is only charged when --keep-downloads writes real files. By
+    # default every GET streams to /dev/null, so the honest number is 0 --
+    # reporting k * object_size here would claim disk traffic that never
+    # happened. This makes the floor DELIBERATELY GENEROUS: it is credited with
+    # none of the whole-object staging an out-of-process path would really do,
+    # and CLIO's margin is measured against that best case. The per-GET process
+    # cost above is still charged, and remains the floor's defining handicap.
+    print(f"Temp file bytes: "
+          f"{k * args.object_size if args.keep_downloads else 0}")
     print(f"Transport chunk bytes: {args.object_size}")
     print("===================")
 
