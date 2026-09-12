@@ -82,7 +82,17 @@ scheduler:
   # the duration of each GET. A narrow cgroup silently caps concurrency.
   cpus_per_task: 40
   partition: compute
-  time: "08:00:00"
+  # 18 h for a ~10.4 h sweep. The margin is not padding, it is variance cover:
+  # the SAME 32 MiB / K=1 cell measured 6.95 and 10.59 MB/s on different jobs
+  # (23911 vs 23923), a 1.5x swing on a shared WAN link, and the whole sweep is
+  # link-bound. At the slow end ~10.4 h becomes ~15.6 h. Slurm bills actual
+  # usage, not the request, so over-asking costs only queue priority -- whereas
+  # under-asking truncates the tail of results.csv. Budget basis: each of the 36
+  # rows moves 2 GiB through THREE engines = 6 GiB, ~546 s of pure transfer at
+  # the measured ~11.2 MB/s ceiling, plus per-request overhead that dominates at
+  # fine granularity (the 512 KiB / K=1 cell alone is 3930.9 s; job 23924).
+  # Check the cap before raising further: scontrol show partition compute.
+  time: "18:00:00"
   output: ${HOME}/clio_s3_read-%j.out
   error: ${HOME}/clio_s3_read-%j.err
   # MUST stay literally identical to config.hostfile below.
@@ -259,23 +269,34 @@ config:
 vars:
   # --- Granularity: bytes per request. Zipped, length 4. ---
   # Chunk edge c -> c^3 * 2 bytes:
-  #   64 -> 512 KiB / 4096 objs ; 128 -> 4 MiB / 512 ;
-  #   256 -> 32 MiB / 64        ; 512 -> 256 MiB / 8
+  #   512 -> 256 MiB / 8 objs ; 256 -> 32 MiB / 64 ;
+  #   128 -> 4 MiB / 512      ; 64  -> 512 KiB / 4096
   # Total bytes stay 2 GiB in every row; only request COUNT varies.
-  clio_s3.key_prefix:  ["clio-s3-read-bench/raw/524288",
-                        "clio-s3-read-bench/raw/4194304",
+  #
+  # ORDERED LARGEST-FIRST ON PURPOSE -- do not "tidy" this back to ascending.
+  # results.csv is written incrementally, so an allocation overrun truncates the
+  # TAIL of the sweep. Two measurements decide which tail is cheapest to lose:
+  # (a) 512 KiB is by far the most expensive column (3930.9 s for its K=1 cell
+  # alone, vs 885 s at 32 MiB), and (b) it is the LEAST informative one --
+  # CLIO's edge over Zarr GROWS with object size (K=1: 1.0008x at 512 KiB,
+  # 1.73x at 32 MiB), because at small granularity both stacks are pinned by the
+  # same serial S3 round-trip and connection reuse cannot remove a round-trip
+  # you have to wait for. So the headline lives at 256 MiB and the filler at
+  # 512 KiB; running big-to-small means a kill costs the filler.
+  clio_s3.key_prefix:  ["clio-s3-read-bench/raw/268435456",
                         "clio-s3-read-bench/raw/33554432",
-                        "clio-s3-read-bench/raw/268435456"]
-  clio_s3.object_size: ["512k", "4m", "32m", "256m"]
-  clio_s3.num_objects: [4096, 512, 64, 8]
-  zarr_s3.chunk_edge:  [64, 128, 256, 512]
+                        "clio-s3-read-bench/raw/4194304",
+                        "clio-s3-read-bench/raw/524288"]
+  clio_s3.object_size: ["256m", "32m", "4m", "512k"]
+  clio_s3.num_objects: [8, 64, 512, 4096]
+  zarr_s3.chunk_edge:  [512, 256, 128, 64]
   # The raw-GET floor reads the same keys/sizes/counts as the CLIO row.
-  raw_get.key_prefix:  ["clio-s3-read-bench/raw/524288",
-                        "clio-s3-read-bench/raw/4194304",
+  raw_get.key_prefix:  ["clio-s3-read-bench/raw/268435456",
                         "clio-s3-read-bench/raw/33554432",
-                        "clio-s3-read-bench/raw/268435456"]
-  raw_get.object_size: ["512k", "4m", "32m", "256m"]
-  raw_get.num_objects: [4096, 512, 64, 8]
+                        "clio-s3-read-bench/raw/4194304",
+                        "clio-s3-read-bench/raw/524288"]
+  raw_get.object_size: ["256m", "32m", "4m", "512k"]
+  raw_get.num_objects: [8, 64, 512, 4096]
 
   # --- Concurrency. Zipped, length 3. ---
   # runtime.num_threads rides along because the S3 assimilator blocks a runtime
@@ -298,7 +319,14 @@ loop:
 
 # Per-combination wall-clock backstop. Expiry marks that row failed and the
 # sweep continues, so one wedged row can no longer lose the other 35.
-run_timeout: 1800
+#
+# 5400 is set from measurement, not taste: the 512 KiB / K=1 cell took 3930.9 s
+# (job 23924, clio_s3_read_probe.yaml) -- 4096 requests x ~0.27 s serial, paid
+# three times over because all three engines run it. At the old 1800 the kill
+# landed inside zarr_s3 (cumulative CLIO 1121 s, Zarr 2243 s, floor 3918 s) and
+# EVERY 512 KiB row would have been voided. 5400 leaves ~37% headroom on that
+# worst cell; do not lower it without re-running the probe.
+run_timeout: 5400
 
 repeat: 3
 output: "${HOME}/clio_s3_read_results"
