@@ -61,8 +61,12 @@ def parse_args(argv):
     p.add_argument("--s3-tool", default=None,
                    help="path to cae_s3_tool; also read from CAE_S3_TOOL")
     p.add_argument("--tmpdir", default=None,
-                   help="where downloaded objects land; peak usage is "
-                        "concurrency * object_size")
+                   help="where downloaded objects land when --keep-downloads "
+                        "is set; peak usage is concurrency * object_size")
+    p.add_argument("--keep-downloads", action="store_true",
+                   help="write each GET to a real file under --tmpdir instead "
+                        "of /dev/null. Off by default: this is a WIRE-speed "
+                        "floor, and the bytes are never read back")
     return p.parse_args(argv)
 
 
@@ -79,17 +83,33 @@ def resolve_tool(explicit):
 def run_gets(args, tool, tmpdir):
     """Run the timed download: K concurrent cae_s3_tool get processes.
 
-    One destination file PER SLOT, overwritten on each GET: the downloaded
-    bytes are irrelevant to a wire-speed measurement, so peak disk usage is
-    concurrency * object_size, not num_objects * object_size.
+    By default every slot writes to /dev/null. The downloaded bytes are never
+    read back -- this measures wire speed -- and discarding them keeps the
+    floor comparable to the engines it is a floor FOR: CLIO lands bytes in CTE
+    (shm) and Zarr in numpy arrays (RAM), so charging only this path for a disk
+    write would understate it. It also removes the hard scaling limit that
+    real files impose: one file per slot is concurrency * object_size of peak
+    space, which is 1 GiB at K=32 x 32 MiB and 8 GiB at K=32 x 256 MiB. Ares
+    node-local /tmp could not absorb the 1 GiB case -- 62 of 64 GETs died with
+    `cae_s3_tool get: write failed` (job 23921) and the row was voided.
+
+    cae_s3_tool opens the destination with std::ofstream(trunc) and streams the
+    SDK body into it, so /dev/null is a valid target and all slots can share
+    it. The SDK completes the download before that write, so the timing still
+    covers the full transfer.
+
+    Pass --keep-downloads for real files under --tmpdir.
 
     :param args: Parsed arguments.
     :param tool: Path to cae_s3_tool.
-    :param tmpdir: Directory the per-slot destination files live in.
+    :param tmpdir: Directory for per-slot files; None when discarding.
     :return: Tuple of (elapsed microseconds, failure count).
     """
     k = min(args.concurrency, args.num_objects)
-    dests = [os.path.join(tmpdir, f"dst_{slot}.bin") for slot in range(k)]
+    if tmpdir is None:
+        dests = [os.devnull] * k
+    else:
+        dests = [os.path.join(tmpdir, f"dst_{slot}.bin") for slot in range(k)]
     running = {}   # Popen -> slot index
     failures = 0
     next_idx = 0
@@ -208,14 +228,17 @@ def main(argv):
 
     tool = resolve_tool(args.s3_tool)
     k = min(args.concurrency, args.num_objects)
-    tmpdir = tempfile.mkdtemp(prefix="s3_raw_get_", dir=args.tmpdir)
+    tmpdir = (tempfile.mkdtemp(prefix="s3_raw_get_", dir=args.tmpdir)
+              if args.keep_downloads else None)
     try:
+        dest_desc = tmpdir if tmpdir else os.devnull
         print(f"s3_raw_get: s3://{args.bucket}/{args.key_prefix} x "
               f"{args.num_objects} objects of {args.object_size} B, K={k}, "
-              f"tool={tool}")
+              f"tool={tool}, dest={dest_desc}")
         elapsed_us, failures = run_gets(args, tool, tmpdir)
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     print_results(args.label, elapsed_us, args.num_objects, args.object_size,
                   k)
