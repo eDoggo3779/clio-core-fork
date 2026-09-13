@@ -46,6 +46,7 @@
 // transport here is confined to the runtime library.
 #ifdef CLIO_ENABLE_S3_REST
 #include <clio_cae/core/factory/s3_conn_pool.h>
+#include <clio_cae/core/factory/s3_file_assimilator.h>
 #endif
 
 // Forward declaration for CTE client
@@ -78,6 +79,8 @@ class Runtime : public clio::run::Container {
 #ifdef CLIO_ENABLE_S3_REST
     // sockets==1 & requests>>1 is reuse. No-ops when no S3 I/O happened.
     s3_conn_pool_.LogTally();
+    // Where each object's latency actually went. Same placement, same reason.
+    S3AssimLogPhaseTally();
 #endif
   }
 

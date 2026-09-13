@@ -49,6 +49,23 @@ namespace clio::cae::core {
 class S3ConnectionPool;
 
 /**
+ * Emit the accumulated per-phase latency breakdown for every object this
+ * process assimilated from S3, then reset the accumulators.
+ *
+ * Sibling of S3ConnectionPool::LogTally() and called from the same place --
+ * ~Runtime() -- for the same reason: a tally in a ChiMod kDestroy task method
+ * is unreachable on an ordinary shutdown (#563).
+ *
+ * The figures are LATENCY, not CPU: each phase is wall-clock across its
+ * CLIO_CO_AWAIT, so a suspended coroutine's wait shows up in the phase it was
+ * waiting on. That is the intended reading -- the question these answer is
+ * "where does an object's 2.5 s go", not "which phase burns cycles".
+ *
+ * No-ops when this process assimilated nothing.
+ */
+void S3AssimLogPhaseTally();
+
+/**
  * S3FileAssimilator - Imports an object straight from Amazon S3 (or any
  * S3-compatible endpoint, e.g. MinIO) into CTE.
  *
