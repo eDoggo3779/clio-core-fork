@@ -375,11 +375,29 @@ RunResult RunReadLoop(const BenchConfig& c, clio::cae::core::Client& cae_client,
       r.slot_us[s] += std::chrono::duration_cast<std::chrono::microseconds>(
                           t1 - slots[s].t0).count();
       r.slot_ops[s] += 1;
+      // Three DIFFERENT codes matter here and they are easy to confuse:
+      //   GetReturnCode()      -- clio::run::Task::return_code_ (task.h), the
+      //                           RUNTIME's task-level status. 0 means "the
+      //                           coroutine ran"; it says nothing about CAE.
+      //   result_code_         -- CAE's own status (core_tasks.h). Every
+      //                           failure branch in Runtime::ParseOmni
+      //                           (core_runtime.cc) sets this non-zero.
+      //   num_tasks_scheduled_ -- 0 when nothing was assimilated.
+      // Job 23925 logged four "rc=0, scheduled=0" failures that were
+      // undiagnosable precisely because only the first was printed: the task
+      // genuinely succeeded at the runtime level while CAE reported an error
+      // in result_code_/error_message_, both of which this line discarded.
+      // Print all three plus the message.
       if (slots[s].fut->GetReturnCode() != 0 ||
+          slots[s].fut->result_code_ != 0 ||
           slots[s].fut->num_tasks_scheduled_ == 0) {
-        HLOG(kError, "ParseOmni failed for object {} (rc={}, scheduled={})",
+        HLOG(kError,
+             "ParseOmni failed for object {} (task_rc={}, result_code={}, "
+             "scheduled={}, msg='{}')",
              slots[s].obj_idx, slots[s].fut->GetReturnCode(),
-             slots[s].fut->num_tasks_scheduled_);
+             slots[s].fut->result_code_,
+             slots[s].fut->num_tasks_scheduled_,
+             slots[s].fut->error_message_.str());
         r.rc = 1;
       }
       ++r.objects_done;
