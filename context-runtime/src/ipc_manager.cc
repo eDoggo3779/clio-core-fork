@@ -4086,6 +4086,14 @@ void IpcManager::HeartbeatThread() {
 
 void IpcManager::CleanupResponseArchive(size_t net_key) {
   std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+  // Drop the in-flight registration FIRST. pending_zmq_futures_ holds a RAW
+  // Task* that is only valid while the client's Future owns it, and the sole
+  // caller is ~Future — the moment after which it does not. A response that
+  // arrives later found the stale entry and wrote through the freed task
+  // (RecvZmqClientThread -> Task::SetNewData), which is the heap-use-after-free
+  // AddressSanitizer reported for cr_cli_client_crash_leak. Nothing can consume
+  // the response once the future is gone, so forgetting it is the whole fix.
+  pending_zmq_futures_.erase(net_key);
   auto it = pending_response_archives_.find(net_key);
   if (it != pending_response_archives_.end()) {
     // Frees ZMQ zero-copy recv handles (bulk.desc); a no-op for a SHM archive
