@@ -141,8 +141,17 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
         return false;
       }
       ofs << out.c_str() << "\n";
+      // close() here, not at the end of the scope: the model is small enough to
+      // sit entirely in the stream buffer, so the write to the device happens
+      // at flush time. Letting the destructor do that puts the failure after
+      // this check -- good() would say the write succeeded and the rename below
+      // would install a file the filesystem never accepted (ENOSPC, a full
+      // quota, a dying disk). Closing explicitly moves the flush in front of
+      // the check; close() sets failbit if it cannot complete.
+      ofs.close();
       if (!ofs.good()) {
         HLOG(kError, "TaskStatModel: failed to write {}", tmp_path);
+        std::filesystem::remove(tmp_path, ec);
         return false;
       }
     }
