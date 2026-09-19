@@ -2258,6 +2258,11 @@ size_t IpcManager::ReportRuntimeLeaks(const char *phase) const {
 }
 
 IpcManager::~IpcManager() {
+  // One-shot client-response send tally (#968). Emitted here because SendOut
+  // is driven from a periodic admin task and has no exit of its own to hook.
+  // No-ops in a process that never sent a client response, so clients and
+  // short-lived tools stay silent.
+  IpcCpu2CpuZmq::LogSendTally();
 #if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
   ReportRuntimeLeaks("~IpcManager");
 #endif
@@ -3708,6 +3713,25 @@ void IpcManager::RecvZmqClientThread() {
     }
     error_streak = 0;
     recv_transport->PollRecv(kZmqPollTimeoutMs);
+  }
+
+  // One-shot teardown tally (#968). recv_count / miss_count were only ever
+  // observable through a 1-in-256 kDebug line that a default build compiles
+  // out, so a run could end having silently mis-routed responses with nothing
+  // in the log to say so. This is ONE line per client process, at kInfo, and
+  // it is the denominator every rate in this area needs.
+  //
+  // misses > 0 means at least one response arrived naming a net_key with no
+  // pending future -- i.e. a reply outlived the task it belonged to. That is
+  // the signature the #968 read failures turn on, so it is promoted to
+  // kWarning to survive a log level that hides kInfo.
+  if (miss_count > 0) {
+    HLOG(kWarning,
+         "[CountClientRecv] TOTAL responses={} misses={} -- a response named a "
+         "net_key with NO pending future; see #968",
+         recv_count, miss_count);
+  } else {
+    HLOG(kInfo, "[CountClientRecv] TOTAL responses={} misses=0", recv_count);
   }
 }
 

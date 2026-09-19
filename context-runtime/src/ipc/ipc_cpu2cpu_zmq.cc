@@ -263,14 +263,41 @@ void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc,
 // SendOut: net-worker serialize and send response via ZMQ
 //==============================================================================
 
+// Client-response send instrumentation (#968). At namespace scope rather than
+// function-local statics so LogSendTally() can report the finals at teardown;
+// SendOut is driven from a periodic admin task, so it has no exit of its own to
+// hook. Relaxed throughout -- read once at shutdown, nothing branches on them.
+static std::atomic<size_t> send_counter{0};
+static std::atomic<size_t> send_fail_counter{0};
+
+void IpcCpu2CpuZmq::LogSendTally() {
+  const size_t sent = send_counter.load(std::memory_order_relaxed);
+  const size_t failed = send_fail_counter.load(std::memory_order_relaxed);
+  if (sent == 0 && failed == 0) {
+    return;  // this process never sent a client response
+  }
+  // Retries are the leading suspect for a DUPLICATED response in #968, so a
+  // non-zero count is promoted to kWarning: it must survive a log level that
+  // hides kInfo, and it is the number to correlate against the client's
+  // [CountClientRecv] miss tally.
+  if (failed > 0) {
+    HLOG(kWarning,
+         "[CountSend] TOTAL client responses sent={} send_failures={} -- each "
+         "failure re-queued the response, so a duplicate delivery is possible; "
+         "see #968",
+         sent, failed);
+  } else {
+    HLOG(kInfo, "[CountSend] TOTAL client responses sent={} send_failures=0",
+         sent);
+  }
+}
+
 bool IpcCpu2CpuZmq::SendOut(
     IpcManager *ipc, u32 &tasks_sent,
     std::vector<clio::run::shared_ptr<Task>> & /*deferred_deletes — unused*/) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   bool did_work = false;
   tasks_sent = 0;
-  static std::atomic<size_t> send_counter{0};
-  static std::atomic<size_t> send_fail_counter{0};
 
   // Task lifetime across the zero-copy ZMQ send is handled entirely
   // inside lightbeam now: each Send() takes an LbmContext::on_send_complete
@@ -384,12 +411,28 @@ bool IpcCpu2CpuZmq::SendOut(
                elapsed_sec, rc, static_cast<int>(priority));
           continue;
         }
-        // Bounded retry: re-enqueue, but at kDebug (rate-limited) so a transient
-        // EAGAIN no longer floods the log at kError the way #722 described.
+        // Bounded retry: re-enqueue. #722 put this at kDebug because logging
+        // EVERY attempt at kError floods; but kDebug is COMPILED OUT of a
+        // default build (CTP_LOG_LEVEL defaults to kInfo and HLOG gates on
+        // `if constexpr`), so in practice the retry path was invisible in
+        // every deployed build -- including the #968 sweeps, where a retried
+        // (hence duplicated) response is a leading suspect.
+        //
+        // Log the FIRST failure per response at kWarning and the rest at
+        // kDebug. That keeps #722's anti-flood property -- one line per
+        // struggling response, not one per attempt -- while making the
+        // phenomenon visible at all without a debug build.
         HLOG(kDebug,
              "IpcCpu2CpuZmq::SendOut: Send rc={} attempt {} — re-queueing "
              "client response (priority={})",
              rc, future_shm->send_fail_count_, static_cast<int>(priority));
+        if (future_shm->send_fail_count_ == 1) {
+          HLOG(kWarning,
+               "IpcCpu2CpuZmq::SendOut: Send rc={} — re-queueing client "
+               "response for pid {} (first retry for this response; "
+               "subsequent attempts log at kDebug, priority={})",
+               rc, future_shm->client_pid_, static_cast<int>(priority));
+        }
         ipc->EnqueueNetTask(queued_future, priority);
         continue;
       }
@@ -407,7 +450,11 @@ bool IpcCpu2CpuZmq::SendOut(
       tasks_sent++;
       size_t total = send_counter.fetch_add(1, std::memory_order_relaxed) + 1;
       if ((total & 0xff) == 0) {
-        HLOG(kDebug,
+        // kInfo, not kDebug: already rate-limited to 1-in-256, so this is ~10
+        // lines per benchmark row -- cheap enough to keep in a default build,
+        // and it is the only running record of send_fail_counter, which is
+        // otherwise unobservable outside a debug build that nobody deploys.
+        HLOG(kInfo,
              "[CountSend] cumulative client responses sent = {} "
              "(mode={}, fails so far = {})",
              total, mode_idx,

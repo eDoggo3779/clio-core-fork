@@ -69,14 +69,26 @@
 #    cost ~2/3 of every row's wall time. Dropping them buys 3x the reproduction
 #    attempts per hour. Use clio_s3_read.yaml when you want a comparison.
 #
-# 5. log_level IS SWEPT, not fixed. It rides the granularity axis: "debug" for
-#    the 15 reproduction/discriminator rows, "info" for the 9 stress rows.
-#    THIS IS THE SINGLE MOST IMPORTANT CHANGE IN THIS FILE. Job 23930 ran at
-#    "info", which is why its [CountClientRecv] / [CountSend] counters and the
-#    ipc_cpu2cpu_zmq.cc SendOut re-queue lines -- the exact evidence that would
-#    show a duplicated or late response -- were never written. Debug on the
-#    stress rows too would multiply the log by the 4096-object column for no
-#    reproduction value, hence the split.
+# 5. log_level IS FIXED AT "info", AND SWEEPING IT WOULD BE POINTLESS.
+#    An earlier revision of this file swept it to "debug" on the reproduction
+#    rows. That was wrong and is corrected here: CTP_LOG_LEVEL is a COMPILE-TIME
+#    threshold. HLOG gates on `if constexpr (LOG_CODE >= CTP_LOG_LEVEL)`
+#    (clio_ctp/util/logging.h:110) and CLIO_CTP_LOG_LEVEL defaults to 1 = kInfo
+#    (CMakeLists.txt:157), so in a default build every HLOG(kDebug, ...) call
+#    site -- all 490 of them -- is compiled OUT of the binary. The runtime
+#    CTP_LOG_LEVEL env var that jarvis sets can only filter among lines that
+#    survived compilation; it cannot resurrect a kDebug line. Setting "debug"
+#    here would have produced exactly the evidence-free log job 23930 produced.
+#
+#    The evidence is instead surfaced IN CODE, at levels a default build emits:
+#      - IpcCpu2CpuZmq/IpcCpu2Cpu::RecvOut now log kError and RETURN FALSE when
+#        a completed task has no response archive -- the silent fallthrough that
+#        made this bug invisible. One line, only when the bug fires.
+#      - SendOut's first re-queue per response is kWarning (the rest stay
+#        kDebug, preserving #722's anti-flood intent).
+#      - [CountSend] cumulative is kInfo (already 1-in-256).
+#      - One-shot [CountSend] / [CountClientRecv] TOTAL tallies at teardown,
+#        promoted to kWarning when non-zero failures/misses occurred.
 #
 # 6. verify: true. The parent sweep runs verify:false. Here it is the
 #    DISCRIMINATING MEASUREMENT, not a nicety: VerifyTags re-reads each tag's
@@ -201,17 +213,15 @@ scheduler:
     - '[ -r "$HOME/.aws/credentials" ] || { echo "ERROR: ~/.aws/credentials missing/unreadable" >&2; exit 1; }'
     - '[ -n "${S3_BENCH_BUCKET:-}" ] || { echo "ERROR: S3_BENCH_BUCKET not set" >&2; exit 1; }'
     - 'export TMPDIR=/tmp/clio_s3_bench; mkdir -p "$TMPDIR"'
-    # 2b) Debug logging needs room. 15 of 24 rows run at debug on a stack that
-    #     already produced ~190k lines per job at info. Fail NOW with a clear
-    #     message rather than at row 9 with a truncated log and a wasted
-    #     allocation. 20 GiB is a deliberate over-ask; lower it only after a
-    #     run tells you the real figure.
+    # 2b) Log headroom. Every row runs at info (see point 5), so this is the
+    #     ~190k-lines-per-job regime the earlier sweeps produced, not a debug
+    #     flood -- but the guard stays: failing NOW with a clear message beats
+    #     dying at row 9 with a truncated log and a spent allocation.
     - |
       AVAIL_KB="$(df -Pk "$HOME" | awk 'NR==2 {print $4}')"
       echo "free space in \$HOME: $((AVAIL_KB / 1024 / 1024)) GiB"
-      [ "$AVAIL_KB" -ge 20971520 ] || {
-        echo "ERROR: need >= 20 GiB free in \$HOME for debug-level logs; have $((AVAIL_KB / 1024 / 1024)) GiB" >&2
-        echo "  Either free space or drop runtime.log_level to info in this file (and lose the counters)." >&2
+      [ "$AVAIL_KB" -ge 5242880 ] || {
+        echo "ERROR: need >= 5 GiB free in \$HOME for this run's logs; have $((AVAIL_KB / 1024 / 1024)) GiB" >&2
         exit 1; }
     # 3) Stale-state cleanup. pkill patterns are BRACKETED so they never match
     #    this script's own argv.
@@ -337,10 +347,11 @@ config:
       # Do not switch this to shm "to compare": that would exercise a different
       # transport and tell us nothing about the failure we are chasing.
       ipc_mode: "ipc"
-      # SWEPT with granularity: debug for the reproduction rows, info for the
-      # stress tail. See point 5 in the header -- job 23930 ran entirely at info
-      # and that is precisely why its response-path counters are missing.
-      log_level: "debug"
+      # NOT swept, and deliberately not "debug" -- see point 5 in the header.
+      # kDebug is compiled out of a default build, so "debug" here would change
+      # nothing; the response-path evidence is emitted at kInfo/kWarning/kError
+      # instead. "info" is the level those lines need.
+      log_level: "info"
       # SWIM off: transient errors must not promote a peer to dead mid-run.
       swim_enabled: false
       sleep: 4
@@ -409,8 +420,6 @@ vars:
   # prefix -- a prefix holds exactly 2 GiB / object_size objects, so asking for
   # FEWER is always safe and asking for more is not.
   clio_s3.num_objects: [512, 512, 512, 512, 128, 8, 64, 4096]
-  runtime.log_level:  ["debug", "debug", "debug", "debug", "debug",
-                       "info", "info", "info"]
 
   # --- Concurrency axis. Zipped, length 3. ---
   # All three are kept even though the failure spans all three: that is exactly
@@ -429,8 +438,7 @@ loop:
   # Granularity is the OUTER dimension and concurrency the INNER one, so the
   # emitted order is combo 0 = 4m/512/K=1, 1 = K=8, 2 = K=32, 3 = block two...
   # That keeps all twelve reproduction rows contiguous at the front.
-  - [clio_s3.key_prefix, clio_s3.object_size, clio_s3.num_objects,
-     runtime.log_level]
+  - [clio_s3.key_prefix, clio_s3.object_size, clio_s3.num_objects]
   - [clio_s3.concurrency, runtime.num_threads, clio_s3.worker_threads]
 
 # Per-combination wall-clock backstop. Expiry marks the row failed and the run
