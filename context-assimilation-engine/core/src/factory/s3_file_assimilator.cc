@@ -364,25 +364,38 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
   size_t desc_size = description.size();
   auto desc_buffer = CLIO_IPC->AllocateBuffer(desc_size);
   std::memcpy(desc_buffer.ptr_, description.c_str(), desc_size);
-  // Submitted here but NOT awaited here. This is a ~40-byte blob, and awaiting
-  // it inline put a whole CTE round trip on the critical path of every object,
-  // ahead of the first body byte being read. It costs the same round trip
-  // whether we wait for it now or after the body, so it waits with the body
-  // chunks -- one fewer serialized trip per object.
+  // Submitted AND awaited here, as it was before b8b84521. That commit deferred
+  // the await to after the body to take this CTE round trip off the critical
+  // path of every object; the targeted fine-granularity cells got slower, not
+  // faster, so the deferral bought nothing measurable and cost two things that
+  // are worth more than one round trip:
   //
-  // That matters only at fine granularity, which is exactly where the read
-  // sweep showed CLIO losing: chunks-per-object is object_size/1 MiB, so an
-  // object under 32 MiB can never fill the kMaxParallelTasks window below and
-  // the fixed per-object trips dominate. Job 23925, CLIO/Zarr by chunk count:
-  // 256 chunks 1.04x, 32 chunks 1.03x, 4 chunks 0.71-0.81x, 1 chunk 0.59x.
+  //   1. On the mid-body error paths (-8, -10) desc_task was abandoned while
+  //      still in flight, leaving a submitted-but-never-collected future.
+  //   2. A description failure was only discovered after the body had already
+  //      been committed, so the object was half-written when it was reported.
   //
-  // Ordering is safe: the tag already exists, and "description" and "chunk_N"
-  // are independent blobs under it.
+  // Keep the trip. The per-object cost is one CTE hop and it is honest.
   const SteadyClock::time_point _t_desc = SteadyClock::now();
   auto desc_task =
       cte_client_->AsyncPutBlob(tag_id, "description", 0, desc_size,
                                 desc_buffer.shm_.template Cast<void>(), 1.0f,
                                 clio::cte::core::Context(), 0);
+  CLIO_CO_AWAIT(desc_task);
+  g_us_desc.fetch_add(UsSince(_t_desc), std::memory_order_relaxed);
+  if (desc_task->return_code_ != 0) {
+    HLOG(kError,
+         "S3FileAssimilator: Failed to store description for tag '{}' (code {})",
+         tag_name, desc_task->return_code_);
+    CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
+    error_code = -9;
+    CLIO_CO_RETURN;
+  }
+  // Pre-existing leak found while b8b84521 moved this, and kept on the revert:
+  // the description buffer was allocated per object and never freed.
+  // BinaryFileAssimilator:176 has the same bug -- left alone rather than edited
+  // blind in an unrelated path.
+  CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
 
   // Stream the body into CTE in chunks, keeping up to kMaxParallelTasks PutBlob
   // tasks in flight (identical wait-and-drain shape to the binary backend). The
@@ -461,24 +474,6 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
     }
     CLIO_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
   }
-
-  // Now collect the description blob submitted before the body. By this point
-  // it has almost certainly landed, so this await is usually free -- which is
-  // the entire point of having moved it off the front of the object.
-  CLIO_CO_AWAIT(desc_task);
-  g_us_desc.fetch_add(UsSince(_t_desc), std::memory_order_relaxed);
-  if (desc_task->return_code_ != 0) {
-    HLOG(kError,
-         "S3FileAssimilator: Failed to store description for tag '{}' (code {})",
-         tag_name, desc_task->return_code_);
-    CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
-    error_code = -9;
-    CLIO_CO_RETURN;
-  }
-  // Pre-existing leak, fixed while moving this: the description buffer was
-  // allocated per object and never freed. BinaryFileAssimilator:176 has the
-  // same bug -- left alone here rather than edited blind in an unrelated path.
-  CLIO_IPC->FreeBuffer(desc_task->blob_data_.template Cast<char>());
 
   // Drain any unread tail so the socket is reusable, then the guard pools it.
   _t_phase = SteadyClock::now();
