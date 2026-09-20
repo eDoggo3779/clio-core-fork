@@ -212,32 +212,73 @@ scheduler:
         echo "  Rebuild first:  spack install iowarp@dev" >&2
         exit 1; }
       echo "cae link check OK: $LIB (Poco present, no AWS SDK, CAE keepalive tally present)"
-    # 1c) #968 INSTRUMENTATION GATE. Revision 2's entire readout is three log
-    #     strings emitted by the runtime library. If the installed build predates
-    #     them the job runs to completion, prints an all-zero anomaly table, and
-    #     means NOTHING -- the most expensive possible failure mode. Assert the
-    #     strings are actually in the binary before spending the allocation.
+    # 1c) #968 INSTRUMENTATION GATE. Revision 2's entire readout is a handful of
+    #     log strings emitted by the runtime library and the bench. If the
+    #     installed build predates them the job runs to completion, prints an
+    #     all-zero anomaly table, and means NOTHING -- the most expensive
+    #     possible failure mode. Assert they are in the binaries first.
+    #
+    #     PROBE ONE STRING PER CHANGED TRANSLATION UNIT, not just any string.
+    #     An earlier revision of this gate checked four markers that all came
+    #     from the same two .cc files, so a partial rebuild in which
+    #     config_manager.cc or ipc_manager.cc was stale would have sailed
+    #     through it. Each marker below is annotated with the file it proves.
+    #
+    #     Worker::ChargeLoad / CreditLoad (worker.cc) add no string literals and
+    #     cannot be probed this way. They link into the same library as the
+    #     default_sched.cc and ipc_manager.cc markers, so those cover it.
+    #
+    #     DO NOT add "RESCUE (no-op)" here. That line is HLOG(kDebug, ...) and
+    #     kDebug is compiled OUT of a default build (HLOG gates on
+    #     `if constexpr (LOG_CODE >= CTP_LOG_LEVEL)`), so the literal is dead
+    #     code the linker discards. Probing for it would fail on a perfectly
+    #     good build, every time.
     - |
       CLIO_RUN_BIN="$(command -v clio_run || true)"
       RTLIB="${CLIO_RUN_BIN%/bin/clio_run}/lib/libclio_run_cxx.so"
       [ -f "$RTLIB" ] || RTLIB="${RTLIB%/lib/*}/lib64/libclio_run_cxx.so"
       [ -f "$RTLIB" ] || { echo "ERROR: libclio_run_cxx.so not found under the install root" >&2; exit 1; }
-      echo "instrumentation gate: lib -> $(readlink -f "$RTLIB" 2>&1 || true)"
+      BENCH="$(command -v clio_s3_read_bench || true)"
+      [ -n "$BENCH" ] || { echo "ERROR: clio_s3_read_bench not on PATH" >&2; exit 1; }
+      # -L on BOTH: these paths are symlinks into a spack view, and a symlink
+      # carries its OWN mtime. Reading it undereferenced reports when the link
+      # was made, not when the library was built -- which cost a real
+      # pre-submission investigation into a "9-day-old" binary that was in fact
+      # four minutes old.
+      echo "instrumentation gate: lib   -> $(readlink -f "$RTLIB" 2>&1 || true)"
+      echo "instrumentation gate: built -> $(stat -Lc '%y' "$RTLIB" 2>&1 || true)"
+      echo "instrumentation gate: bench -> $(readlink -f "$BENCH" 2>&1 || true)"
+      echo "instrumentation gate: built -> $(stat -Lc '%y' "$BENCH" 2>&1 || true)"
       MISSING=""
-      for marker in "PREMATURE RESPONSE" "DUPLICATE RESPONSE" "RESPONSE IDENTITY MISMATCH" "stall threshold ="; do
-        if grep -qaF -- "$marker" "$RTLIB"; then
-          echo "  present: '$marker'"
+      check_marker() {  # $1 = binary, $2 = marker, $3 = source file it proves
+        if grep -qaF -- "$2" "$1"; then
+          echo "  present: '$2'  <- $3"
         else
-          echo "  MISSING: '$marker'" >&2
+          echo "  MISSING: '$2'  <- $3 DID NOT REBUILD" >&2
           MISSING="yes"
         fi
-      done
+      }
+      check_marker "$RTLIB" "PREMATURE RESPONSE"        "ipc_cpu2cpu_zmq.cc"
+      check_marker "$RTLIB" "DUPLICATE RESPONSE"        "ipc_cpu2cpu_zmq.cc"
+      check_marker "$RTLIB" "TOTAL ANOMALIES"           "ipc_cpu2cpu_zmq.cc"
+      check_marker "$RTLIB" "RESPONSE IDENTITY MISMATCH" "ipc_manager.cc"
+      check_marker "$RTLIB" "identity_mismatches="      "ipc_manager.cc"
+      check_marker "$RTLIB" "STRICT_RESPONSE_IDENTITY"  "ipc_manager.cc"
+      check_marker "$RTLIB" "STALL_THRESHOLD_SEC"       "config_manager.cc"
+      check_marker "$RTLIB" "stall threshold ="         "default_sched.cc"
+      check_marker "$RTLIB" "moved nothing"             "default_sched.cc"
+      check_marker "$BENCH" "every object's tag"        "clio_s3_read_bench.cc"
+      check_marker "$BENCH" "is missing data"           "clio_s3_read_bench.cc"
       [ -z "$MISSING" ] || {
-        echo "ERROR: the installed runtime PREDATES the #968 revision-2 instrumentation." >&2
-        echo "  This job would produce an all-zero anomaly table that means nothing." >&2
+        echo "ERROR: an installed binary PREDATES the #968 revision-2 instrumentation." >&2
+        echo "  The lines above name which source file did not make it in." >&2
+        echo "  This job would produce a misleading anomaly table." >&2
         echo "  Rebuild first:  git -C \${CLIO_REPO:-\$HOME/clio-core} pull && spack install iowarp@dev" >&2
+        echo "  If spack reports [+] in seconds, it thinks the spec is already" >&2
+        echo "  installed; check 'spack -e <env> location --source-dir iowarp'" >&2
+        echo "  actually points at the tree you pulled into." >&2
         exit 1; }
-      echo "instrumentation gate OK: all #968 revision-2 markers present"
+      echo "instrumentation gate OK: every changed translation unit is present"
     # 1d) Record the build under test. A reproduction attempt that cannot name
     #     the binary it ran against is not evidence.
     - |
@@ -337,6 +378,15 @@ scheduler:
           print("NO SCHEDULER LOGS FOUND for job", jobid); sys.exit(0)
       # Order matters only within a file; segments are per-daemon-start.
       SPLIT = re.compile(r"\[#968\] stall threshold = ([0-9.eE+-]+)s")
+      # The scheduler's periodic tally, which carries the TRUE cumulative rescue
+      # counts. The per-line "rescue" marker below only counts rescues that
+      # MOVED something -- no-op rescues log at kDebug and are compiled out of a
+      # default build -- so without this the table would badly under-report the
+      # rescue rate. Matches both the kInfo and kWarning forms of the line.
+      # Values are cumulative per daemon, and the daemon restarts every row, so
+      # the LAST value seen in a segment is that row's total.
+      RESC = re.compile(r"lane rescues performed: (\d+) \((\d+) moved nothing")
+      EXTRA = ["resc_tot", "resc_noop"]
       MARKERS = [
           ("premature",   "PREMATURE RESPONSE"),
           ("duplicate",   "DUPLICATE RESPONSE"),
@@ -356,10 +406,16 @@ scheduler:
                   if m:
                       cur = {"thr": m.group(1), "src": os.path.basename(path)}
                       cur.update({k: 0 for k, _ in MARKERS})
+                      cur.update({k: 0 for k in EXTRA})
                       segments.append(cur)
                       continue
                   if cur is None:
                       continue
+                  rm = RESC.search(line)
+                  if rm:
+                      # Cumulative, so overwrite rather than accumulate.
+                      cur["resc_tot"] = int(rm.group(1))
+                      cur["resc_noop"] = int(rm.group(2))
                   for key, pat in MARKERS:
                       if pat in line:
                           cur[key] += 1
@@ -368,31 +424,46 @@ scheduler:
           print("The installed runtime predates revision-2 instrumentation, or")
           print("the daemon never started. This job's anomaly table is void.")
           sys.exit(0)
-      hdr = ["seg", "stall_s"] + [k for k, _ in MARKERS]
-      w = [4, 9] + [max(len(k), 6) for k, _ in MARKERS]
+      cols = [k for k, _ in MARKERS] + EXTRA
+      hdr = ["seg", "stall_s"] + cols
+      w = [4, 9] + [max(len(k), 6) for k in cols]
       print("=== PER-ROW #968 ANOMALY TABLE (one segment = one daemon = one row) ===")
+      print("  rescue   = rescues that MOVED work (no-op rescues are kDebug =")
+      print("             compiled out). resc_tot/resc_noop are the scheduler's")
+      print("             own cumulative totals and are the honest rescue rate.")
       print(" ".join(h.rjust(x) for h, x in zip(hdr, w)))
       for i, s in enumerate(segments):
-          vals = [str(i), s["thr"]] + [str(s[k]) for k, _ in MARKERS]
+          vals = [str(i), s["thr"]] + [str(s[k]) for k in cols]
           print(" ".join(v.rjust(x) for v, x in zip(vals, w)))
       print()
       print("=== ARM TOTALS (the A/B) ===")
       arms = {}
       for s in segments:
           if s["thr"] not in arms:
-              arms[s["thr"]] = {k: 0 for k, _ in MARKERS}
+              arms[s["thr"]] = {k: 0 for k in cols}
               arms[s["thr"]]["rows"] = 0
           a = arms[s["thr"]]
           a["rows"] += 1
-          for k, _ in MARKERS:
+          for k in cols:
               a[k] += s[k]
-      hdr2 = ["stall_s", "rows"] + [k for k, _ in MARKERS]
-      w2 = [9, 5] + [max(len(k), 6) for k, _ in MARKERS]
+      hdr2 = ["stall_s", "rows"] + cols
+      w2 = [9, 5] + [max(len(k), 6) for k in cols]
       print(" ".join(h.rjust(x) for h, x in zip(hdr2, w2)))
       for thr in sorted(arms, key=lambda t: float(t)):
           a = arms[thr]
-          vals = [thr, str(a["rows"])] + [str(a[k]) for k, _ in MARKERS]
+          vals = [thr, str(a["rows"])] + [str(a[k]) for k in cols]
           print(" ".join(v.rjust(x) for v, x in zip(vals, w2)))
+      # The INERT arm's whole purpose is that rescue never runs. If it logged
+      # rescues anyway, the arm did not do what it was supposed to and the A/B
+      # is void -- say so here rather than letting it pass as a clean result.
+      for thr in sorted(arms, key=lambda t: float(t)):
+          if float(thr) >= 60.0 and arms[thr]["resc_tot"] > 0:
+              print()
+              print(f"WARNING: the stall_s={thr} arm performed "
+                    f"{arms[thr]['resc_tot']} rescues. That arm is supposed to "
+                    f"make stall detection unreachable, so the A/B contrast is "
+                    f"NOT clean -- check that runtime.stall_threshold_sec "
+                    f"actually reached the daemon.")
       print()
       tot = sum(a[k] for a in arms.values() for k in ("premature", "duplicate", "mismatch"))
       if tot == 0:
