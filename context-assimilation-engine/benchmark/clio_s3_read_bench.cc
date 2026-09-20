@@ -572,8 +572,27 @@ int main(int argc, char** argv) {
     clio_bench::PrintResults(c.label, a, r.slot_us, r.slot_ops);
     PrintFairness(c, r);
 
-    if (c.verify && exit_code == 0) {
-      exit_code = VerifyTags(c, indices);
+    // #968: verify UNCONDITIONALLY when asked, including after a failed read
+    // loop. Gating on exit_code == 0 skipped the check on exactly the rows that
+    // needed it: the whole point of verifying is to separate "the bytes landed
+    // in the CTE but the reply was lost" from "the read genuinely did not
+    // happen", and that question only arises once a row has already failed.
+    // The row's exit code is preserved -- verify can turn a passing row into a
+    // failing one, never the reverse -- so this only adds evidence.
+    if (c.verify) {
+      int verify_rc = VerifyTags(c, indices);
+      if (exit_code == 0) {
+        exit_code = verify_rc;
+      } else if (verify_rc == 0) {
+        HLOG(kWarning,
+             "[#968] the read loop reported a failure but every object's tag "
+             "is present in the CTE at its expected size: the data DID land "
+             "and the lost thing was the response, not the transfer.");
+      } else {
+        HLOG(kError,
+             "[#968] the read loop failed AND the CTE is missing data: this "
+             "row is a genuine transfer failure, not a lost response.");
+      }
     }
   } catch (const std::exception& e) {
     HLOG(kError, "Exception: {}", e.what());

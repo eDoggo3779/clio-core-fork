@@ -1292,10 +1292,19 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     }
     // The task is now EXECUTING: count its predicted cost in load_ (whether the
     // value came from the map or from here), and release the queued reservation
-    // so it is not double-counted. EndTask subtracts the same PredictedLoad.
-    load_.store(load_.load(std::memory_order_relaxed) +
-                    task_ptr->PredictedLoad(),
-                std::memory_order_relaxed);
+    // so it is not double-counted.
+    //
+    // #968: record WHAT was charged and to WHOM. EndTask credits back exactly
+    // this, to exactly this worker. It used to subtract PredictedLoad() from
+    // whichever worker happened to run EndTask, for every task that reached it
+    // — including tasks that never executed and therefore were never charged,
+    // and including tasks a stall rescue had moved to another worker. Both
+    // drive load_ negative, and a negative load feeds straight into the stall
+    // heuristic that decides whether to rescue.
+    const float charge = task_ptr->PredictedLoad();
+    ChargeLoad(charge);
+    task_ptr->SetLoadChargedUs(charge);
+    task_ptr->SetLoadChargedWorker(worker_id_);
     if (reserved != 0.0f) {
       ReleaseReservation(reserved);
       task_ptr->SetSchedReservedUs(0);
@@ -1373,10 +1382,23 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
     num_nonperiodic_processed_.fetch_add(1, std::memory_order_relaxed);
   }
 
-  // Subtract predicted load from worker
-  load_.store(load_.load(std::memory_order_relaxed) -
-                  task_ptr->PredictedLoad(),
-              std::memory_order_relaxed);
+  // #968: give back exactly the charge ExecTask made, to the worker it was made
+  // on. A task that never executed has no charge (0 here) and correctly credits
+  // nothing; a task that was migrated credits its original worker rather than
+  // this one. Both were sources of load_ underflow — see Worker::CreditLoad.
+  const float charged = task_ptr->LoadChargedUs();
+  if (charged != 0.0f) {
+    const u32 charged_worker = task_ptr->LoadChargedWorker();
+    Worker *owner = this;
+    if (charged_worker != worker_id_) {
+      auto *orch = CLIO_WORK_ORCHESTRATOR;
+      Worker *found = (orch != nullptr) ? orch->GetWorker(charged_worker)
+                                        : nullptr;
+      if (found != nullptr) owner = found;
+    }
+    owner->CreditLoad(charged);
+    task_ptr->SetLoadChargedUs(0);
+  }
 
   // issue #781: defensively release any still-held queued reservation for tasks
   // that reach EndTask WITHOUT executing (e.g. the early-error EACCES path), so a

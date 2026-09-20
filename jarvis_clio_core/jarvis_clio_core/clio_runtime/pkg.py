@@ -93,6 +93,24 @@ class ClioRuntime(Service):
                 'default': 'info'
             },
             {
+                'name': 'stall_threshold_sec',
+                'msg': ('Seconds inside ONE task before the scheduler calls a '
+                        'worker stalled and rescues it. 1.0 is far too short '
+                        'for handlers that do real I/O (a 4 MiB S3 GET '
+                        'routinely exceeds it) -- see #968. Use a large value '
+                        'to make the rescue machinery effectively inert.'),
+                'type': float,
+                'default': 1.0
+            },
+            {
+                'name': 'strict_response_identity',
+                'msg': ('Reject a client response whose echoed task identity '
+                        'does not match the future waiting at its net_key, '
+                        'instead of only logging it (#968).'),
+                'type': bool,
+                'default': False
+            },
+            {
                 'name': 'queue_depth',
                 'msg': 'Task queue depth per worker',
                 'type': int,
@@ -239,6 +257,11 @@ class ClioRuntime(Service):
         self.setenv('CLIO_SERVER_CONF', self.config_file)
         self.setenv('CTP_LOG_LEVEL', self.config['log_level'])
         self.setenv('CLIO_IPC_MODE', self.config['ipc_mode'].upper())
+        # #968: the identity check is read from the environment by the CLIENT's
+        # recv thread, not from the daemon's config file, so it has to be set
+        # here rather than only emitted into clio_config.yaml.
+        self.setenv('CLIO_STRICT_RESPONSE_IDENTITY',
+                    '1' if self.config['strict_response_identity'] else '0')
         self._forward_env()
 
         self._generate_config()
@@ -350,6 +373,7 @@ class ClioRuntime(Service):
                 'process_reaper_threads': self.config['process_reaper_workers'],
                 'queue_depth': self.config['queue_depth'],
                 'local_sched': self.config['local_sched'],
+                'stall_threshold_sec': self.config['stall_threshold_sec'],
                 'heartbeat_interval': self.config['heartbeat_interval'],
                 'first_busy_wait': self.config['first_busy_wait'],
                 'max_sleep': self.config['max_sleep']

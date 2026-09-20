@@ -141,6 +141,12 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       // response (AllocLoadTask reassigns the server task's identity).
       future_shm->client_net_key_ = info.task_id_.net_key_;
       future_shm->client_pid_ = info.task_id_.pid_;
+      // #968: also keep the client's non-recyclable identity so SendOut can
+      // echo it and the client can corroborate the net_key match. AllocLoadTask
+      // has already reassigned the server task's own task_id_, so this is the
+      // only surviving record of who actually asked.
+      future_shm->client_task_unique_ = info.task_id_.unique_;
+      future_shm->client_task_major_ = info.task_id_.major_;
       future_shm->response_fd_ = recv_info.fd_;
       // Resolve the response transport. TCP clients advertise an ephemeral
       // response-listener port (archive.client_port_); open (or reuse from the
@@ -269,6 +275,46 @@ void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc,
 // hook. Relaxed throughout -- read once at shutdown, nothing branches on them.
 static std::atomic<size_t> send_counter{0};
 static std::atomic<size_t> send_fail_counter{0};
+// #968 anomaly counters. Each has a loud per-occurrence kError above; these
+// exist so the teardown tally states the totals even if the per-occurrence
+// lines are lost to log rotation or a truncated tail.
+static std::atomic<size_t> premature_send_counter{0};
+static std::atomic<size_t> duplicate_send_counter{0};
+
+/**
+ * #968: emit LogSendTally() on a wall-clock cadence from the SendOut pass.
+ *
+ * LogSendTally() was originally hooked to ~IpcManager(). That destructor never
+ * runs in the deployments this instrumentation was built for: the benchmark
+ * pipeline tears the daemon down with `clio_run runtime stop --force` followed
+ * by `pkill -9`, and there is no SIGTERM handler, so the process dies without
+ * unwinding and the tally was never printed once. SendOut is driven by a
+ * periodic admin task that keeps running whether or not there is traffic, so
+ * gating on elapsed time here reports the totals for the life of the daemon
+ * regardless of how it eventually dies -- at worst kReportPeriodSec stale.
+ * @param force emit now, ignoring the cadence (used at teardown).
+ */
+static void MaybeLogSendTally(bool force) {
+  static constexpr double kReportPeriodSec = 30.0;
+  static std::mutex report_mtx;
+  static ctp::Timepoint last_report;
+  static bool have_last = false;
+  ctp::Timepoint now;
+  now.Now();
+  {
+    std::lock_guard<std::mutex> lk(report_mtx);
+    if (!have_last) {
+      have_last = true;
+      last_report = now;
+      if (!force) return;  // nothing has happened yet on the first pass
+    } else if (!force &&
+               last_report.GetUsecFromStart(now) / 1e6 < kReportPeriodSec) {
+      return;
+    }
+    last_report = now;
+  }
+  IpcCpu2CpuZmq::LogSendTally();
+}
 
 void IpcCpu2CpuZmq::LogSendTally() {
   const size_t sent = send_counter.load(std::memory_order_relaxed);
@@ -288,6 +334,23 @@ void IpcCpu2CpuZmq::LogSendTally() {
          sent, failed);
   } else {
     HLOG(kInfo, "[CountSend] TOTAL client responses sent={} send_failures=0",
+         sent);
+  }
+  // #968 anomaly totals. Both are zero in a healthy run, so a non-zero line is
+  // the headline result of the run and must survive a kInfo log level.
+  const size_t premature =
+      premature_send_counter.load(std::memory_order_relaxed);
+  const size_t duplicate =
+      duplicate_send_counter.load(std::memory_order_relaxed);
+  if (premature > 0 || duplicate > 0) {
+    HLOG(kError,
+         "[CountSend] TOTAL ANOMALIES premature_responses={} "
+         "duplicate_responses={} (of {} sent) -- see #968",
+         premature, duplicate, sent);
+  } else {
+    HLOG(kInfo,
+         "[CountSend] TOTAL ANOMALIES premature_responses=0 "
+         "duplicate_responses=0 (of {} sent)",
          sent);
   }
 }
@@ -358,8 +421,62 @@ bool IpcCpu2CpuZmq::SendOut(
       }
 
       // Restore the client's net_key so the serialized response matches the
-      // pending future the ZMQ recv thread keyed by it.
+      // pending future the ZMQ recv thread keyed by it, and echo back the
+      // client's own task identity (#968) so the recv thread can tell a reply
+      // to the task it is waiting for from a late reply to a freed task that
+      // used to live at this address. TaskInfo is built from task_id_ inside
+      // SaveTask, so both must be stamped before serializing. This is the last
+      // use of origin_task's identity -- it is freed by RAII at the end of this
+      // iteration -- so overwriting it here is safe.
       origin_task->task_id_.net_key_ = future_shm->client_net_key_;
+      origin_task->task_id_.unique_ = future_shm->client_task_unique_;
+      origin_task->task_id_.major_ = future_shm->client_task_major_;
+
+      // #968 PREMATURE-COMPLETION PROBE. The observed failure is a client that
+      // deserialized a well-formed response whose OUT fields were all at their
+      // runtime-side pre-completion defaults -- i.e. the archive was serialized
+      // before the handler's coroutine reached the line that fills them in.
+      // coro_completed_ is set by the top-level coroutine's final_suspend, so
+      // this is a direct test of that: a response leaving here with the flag
+      // clear IS the bug, and names the task it happened to.
+      //
+      // Two BENIGN paths also complete a task without running its coroutine to
+      // the end, and are expected to appear here: the early access-control
+      // rejection in Worker::ExecTask (rc = EACCES) and the batch-merge
+      // broadcast in Worker::CompleteBatchParents. Both are correct -- there
+      // genuinely is no handler output to wait for. So pool, method and rc are
+      // logged: the #968 signature is rc=0 on a handler that DOES produce OUT
+      // fields, which neither benign path can produce.
+      if (!origin_task->IsCoroCompleted()) {
+        premature_send_counter.fetch_add(1, std::memory_order_relaxed);
+        HLOG(kError,
+             "[#968] PREMATURE RESPONSE: serializing a reply for a task whose "
+             "coroutine has NOT completed -- OUT fields are still at their "
+             "defaults (net_key={} client_unique={} pool={} method={} rc={} "
+             "worker={}). rc=0 here means the client reads a silent failure; "
+             "rc=13 (EACCES) or a batch-merge pool is the benign case.",
+             future_shm->client_net_key_, future_shm->client_task_unique_,
+             origin_task->pool_id_, origin_task->method_,
+             origin_task->GetReturnCode(), origin_task->RunWorkerId());
+      }
+
+      // #968 DUPLICATE-RESPONSE PROBE. One request must produce exactly one
+      // reply. A second one is delivered against a net_key the client may have
+      // already recycled onto a different task, which is the other way the
+      // observed symptom can arise. Counted on the future itself so a repeat is
+      // reported at the moment it is created, not inferred afterwards from the
+      // client's miss tally.
+      if (future_shm->responses_sent_ > 0) {
+        duplicate_send_counter.fetch_add(1, std::memory_order_relaxed);
+        HLOG(kError,
+             "[#968] DUPLICATE RESPONSE: this future has already shipped {} "
+             "reply(ies) (net_key={} client_unique={} pool={} method={} "
+             "send_fail_count={}). A second delivery lands on whatever owns "
+             "this net_key now.",
+             future_shm->responses_sent_, future_shm->client_net_key_,
+             future_shm->client_task_unique_, origin_task->pool_id_,
+             origin_task->method_, future_shm->send_fail_count_);
+      }
 
       // Serialize task outputs
       SaveTaskArchive archive(MsgType::kSerializeOut, response_transport);
@@ -448,6 +565,10 @@ bool IpcCpu2CpuZmq::SendOut(
 
       did_work = true;
       tasks_sent++;
+      // #968: this future has now put a reply on the wire. A later iteration
+      // that reaches the duplicate probe above with this non-zero is shipping a
+      // second reply for one request.
+      future_shm->responses_sent_++;
       size_t total = send_counter.fetch_add(1, std::memory_order_relaxed) + 1;
       if ((total & 0xff) == 0) {
         // kInfo, not kDebug: already rate-limited to 1-in-256, so this is ~10
@@ -462,6 +583,10 @@ bool IpcCpu2CpuZmq::SendOut(
       }
     }
   }
+
+  // #968: periodic totals, so the tally exists in the log even though this
+  // daemon is killed rather than shut down. See MaybeLogSendTally.
+  MaybeLogSendTally(/*force=*/false);
 
   return did_work;
 }

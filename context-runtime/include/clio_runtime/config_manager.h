@@ -176,6 +176,26 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetShmClientSpinUs() const { return shm_client_spin_us_; }
 
   /**
+   * issue #968: seconds a worker may spend inside a single ExecTask before the
+   * scheduler calls it stalled and rescues it.
+   *
+   * The original 1.0 s was chosen for a CPU-bound task that never yields. It is
+   * far too short for an I/O handler: a 4 MiB S3 GET routinely takes longer
+   * than a second, so every ordinary read is misread as a wedged worker. In the
+   * #968 sweeps that produced 56,426 stall detections and 46,576 rescues in a
+   * single 512-object row, 83.7% of which moved no tasks at all — against a
+   * design comment that assumes rescues are rare. Each rescue swaps a worker's
+   * whole event-queue object, so a pathological rate is not merely noisy.
+   *
+   * Configurable (runtime.stall_threshold_sec, or CLIO_STALL_THRESHOLD_SEC) so
+   * the rescue machinery can be turned down to a no-op for a controlled
+   * comparison without rebuilding. The default is unchanged at 1.0 so this is
+   * purely additive; raise it for any deployment whose handlers do real I/O.
+   * @return the stall cutoff in seconds.
+   */
+  double GetStallThresholdSec() const { return stall_threshold_sec_; }
+
+  /**
    * issue #785: extra task lanes reserved for elastic replacement workers.
    * Lanes are indexed by worker id, so replacements spawned by a stall rescue
    * need lanes allocated up front or they can never be routed to. Matches the
@@ -471,6 +491,8 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Configuration parameters
   u32 num_threads_ = 4;
+  /** issue #968: worker stall cutoff in seconds. See GetStallThresholdSec. */
+  double stall_threshold_sec_ = 1.0;
   // issue #807: parallel inbound SHM rings, ENABLED by default. 0 = auto (=
   // worker count, so every worker drains its own shard). Since the drain is
   // done by the EXISTING workers in their poll loop (not dedicated threads),

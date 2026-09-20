@@ -371,6 +371,51 @@ class Worker {
   }
 
   /**
+   * #968: add \a us to this worker's executing-task load, atomically.
+   *
+   * The previous form was `load_.store(load_.load() + us)`, a non-atomic
+   * read-modify-write on a std::atomic<float>. That is a lost-update race the
+   * moment two threads touch one worker's load_, which EndTask does routinely:
+   * it is called from the batch-merge path and from the network thread, not
+   * only from the worker's own thread. std::atomic<float> has no portable
+   * fetch_add (same reason queued_load_us_ is an integer), so this is a CAS
+   * loop.
+   * @param us microseconds of predicted CPU time to charge.
+   */
+  void ChargeLoad(float us) {
+    if (us == 0.0f) return;
+    float cur = load_.load(std::memory_order_relaxed);
+    while (!load_.compare_exchange_weak(cur, cur + us,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+    }
+  }
+
+  /**
+   * #968: give back a charge previously made by ChargeLoad, atomically, and
+   * never below zero.
+   *
+   * load_ is a gauge of work in flight, so it is meaningless when negative —
+   * yet 30.6% of observed stall decisions in the #968 sweeps read a negative
+   * load, because every EndTask subtracted a predicted cost whether or not a
+   * matching ExecTask had ever added one (the early-EACCES path and the
+   * batch-completion paths end tasks that never executed). Callers now only
+   * credit what RunContext records as actually charged; the clamp here is the
+   * backstop that keeps the gauge physical regardless.
+   * @param us microseconds of predicted CPU time to release.
+   */
+  void CreditLoad(float us) {
+    if (us == 0.0f) return;
+    float cur = load_.load(std::memory_order_relaxed);
+    float next;
+    do {
+      next = cur - us;
+      if (next < 0.0f) next = 0.0f;
+    } while (!load_.compare_exchange_weak(cur, next, std::memory_order_relaxed,
+                                          std::memory_order_relaxed));
+  }
+
+  /**
    * True if this worker has been executing one task longer than \a threshold_sec
    * — i.e. a non-yielding/mislabeled task is stalling it (issue #781).
    * @param now_us current steady-clock time in microseconds.

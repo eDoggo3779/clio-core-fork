@@ -100,7 +100,11 @@ class DefaultScheduler : public Scheduler {
 
  private:
   static constexpr size_t kLargeIOThreshold = 4096;  ///< I/O size threshold
-  static constexpr double kStallThresholdSec = 1.0;  ///< #781: worker stall cutoff
+  /// #968: worker stall cutoff, seconds. Was a hard-coded 1.0, which any
+  /// handler doing real I/O exceeds routinely — see
+  /// ConfigManager::GetStallThresholdSec for the measured consequences. Cached
+  /// once at construction; the config is immutable for the life of the runtime.
+  double stall_threshold_sec_ = 1.0;
   static constexpr double kRetireCooldownSec = 5.0;  ///< #781: idle elastic retire
   static constexpr u32 kStealBatch = 4;              ///< #781: tasks stolen per victim
 
@@ -124,6 +128,17 @@ class DefaultScheduler : public Scheduler {
   std::atomic<u64> load_balance_ticks_{0};  ///< #781 monitor ticks observed
   std::atomic<u64> stalls_detected_{0};     ///< #781 cumulative stall events
   std::atomic<u64> rescues_performed_{0};   ///< #785 lane transfers off stalled workers
+  /// #968 rescues that moved neither a parked nor a queued task. These are pure
+  /// event-queue churn: the donor keeps its lane and had nothing to hand over,
+  /// so the whole operation is a no-op except for swapping the queue object out
+  /// from under whatever is parked on it. 83.7% of observed rescues.
+  std::atomic<u64> rescues_no_op_{0};
+  /// #968 per-worker "already reported this stall episode" bits, so the stall
+  /// warning fires once per episode instead of once per 500 ms monitor tick.
+  /// Indexed by worker id; a worker that stops being stalled clears its bit and
+  /// is eligible to warn again. Guarded by the monitor thread, which is the
+  /// only writer.
+  std::vector<bool> stall_reported_;
   /** #785: replacement workers spawned by rescues. Only ever touched by
    *  LoadBalance on the monitor thread, so it needs no lock. Kept separate from
    *  io_workers_ (which the mapper scans) so a rescuer is not immediately handed

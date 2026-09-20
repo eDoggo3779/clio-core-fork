@@ -66,6 +66,20 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
 
   u32 total_workers = work_orch->GetTotalWorkerCount();
 
+  // #968: pick up the configured stall cutoff once. DivideWorkers runs after
+  // the config is loaded and before any worker executes, and the value is
+  // immutable thereafter, so the monitor thread can read the cached copy with
+  // no synchronisation.
+  auto *config = CLIO_CONFIG_MANAGER;
+  if (config != nullptr) {
+    stall_threshold_sec_ = config->GetStallThresholdSec();
+  }
+  // One "already warned about this stall episode" bit per worker, sized for the
+  // elastic headroom too so a replacement worker's id is always in range.
+  stall_reported_.assign(total_workers + 64, false);
+  HLOG(kInfo, "[#968] stall threshold = {}s ({} worker slots tracked)",
+       stall_threshold_sec_, stall_reported_.size());
+
   scheduler_worker_ = nullptr;
   io_workers_.clear();
   net_send_worker_ = nullptr;
@@ -424,7 +438,7 @@ Worker *DefaultScheduler::PickAltWorker(u32 avoid_id) const {
 
 // issue #781 — SCAFFOLD ONLY (not yet wired). Called by the WorkOrchestrator
 // monitor thread every ~500ms. Real implementation will:
-//   1. detect a worker stuck > kStallThresholdSec inside one ExecTask
+//   1. detect a worker stuck > stall_threshold_sec_ inside one ExecTask
 //      (worker->IsStalled()) and, if so, work_orch_->SpawnAdditionalWorker()
 //      + StealAll(from stalled lane -> new worker) so the pathological task
 //      strands one thread, never the runtime;
@@ -440,7 +454,7 @@ Worker *DefaultScheduler::PickLeastLoadedLive(double now_us, Worker *avoid_a,
   auto consider = [&](Worker *w) {
     if (w == nullptr || w == avoid_a || w == avoid_b) return;
     if (w->GetLane() == nullptr) return;
-    if (w->IsStalled(now_us, kStallThresholdSec)) return;
+    if (w->IsStalled(now_us, stall_threshold_sec_)) return;
     double l = w->RealtimeLoad(now_us);
     if (best == nullptr || l < best_load) {
       best = w;
@@ -613,7 +627,7 @@ void DefaultScheduler::RebalanceClasses(double now_us) {
 void DefaultScheduler::LoadBalance() {
   // Runs on the WorkOrchestrator monitor thread every ~500ms (NOT a worker).
   // This pass implements the OBSERVABILITY half of the safety net: detect a
-  // worker stuck > kStallThresholdSec inside one ExecTask (a non-yielding /
+  // worker stuck > stall_threshold_sec_ inside one ExecTask (a non-yielding /
   // mislabeled task) and warn loudly with live/stalled counts. Because
   // RuntimeMapTask already steers NEW tasks away from a stalled worker (its
   // RealtimeLoad is enormous), the runtime keeps making progress on quick tasks
@@ -627,7 +641,7 @@ void DefaultScheduler::LoadBalance() {
   // workload distribution (how many quick vs 1-second tasks it actually ran).
   // It adapts continuously as RecordCompletion folds in each finished task.
   if (tick % 10 == 0) {
-    HLOG(kWarning,
+    HLOG(kInfo,
          "[#781 PDF] observed exec-time bins (cumulative): "
          "<10us={} <50us={} <500us={} <10ms={} <50ms={} <500ms={} <1s={} "
          ">=1s={} | stalls_detected={}",
@@ -636,8 +650,21 @@ void DefaultScheduler::LoadBalance() {
          perf_pdf_[kLt50ms].load(), perf_pdf_[kLt500ms].load(),
          perf_pdf_[kLt1s].load(), perf_pdf_[kGe1s].load(),
          stalls_detected_.load());
-    HLOG(kWarning, "[#785] lane rescues performed: {}",
-         rescues_performed_.load());
+    // #968: the no-op share is the number that says whether the rescue
+    // machinery is doing useful work or just churning event queues. Escalate to
+    // kWarning only when it is pathological, so a healthy run stays quiet.
+    const u64 resc = rescues_performed_.load();
+    const u64 noop = rescues_no_op_.load();
+    if (resc >= 100 && noop * 2 > resc) {
+      HLOG(kWarning,
+           "[#785] lane rescues performed: {} ({} moved nothing = {}%). A "
+           "majority of rescues are no-ops: the stall threshold ({}s) is "
+           "firing on tasks that are merely slow, not wedged. See #968.",
+           resc, noop, (noop * 100) / resc, stall_threshold_sec_);
+    } else {
+      HLOG(kInfo, "[#785] lane rescues performed: {} ({} moved nothing)", resc,
+           noop);
+    }
     size_t nq, nm, nh;
     {
       std::lock_guard<std::mutex> g(class_mu_);
@@ -645,7 +672,7 @@ void DefaultScheduler::LoadBalance() {
       nm = class_workers_[kMediumClass].size();
       nh = class_workers_[kHeavyClass].size();
     }
-    HLOG(kWarning,
+    HLOG(kInfo,
          "[sched] cost classes: quick {} workers ({} routed, +{}/-{}) | "
          "medium {} workers ({} routed, +{}/-{}) | heavy {} workers "
          "({} routed, +{}/-{})",
@@ -672,14 +699,34 @@ void DefaultScheduler::LoadBalance() {
   // Non-migratable workers are still detected and warned about; they are simply
   // not rescued.
   auto check = [&](Worker *w, bool migratable) -> bool {
-    if (w == nullptr || !w->IsExecuting()) return false;
-    if (!w->IsStalled(now_us, kStallThresholdSec)) return false;
+    if (w == nullptr) return false;
+    const u32 wid = w->GetId();
+    const bool tracked = wid < stall_reported_.size();
+    if (!w->IsExecuting() || !w->IsStalled(now_us, stall_threshold_sec_)) {
+      // Episode over (or never started): this worker may warn again next time.
+      if (tracked) stall_reported_[wid] = false;
+      return false;
+    }
     stalls_detected_.fetch_add(1, std::memory_order_relaxed);
-    HLOG(kWarning,
-         "[#781] worker {} STALLED on one task (load_us={} realtime_load_us={} "
-         "threshold_s={})",
-         w->GetId(), (double)w->Load(), w->RealtimeLoad(now_us),
-         kStallThresholdSec);
+    // #968: warn ONCE per stall EPISODE, not once per 500 ms monitor tick. A
+    // worker inside a 40 s task used to emit ~80 identical warnings; across a
+    // 512-object row that produced 56,426 lines describing a few hundred
+    // genuine events. The detection itself is unchanged — only the reporting is
+    // deduplicated — so stalls_detected_ still counts every tick and the
+    // periodic tally below still shows the true rate.
+    const bool first_of_episode = !tracked || !stall_reported_[wid];
+    if (tracked) stall_reported_[wid] = true;
+    if (first_of_episode) {
+      HLOG(kWarning,
+           "[#781] worker {} STALLED on one task (load_us={} "
+           "realtime_load_us={} threshold_s={} migratable={}) -- first report "
+           "of this episode; repeats are suppressed until it clears",
+           wid, (double)w->Load(), w->RealtimeLoad(now_us),
+           stall_threshold_sec_, migratable ? 1 : 0);
+    } else {
+      HLOG(kDebug, "[#781] worker {} still STALLED (load_us={})", wid,
+           (double)w->Load());
+    }
 
     // issue #785: LANE RESCUE. The stalled worker is inside ExecTask and is
     // provably not popping its lane, so its queued backlog is stranded behind a
@@ -817,12 +864,25 @@ void DefaultScheduler::LoadBalance() {
         elastic_workers_.end()) {
       elastic_workers_.push_back(rescuer);
     }
-    rescues_performed_.fetch_add(1, std::memory_order_relaxed);
-    HLOG(kWarning,
-         "[#785] RESCUE: stalled worker {} -> worker {} ({} parked task(s) "
-         "moved, {} queued task(s) redistributed, rescues={})",
-         w->GetId(), rescuer->GetId(), parked_moved, redistributed,
-         rescues_performed_.load(std::memory_order_relaxed));
+    const u64 rescues = rescues_performed_.fetch_add(
+                            1, std::memory_order_relaxed) + 1;
+    // #968: a rescue that moved NOTHING still swapped the donor's event-queue
+    // object out from under every coroutine parked on it, for no benefit --
+    // there was no backlog to relieve. 83.7% of observed rescues were this.
+    // Separate the two cases so the log shows the ones that did real work and
+    // the count shows how much of the rest is churn.
+    if (parked_moved == 0 && redistributed == 0) {
+      rescues_no_op_.fetch_add(1, std::memory_order_relaxed);
+      HLOG(kDebug,
+           "[#785] RESCUE (no-op): stalled worker {} -> worker {}, nothing to "
+           "move; rescues={}",
+           w->GetId(), rescuer->GetId(), rescues);
+    } else {
+      HLOG(kWarning,
+           "[#785] RESCUE: stalled worker {} -> worker {} ({} parked task(s) "
+           "moved, {} queued task(s) redistributed, rescues={})",
+           w->GetId(), rescuer->GetId(), parked_moved, redistributed, rescues);
+    }
     return true;
   };
 
@@ -865,7 +925,7 @@ void DefaultScheduler::LoadBalance() {
       processed += w->RealTasksProcessed();
       if (w->IsExecuting()) {
         ++live;
-        if (w->IsStalled(now_us, kStallThresholdSec)) ++live_stalled;
+        if (w->IsStalled(now_us, stall_threshold_sec_)) ++live_stalled;
       }
       WorkerStats st = w->GetWorkerStats();
       ob_queued += st.num_queued_tasks_;
@@ -987,7 +1047,7 @@ void DefaultScheduler::LoadBalance() {
                "[HANGWATCH]  w{} exec={} stalled={} lane_size={} queued={} "
                "blocked={} periodic={} retry={} done={}",
                w->GetId(), w->IsExecuting(),
-               w->IsStalled(now_us, kStallThresholdSec),
+               w->IsStalled(now_us, stall_threshold_sec_),
                ln ? static_cast<long>(ln->Size()) : -1L,
                st.num_queued_tasks_, st.num_blocked_tasks_,
                st.num_periodic_tasks_, st.num_retry_tasks_,
