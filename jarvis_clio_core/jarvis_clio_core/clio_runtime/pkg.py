@@ -93,16 +93,6 @@ class ClioRuntime(Service):
                 'default': 'info'
             },
             {
-                'name': 'stall_threshold_sec',
-                'msg': ('Seconds inside ONE task before the scheduler calls a '
-                        'worker stalled and rescues it. 1.0 is far too short '
-                        'for handlers that do real I/O (a 4 MiB S3 GET '
-                        'routinely exceeds it) -- see #968. Use a large value '
-                        'to make the rescue machinery effectively inert.'),
-                'type': float,
-                'default': 1.0
-            },
-            {
                 'name': 'strict_response_identity',
                 'msg': ('Reject a client response whose echoed task identity '
                         'does not match the future waiting at its net_key, '
@@ -373,7 +363,6 @@ class ClioRuntime(Service):
                 'process_reaper_threads': self.config['process_reaper_workers'],
                 'queue_depth': self.config['queue_depth'],
                 'local_sched': self.config['local_sched'],
-                'stall_threshold_sec': self.config['stall_threshold_sec'],
                 'heartbeat_interval': self.config['heartbeat_interval'],
                 'first_busy_wait': self.config['first_busy_wait'],
                 'max_sleep': self.config['max_sleep']

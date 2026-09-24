@@ -107,32 +107,6 @@ scheduler:
     - 'command -v cae_s3_tool        >/dev/null 2>&1 || { echo "ERROR: cae_s3_tool not on PATH — was IOWarp built with +s3_cae?" >&2; exit 1; }'
     - 'command -v jarvis             >/dev/null 2>&1 || { echo "ERROR: jarvis not on PATH (venv: ${JARVIS_VENV:-$HOME/jarvis-venv})" >&2; exit 1; }'
     - '"${ZARR_VENV:-$HOME/zarr-venv}/bin/python3" -c "import zarr,s3fs,numpy" || { echo "ERROR: zarr venv broken at ${ZARR_VENV:-$HOME/zarr-venv}" >&2; exit 1; }'
-    - 'echo "toolchain: clio_run=$(command -v clio_run) bench=$(command -v clio_s3_read_bench) jarvis=$(command -v jarvis)"'
-    # 1b) CAE runtime link gate. The s3:// read path is now IN-PROCESS over
-    #     Poco+SigV4 (no fork+exec, no AWS SDK in the runtime). Assert the
-    #     installed library actually is that build: Poco NetSSL present, AWS SDK
-    #     ABSENT, and the CAE keep-alive tally literal present (which also proves
-    #     the install post-dates this change -- a `spack develop` tree does not
-    #     rebuild on `git pull`, so `spack install iowarp@dev` after every pull).
-    - |
-      echo "cae gate: host=$(hostname -s) time=$(date -Is)"
-      CLIO_RUN_BIN="$(command -v clio_run || true)"
-      LIB="${CLIO_RUN_BIN%/bin/clio_run}/lib/libclio_cae_core_runtime.so"
-      [ -f "$LIB" ] || LIB="${LIB%/lib/*}/lib64/libclio_cae_core_runtime.so"
-      [ -f "$LIB" ] || { echo "ERROR: libclio_cae_core_runtime.so not found under the install root" >&2; exit 1; }
-      echo "cae gate: lib -> $(readlink -f "$LIB" 2>&1 || true)"
-      LDD_OUT="$(ldd "$LIB" 2>&1)" || { echo "ERROR: ldd failed on $LIB:" >&2; printf '%s\n' "$LDD_OUT" >&2; exit 1; }
-      printf '%s\n' "$LDD_OUT" | grep -q PocoNetSSL || { echo "ERROR: $LIB has no Poco NetSSL — CAE built without the in-process S3 path?" >&2; exit 1; }
-      printf '%s\n' "$LDD_OUT" | grep -q aws-cpp-sdk && { echo "ERROR: $LIB links the AWS SDK — that stack-smashes runtime init" >&2; exit 1; }
-      KA_RC=0
-      KA_COUNT="$(grep -acF "CAE S3 keepalive" "$LIB")" || KA_RC=$?
-      echo "cae gate: keepalive tally matches = ${KA_COUNT:-0} (grep rc=$KA_RC)"
-      [ "$KA_RC" -le 1 ] || { echo "ERROR: could not read $LIB (grep exit $KA_RC)" >&2; exit 1; }
-      [ "${KA_COUNT:-0}" -ge 1 ] || {
-        echo "ERROR: $LIB PREDATES the in-process persistent-connection read path." >&2
-        echo "  Rebuild first:  spack install iowarp@dev" >&2
-        exit 1; }
-      echo "cae link check OK: $LIB (Poco present, no AWS SDK, CAE keepalive tally present)"
     # 2) AWS credentials. NO SECRETS IN THIS FILE. Credentials live in
     #    ~/.aws/credentials (mode 600); both the AWS C++ SDK default chain
     #    (cae_s3_tool) and botocore (s3fs) read it. Only non-secret profile and

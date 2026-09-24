@@ -195,22 +195,6 @@ void ConfigManager::ApplyEnvOverrides() {
     }
   }
 
-  // issue #968: CLIO_STALL_THRESHOLD_SEC overrides the worker stall cutoff
-  // (last word, after any config file). A value <= 0 is rejected rather than
-  // silently disabling stall detection -- "0 means off" would be an invisible
-  // way to lose the watchdog. Use a large value (e.g. 1e9) to make it inert.
-  if (const char *env = clio::run::env::GetCompat("STALL_THRESHOLD_SEC")) {
-    char *end = nullptr;
-    double v = std::strtod(env, &end);
-    if (end != env && v > 0.0) {
-      stall_threshold_sec_ = v;
-    } else {
-      HLOG(kWarning,
-           "CLIO_STALL_THRESHOLD_SEC='{}' is not a positive number; keeping {}",
-           env, stall_threshold_sec_);
-    }
-  }
-
   // issue #807: number of parallel inbound SHM rings (each with its own drain
   // thread). CLIO_SHM_IN_SHARDS overrides. Default 4 spreads the MPSC tail
   // contention and the deserialize+route work across cores without oversubscribing
@@ -426,7 +410,6 @@ bool ConfigManager::IsValid() const { return is_initialized_; }
 void ConfigManager::LoadDefault() {
   // Set default configuration values
   num_threads_ = 4;
-  stall_threshold_sec_ = 1.0;
   queue_depth_ = 1024;
 
   main_segment_size_ = 0;                         // 0 means auto-calculate
@@ -485,11 +468,6 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // Local task scheduler
     if (runtime["local_sched"]) {
       local_sched_ = runtime["local_sched"].as<std::string>();
-    }
-
-    // issue #968: worker stall cutoff. See ConfigManager::GetStallThresholdSec.
-    if (runtime["stall_threshold_sec"]) {
-      stall_threshold_sec_ = runtime["stall_threshold_sec"].as<double>();
     }
 
     // Worker sleep configuration

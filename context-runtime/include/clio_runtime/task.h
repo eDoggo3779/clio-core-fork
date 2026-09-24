@@ -459,10 +459,6 @@ class Task {
   void SetPredictedLoad(float v);
   float SchedReservedUs() const;       // issue #781 queued-load reservation
   void SetSchedReservedUs(float v);    // issue #781
-  float LoadChargedUs() const;         // issue #968 executing-load charge
-  void SetLoadChargedUs(float v);      // issue #968
-  u32 LoadChargedWorker() const;       // issue #968 worker holding the charge
-  void SetLoadChargedWorker(u32 v);    // issue #968
   ctp::HighResMonotonicTimer& RunWallTimer();
   float PredictedWallUs() const;
   void SetPredictedWallUs(float v);
@@ -950,18 +946,6 @@ class RunContext {
    *  task's identity. The ZMQ recv thread keys pending_zmq_futures_ by this, so
    *  the response must carry it for the client to match (else it hangs). */
   uintptr_t client_net_key_;
-  /** #968: the client's OWN task identity, captured at RecvIn alongside
-   *  client_net_key_ and stamped back onto the response at SendOut.
-   *
-   *  net_key_ is the client task's heap address, so it is recycled as soon as
-   *  that task is freed. Demuxing a response by net_key alone therefore has no
-   *  way to tell "the reply to the task I am waiting for" from "a late reply to
-   *  a previous task that happened to live at this address". unique_ is
-   *  monotonic per client process and is never recycled, so echoing it lets the
-   *  client recv thread corroborate the address match against a real identity.
-   *  0 means the peer did not echo one (nothing to check). */
-  u32 client_task_unique_;
-  u32 client_task_major_;  /**< Companion to client_task_unique_ (per-thread) */
   ctp::lbm::ShmTransferInfo input_;   /**< SHM transfer info (client -> worker) */
   ctp::lbm::ShmTransferInfo output_;  /**< SHM transfer info (worker -> client) */
   ctp::lbm::Transport* response_transport_; /**< Transport for the response */
@@ -975,12 +959,6 @@ class RunContext {
    *  (task freed via RAII) instead of re-queued forever. Non-serialized;
    *  meaningful only on the server's outbound response future. */
   u32 send_fail_count_;            /**< Consecutive response-Send failures */
-  /** #968: how many times SendOut has put a response for THIS future on the
-   *  wire. A successful send should happen exactly once; a second one means the
-   *  client is being handed two replies for one request, and the second lands
-   *  on whatever now owns that net_key. Counted so the anomaly is reported
-   *  where it happens rather than inferred from the client's miss tally. */
-  u32 responses_sent_;
   ctp::Timepoint first_send_fail_; /**< Time of the first failure (for timeout) */
   ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
   uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
@@ -1020,15 +998,6 @@ class RunContext {
   float sched_reserved_us_ = 0; /**< #781 queued-load reservation on a worker
                                   * (predicted cost added to worker.queued_load_
                                   * at map, released when the task starts) */
-  /** #968: how much executing-load was actually charged to a worker for this
-   *  task, and to WHICH worker. EndTask used to subtract PredictedLoad()
-   *  unconditionally from `this` worker, which underflows load_ two ways: it
-   *  subtracts for tasks that never executed (so were never charged), and when
-   *  a rescue moves a task it credits the rescuer rather than the worker that
-   *  was charged. Recording the charge makes the credit exact. 0 = not
-   *  charged. */
-  float load_charged_us_ = 0;
-  u32 load_charged_worker_ = 0; /**< Worker id that load_charged_us_ is on */
   ctp::HighResMonotonicTimer wall_timer_; /**< Wall clock time across yields */
   float predicted_wall_us_ =
       0; /**< Predicted wall time from InferWallClockTime */
@@ -1049,13 +1018,10 @@ class RunContext {
         origin_(ClientOrigin::kClientShm),
         client_pid_(0),
         client_net_key_(0),
-        client_task_unique_(0),
-        client_task_major_(0),
         response_transport_(nullptr),
         response_identity_len_(0),
         response_fd_(-1),
         send_fail_count_(0),
-        responses_sent_(0),
         gpu_task_device_ptr_(0),
         gpu_task_size_(0),
         probe_rec_(0),
@@ -1099,8 +1065,6 @@ class RunContext {
         flags_(other.flags_),
         cpu_timer_(other.cpu_timer_),
         predicted_load_(other.predicted_load_),
-        load_charged_us_(other.load_charged_us_),
-        load_charged_worker_(other.load_charged_worker_),
         wall_timer_(other.wall_timer_),
         predicted_wall_us_(other.predicted_wall_us_),
         predicted_stat_(other.predicted_stat_) {
@@ -1135,8 +1099,6 @@ class RunContext {
       flags_ = other.flags_;
       cpu_timer_ = other.cpu_timer_;
       predicted_load_ = other.predicted_load_;
-      load_charged_us_ = other.load_charged_us_;
-      load_charged_worker_ = other.load_charged_worker_;
       wall_timer_ = other.wall_timer_;
       predicted_wall_us_ = other.predicted_wall_us_;
       predicted_stat_ = other.predicted_stat_;
@@ -1217,8 +1179,6 @@ class RunContext {
     cpu_timer_.time_ns_ = 0;
     predicted_load_ = 0;
     sched_reserved_us_ = 0;
-    load_charged_us_ = 0;
-    load_charged_worker_ = 0;
     wall_timer_.time_ns_ = 0;
     predicted_wall_us_ = 0;
     predicted_stat_ = TaskStat();
@@ -1306,10 +1266,6 @@ CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
 CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
 CLIO_RCTX_GET(float, SchedReservedUs, sched_reserved_us_)
 CLIO_RCTX_SET(float, SetSchedReservedUs, sched_reserved_us_)
-CLIO_RCTX_GET(float, LoadChargedUs, load_charged_us_)
-CLIO_RCTX_SET(float, SetLoadChargedUs, load_charged_us_)
-CLIO_RCTX_GET(u32, LoadChargedWorker, load_charged_worker_)
-CLIO_RCTX_SET(u32, SetLoadChargedWorker, load_charged_worker_)
 CLIO_RCTX_REF(ctp::HighResMonotonicTimer, RunWallTimer, wall_timer_)
 CLIO_RCTX_GET(float, PredictedWallUs, predicted_wall_us_)
 CLIO_RCTX_SET(float, SetPredictedWallUs, predicted_wall_us_)
