@@ -10,9 +10,10 @@
 #include "clio_ctp/introspect/system_info.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <deque>
-#include <mutex>
 #include <vector>
 
 namespace clio::run {
@@ -281,6 +282,32 @@ static std::atomic<size_t> send_fail_counter{0};
 static std::atomic<size_t> premature_send_counter{0};
 static std::atomic<size_t> duplicate_send_counter{0};
 
+// Timestamp of the last MaybeLogSendTally() report, as steady-clock
+// nanoseconds; 0 means "not yet seeded".
+//
+// Deliberately a bare atomic and not the mutex-guarded trio of function-local
+// statics this started as, because a function-local std::mutex here is only
+// accidentally safe. SendOut still runs during teardown: the runtime finalizes
+// from atexit handlers, and ServerFinalize -> DrainPendingTasks drains with the
+// workers live, so Runtime::ClientSend drives at least one more pass through
+// here. Whether a function-local static is still alive for that pass depends on
+// whether its __cxa_atexit registration (first pass, on a worker thread) beat
+// the main thread's std::atexit(CLIO_RUNTIME_FINALIZE) at the end of init --
+// handlers run LIFO over one shared list, so registering later means being
+// destroyed earlier. Measured on Linux the worker wins that race comfortably
+// (the ClientSend periodic ticks hundreds of times during ClientInit), but
+// nothing enforces it.
+//
+// Losing it costs nothing on libstdc++, where ~std::mutex() is trivial when
+// __GTHREAD_MUTEX_INIT is defined, so the object is never really destroyed.
+// libc++ does call pthread_mutex_destroy(), and Darwin then fails the late lock
+// with EINVAL -- std::mutex::lock() throws inside a coroutine, whose promise
+// unhandled_exception() std::terminate()s the process.
+//
+// A trivially destructible atomic has no destructor to order, so the teardown
+// pass is safe by construction. It is also cheaper: this runs on every SendOut.
+static std::atomic<i64> last_tally_ns{0};
+
 /**
  * #968: emit LogSendTally() on a wall-clock cadence from the SendOut pass.
  *
@@ -295,23 +322,26 @@ static std::atomic<size_t> duplicate_send_counter{0};
  * @param force emit now, ignoring the cadence (used at teardown).
  */
 static void MaybeLogSendTally(bool force) {
-  static constexpr double kReportPeriodSec = 30.0;
-  static std::mutex report_mtx;
-  static ctp::Timepoint last_report;
-  static bool have_last = false;
-  ctp::Timepoint now;
-  now.Now();
-  {
-    std::lock_guard<std::mutex> lk(report_mtx);
-    if (!have_last) {
-      have_last = true;
-      last_report = now;
-      if (!force) return;  // nothing has happened yet on the first pass
-    } else if (!force &&
-               last_report.GetUsecFromStart(now) / 1e6 < kReportPeriodSec) {
+  static constexpr i64 kReportPeriodNs = 30LL * 1000 * 1000 * 1000;
+  i64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+  // 0 is the "unseeded" sentinel, so never store it as a real stamp.
+  if (now == 0) now = 1;
+  while (true) {
+    i64 last = last_tally_ns.load(std::memory_order_relaxed);
+    if (last != 0 && !force && now - last < kReportPeriodNs) {
       return;
     }
-    last_report = now;
+    if (!last_tally_ns.compare_exchange_weak(last, now,
+                                             std::memory_order_relaxed)) {
+      continue;  // another worker moved the stamp; re-test against its value
+    }
+    // Exactly one caller wins each period, which is what the mutex bought.
+    if (last == 0 && !force) {
+      return;  // nothing has happened yet on the first pass
+    }
+    break;
   }
   IpcCpu2CpuZmq::LogSendTally();
 }
